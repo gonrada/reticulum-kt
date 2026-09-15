@@ -11,6 +11,8 @@ import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.RandomAccessFile
 import java.security.SecureRandom
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
@@ -362,6 +364,28 @@ class Resource private constructor(
     private var metadata: ByteArray? = null
 
     // Multi-segment support
+    /**
+     * Size of the wire metadata BLOCK (3-byte big-endian length + msgpack-packed
+     * metadata), 0 when there is no metadata. Mirrors python `self.metadata_size`
+     * (Resource.py:258-268), which counts the whole prefixed block and is what
+     * the first-segment read bound (`MAX_EFFICIENT_SIZE - metadata_size`)
+     * subtracts. Distinct from the raw [metadata] payload length.
+     */
+    private var metadataBlockSize: Int = 0
+    /**
+     * The auto-compress OPTION as the application passed it (true/false),
+     * carried across split segments. Mirrors python `self.auto_compress_option`
+     * (Resource.py:369), which each prepared segment re-applies to its own
+     * content (Resource.py:773). Not the per-segment [compressed] RESULT:
+     * whether a segment actually shrank is decided per segment.
+     */
+    private var autoCompressOption: Boolean = true
+    /**
+     * The temporary file backing a split transfer's [inputFile] (python
+     * `tempfile.TemporaryFile`, Resource.py:277). Deleted once the transfer
+     * reaches a terminal state (final segment concluded or cancel).
+     */
+    private var tempFile: File? = null
     private var inputFile: java.io.RandomAccessFile? = null
     private var preparingNextSegment: Boolean = false
     private var nextSegment: Resource? = null
@@ -403,10 +427,23 @@ class Resource private constructor(
      * Initialize resource for sending.
      * Matches Python RNS Resource.__init__() protocol.
      */
-    private fun initializeForSending(data: ByteArray, metadata: ByteArray?, autoCompress: Boolean) {
+    private fun initializeForSending(
+        data: ByteArray,
+        metadata: ByteArray?,
+        autoCompress: Boolean,
+        segmentContinuation: Boolean = false,
+        totalPayloadSize: Int? = null
+    ) {
         uncompressedData = data
-        totalSize = data.size
+        // Total transfer size. The ROOT resource is total_size = raw_payload +
+        // metadata_block (python Resource.py:283, total_size = data_size +
+        // metadata_size). A SPLIT CONTINUATION segment carries the transfer's full
+        // RAW payload size (the spilled file length) so the auto-compress decision
+        // (python Resource.py:390, data_size = full payload) and the advertisement's
+        // data_size (Resource.py:1300, adv.d) match the reference for every segment.
+        totalSize = totalPayloadSize ?: data.size
         uncompressedSize = data.size
+        autoCompressOption = autoCompress
 
         // Handle metadata. Mirrors python Resource.__init__ (Resource.py:260-268):
         //   packed_metadata = umsgpack.packb(metadata)
@@ -431,10 +468,80 @@ class Resource private constructor(
             )
             dataWithMetadata = metaPrefix + packedMetadata + data
             totalSize = dataWithMetadata.size
+            metadataBlockSize = 3 + metaSize
         }
 
-        // Compress if requested and within limits
-        val compressedResult = if (autoCompress && dataWithMetadata.size <= ResourceConstants.AUTO_COMPRESS_MAX_SIZE) {
+        // Decide the split before touching the data, from the TOTAL payload size
+        // (mirrors python Resource.py:295-301, computed from total_size before any
+        // read). A split transfer is driven segment by segment: each segment is an
+        // independent, self-contained transfer (own random_hash, compression
+        // decision, encryption, hash, expected proof and part map) announced in
+        // turn, exactly as python builds one Resource per segment (Resource.py:
+        // 296-329 for the file read, __prepare_next_segment at 765-779 for the
+        // follow-ups).
+        if (totalSize > ResourceConstants.MAX_EFFICIENT_SIZE) {
+            totalSegments = ((totalSize - 1) / ResourceConstants.MAX_EFFICIENT_SIZE) + 1
+            split = true
+        }
+
+        // SPLIT path (F3.1 parity): spill the payload to a temporary file, keep
+        // it open as [inputFile] (python `self.input_file`, Resource.py:274-314),
+        // and process ONLY the first segment in memory. prepareNextSegment reads
+        // the following chunks from the file when the previous segment's proof
+        // arrives (validateProof -> prepareNextSegment). Without the spill, an
+        // in-memory payload above MAX_EFFICIENT_SIZE marked split had no file to
+        // read segment 2 from: the proof validator waited forever for a segment
+        // that could never be produced (the remote DoS), and a port that merely
+        // bounds that wait (cancel after a deadline) still never CONCLUDES the
+        // transfer.
+        //
+        // First-segment content is [metadata block] + the first
+        // (MAX_EFFICIENT_SIZE - metadataBlockSize) RAW payload bytes; segment N>1
+        // content is the raw chunk at offset (N-2)*MAX_EFFICIENT_SIZE. Note the
+        // segment bounds are expressed in RAW payload bytes, and the metadata
+        // block is counted inside the first segment's MAX_EFFICIENT_SIZE budget
+        // (python first_read_size = MAX_EFFICIENT_SIZE - self.metadata_size,
+        // Resource.py:303-313). Only the ROOT resource (segment 1, non-continuation)
+        // spills and truncates; a continuation segment is ALREADY a single chunk
+        // read from the parent's file by prepareNextSegment, so it must not
+        // re-spill or re-truncate (guard: !segmentContinuation).
+        if (!segmentContinuation && split && segmentIndex == 1) {
+            val temp = File.createTempFile("rns-res-${System.nanoTime()}", ".tmp")
+            temp.deleteOnExit()
+            temp.outputStream().use { it.write(data) }
+            tempFile = temp
+            inputFile = RandomAccessFile(temp, "rw")
+
+            // First segment raw read: MAX_EFFICIENT_SIZE - metadataBlockSize.
+            // (python first_read_size / segment_read_size, Resource.py:303-313)
+            val firstChunk = ResourceConstants.MAX_EFFICIENT_SIZE - metadataBlockSize
+            val readLen = min(firstChunk, data.size)
+            val firstSegmentData = data.copyOfRange(0, readLen)
+
+            // Rebuild the metadata-prefixed content for this segment only: the
+            // metadata block (3-byte BE length + msgpack) + this segment's raw
+            // chunk. Non-first segments carry no metadata block.
+            dataWithMetadata = if (metadataBlockSize > 0 && metadata != null) {
+                val packedMetadata = msgpackPackBinary(metadata)
+                val metaPrefix = byteArrayOf(
+                    ((packedMetadata.size shr 16) and 0xFF).toByte(),
+                    ((packedMetadata.size shr 8) and 0xFF).toByte(),
+                    (packedMetadata.size and 0xFF).toByte()
+                )
+                metaPrefix + packedMetadata + firstSegmentData
+            } else {
+                firstSegmentData
+            }
+            uncompressedData = dataWithMetadata
+            uncompressedSize = dataWithMetadata.size
+        }
+
+        // Compress if requested and within limits. Mirrors python
+        // Resource.py:389-418: the auto-compress decision is made against the
+        // TOTAL payload size (data_size <= auto_compress_limit), applied per
+        // segment, and a segment is marked compressed only if compression
+        // actually shrank its own content.
+        val compressedResult = if (autoCompress && totalSize <= ResourceConstants.AUTO_COMPRESS_MAX_SIZE) {
             compress(dataWithMetadata)
         } else {
             dataWithMetadata
@@ -461,7 +568,7 @@ class Resource private constructor(
         encrypted = true
 
         size = encryptedData.size
-        log("initializeForSending: prefixedData=${prefixedData.size} bytes, encryptedData=${encryptedData.size} bytes")
+        log("initializeForSending: prefixedData=${prefixedData.size} bytes, encryptedData=${encryptedData.size} bytes (seg $segmentIndex/$totalSegments)")
 
         // Split encrypted data into parts
         val totalParts = ceil(size.toDouble() / sdu).toInt()
@@ -483,22 +590,26 @@ class Resource private constructor(
         }
         hashmapRaw = hashmapBuilder.toByteArray()
 
-        // Calculate resource hash from UNCOMPRESSED data (with metadata) + randomHash
-        // This matches Python: self.hash = RNS.Identity.full_hash(data+self.random_hash)
+        // Calculate resource hash from the segment's UNCOMPRESSED content (with
+        // metadata for segment 1) + randomHash. Mirrors python Resource.py:440-443
+        // where hash/expected_proof are computed over THIS segment's `data`
+        // (the compressed/uncompressed segment content), and original_hash chains
+        // from the previous segment (Resource.py:445-448, 772).
         hash = Hashes.fullHash(dataWithMetadata + randomHash)
-        originalHash = hash.copyOf()
-
-        // Calculate expected proof: full_hash(uncompressed_data + hash)
-        expectedProof = Hashes.fullHash(dataWithMetadata + hash)
-
-        // Check for segmentation
-        if (totalSize > ResourceConstants.MAX_EFFICIENT_SIZE) {
-            totalSegments = ((totalSize - 1) / ResourceConstants.MAX_EFFICIENT_SIZE) + 1
-            split = true
+        // The ROOT resource's original_hash is its own hash (the first-segment hash
+        // the whole transfer is keyed by, which continuations chain from, python
+        // Resource.py:445-446). A continuation segment instead inherits the parent's
+        // original_hash (python Resource.py:772, set by prepareNextSegment), so it
+        // must NOT re-derive it from its own hash here.
+        if (!segmentContinuation) {
+            originalHash = hash.copyOf()
         }
 
+        // Calculate expected proof: full_hash(segment content + hash)
+        expectedProof = Hashes.fullHash(dataWithMetadata + hash)
+
         status = ResourceConstants.QUEUED
-        log("Resource ${hash.toHexString()} created: $size bytes in ${parts.size} parts (compressed=$compressed, encrypted=$encrypted)")
+        log("Resource ${hash.toHexString()} created: $size bytes in ${parts.size} parts (compressed=$compressed, encrypted=$encrypted, seg $segmentIndex/$totalSegments)")
     }
 
     /**
@@ -624,6 +735,15 @@ class Resource private constructor(
         log("  send result: receipt=${receipt != null}, packet.sent=${packet.sent}")
         lastActivity = System.currentTimeMillis()
         advSent = lastActivity
+
+        // Pre-prepare the next segment of a split transfer in the background
+        // (python `advertise()`, Resource.py:528-530: a daemon thread runs
+        // __prepare_next_segment whenever segment_index < total_segments), so
+        // the segment is built by the time this one's proof arrives instead of
+        // the proof validator waiting for it.
+        if (split && segmentIndex < totalSegments) {
+            prepareNextSegment()
+        }
 
         startWatchdog()
         log("Advertised resource ${hash.toHexString()}")
@@ -1261,9 +1381,11 @@ class Resource private constructor(
                 // All segments complete, invoke callback
                 callbacks.completed?.invoke(this)
 
-                // Close input file if present
-                inputFile?.close()
-                inputFile = null
+                // The transfer's input file (and backing temp file) is no longer
+                // needed: the final segment's proof validated, so no further
+                // segment will be read from it. Mirrors python closing
+                // input_file on the final segment (Resource.py:796-805).
+                closeInputFile()
             }
 
             return true
@@ -1293,41 +1415,64 @@ class Resource private constructor(
                     return@thread
                 }
 
-                // Calculate segment data range
-                val firstSegmentSize = ResourceConstants.MAX_EFFICIENT_SIZE -
-                    (if (hasMetadata) metadata?.size ?: 0 else 0)
-                val segmentSize = ResourceConstants.MAX_EFFICIENT_SIZE
-
-                val dataStart = if (segmentIndex == 1) {
-                    0L
-                } else {
-                    firstSegmentSize + ((segmentIndex - 1L) * segmentSize)
-                }
+                // Segment N's RAW read window (python Resource.py:299-313), where N
+                // is the segment being PREPARED = segmentIndex + 1:
+                //   first_read_size = MAX_EFFICIENT_SIZE - metadata_size
+                //   segment 1:        seek 0,                       read first_read_size
+                //   segment N>=2:     seek first_read_size + (N-2)*MAX, read MAX
+                // So the segment we are preparing (N = segmentIndex+1, hence N>=2)
+                // starts at first_read_size + (segmentIndex-1)*MAX. Note
+                // metadata_size is the WIRE block size (3-byte length + packed),
+                // i.e. [metadataBlockSize], NOT the raw metadata payload length.
+                val firstSegmentSize = ResourceConstants.MAX_EFFICIENT_SIZE - metadataBlockSize
+                val dataStart = firstSegmentSize.toLong() +
+                    (segmentIndex - 1L) * ResourceConstants.MAX_EFFICIENT_SIZE
+                val readSize = min(
+                    ResourceConstants.MAX_EFFICIENT_SIZE.toLong(),
+                    file.length() - dataStart
+                ).toInt()
 
                 // Read next segment data
                 file.seek(dataStart)
-                val readSize = min(segmentSize.toLong(), file.length() - dataStart).toInt()
                 val segmentData = ByteArray(readSize)
                 file.readFully(segmentData)
 
-                // Create next segment resource (without metadata)
+                // Create the next segment resource (continuation: no metadata
+                // block of its own, carries the transfer's full total size and the
+                // root's original_hash). Mirrors python __prepare_next_segment
+                // (Resource.py:765-779): a fresh Resource on the same input file at
+                // segment_index+1, auto_compress = the transfer's auto_compress_option
+                // (so the segment re-runs its own compression decision), original_hash
+                // and request/response context carried from the parent.
                 nextSegment = Resource(link, initiator = true).apply {
                     this.callbacks.completed = this@Resource.callbacks.completed
                     this.callbacks.progress = this@Resource.callbacks.progress
                     this.callbacks.failed = this@Resource.callbacks.failed
+                    this.requestId = this@Resource.requestId
+                    this.isResponse = this@Resource.isResponse
 
                     initializeForSending(
                         data = segmentData,
                         metadata = null,
-                        autoCompress = compressed
+                        autoCompress = this@Resource.autoCompressOption,
+                        segmentContinuation = true,
+                        totalPayloadSize = this@Resource.totalSize
                     )
 
                     // Update segment tracking
                     this.segmentIndex = this@Resource.segmentIndex + 1
                     this.totalSegments = this@Resource.totalSegments
                     this.split = true
+                    // python continuation segments keep has_metadata True (via
+                    // sent_metadata_size, Resource.py:268-269/773) so the
+                    // advertisement's x flag matches the reference for every
+                    // segment; their content carries no metadata block, and the
+                    // receiver only strips at segment_index == 1 (Resource.py:697).
+                    this.hasMetadata = this@Resource.hasMetadata
                     this.originalHash = this@Resource.originalHash
+                    this.metadataBlockSize = this@Resource.metadataBlockSize
                     this.inputFile = this@Resource.inputFile
+                    this.tempFile = this@Resource.tempFile
                 }
 
                 log("Next segment prepared: ${nextSegment?.hash?.toHexString()}")
@@ -1413,10 +1558,16 @@ class Resource private constructor(
             // This matches Python where self.data in prove() includes metadata
             val dataForProof = assembled
 
-            // Strip metadata if present. The block is [3-byte BE len(packed)] +
-            // umsgpack.packb(metadata) (Resource.py:266/696-704); recover the raw
-            // metadata by msgpack-unpacking the packed slice.
-            if (hasMetadata && assembled.size > 3) {
+            // Strip metadata if present, but ONLY for segment 1. Mirrors python
+            // `Resource.assemble` (Resource.py:697):
+            //   if self.has_metadata and self.segment_index == 1:
+            // Continuation segments (segment_index > 1) carry no metadata block in
+            // their content (python writes the metadata file once, from segment 1,
+            // and each later segment's assembled stream is raw data), so stripping
+            // on them would eat real payload bytes. The block is [3-byte BE
+            // len(packed)] + umsgpack.packb(metadata) (Resource.py:266/696-704);
+            // recover the raw metadata by msgpack-unpacking the packed slice.
+            if (hasMetadata && segmentIndex == 1 && assembled.size > 3) {
                 val metaSize = ((assembled[0].toInt() and 0xFF) shl 16) or
                               ((assembled[1].toInt() and 0xFF) shl 8) or
                               (assembled[2].toInt() and 0xFF)
@@ -1479,6 +1630,28 @@ class Resource private constructor(
      * by the dedup guard inside `Resource.accept`, removing the
      * recovery path that existed pre-dedup.
      */
+    /**
+     * Release the split-transfer input file and delete its backing temp file.
+     * Idempotent and safe to call from any terminal path (final-segment proof
+     * or cancel). The delete is best-effort: the file was also registered with
+     * deleteOnExit as a last resort if the process exits before this runs.
+     */
+    private fun closeInputFile() {
+        try {
+            inputFile?.close()
+        } catch (e: Exception) {
+            log("Error closing resource input file: ${e.message}")
+        }
+        inputFile = null
+        val file = tempFile
+        if (file != null) {
+            tempFile = null
+            if (!file.delete()) {
+                log("Could not delete split-transfer temp file ${file.name}")
+            }
+        }
+    }
+
     fun cancel() {
         // Idempotency guard. Mirrors python `Resource.py:1090`'s
         // `elif self.status < Resource.COMPLETE:` check — once a resource
@@ -1527,6 +1700,7 @@ class Resource private constructor(
         }
         link.resourceConcluded(this)
         callbacks.failed?.invoke(this)
+        closeInputFile()
         log("Resource ${hash.toHexString()} cancelled")
     }
 
