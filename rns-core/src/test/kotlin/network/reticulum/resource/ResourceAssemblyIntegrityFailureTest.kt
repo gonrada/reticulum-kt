@@ -134,8 +134,8 @@ class ResourceAssemblyIntegrityFailureTest {
     }
 
     @Test
-    @DisplayName("a bz2 stream that inflates past the bound is a decompression bomb: CORRUPT + cancel")
-    fun `decompression bomb marks corrupt and cancels`() {
+    @DisplayName("a bz2 stream that inflates past the bound is a decompression bomb: CORRUPT")
+    fun `decompression bomb marks corrupt`() {
         val res = receiverResource(freshSingleLink())
         setField(res, "status", ResourceConstants.TRANSFERRING)
         setField(res, "encrypted", false)
@@ -150,6 +150,10 @@ class ResourceAssemblyIntegrityFailureTest {
 
         res.assembleForTest()
 
+        // The bomb guard marks the transfer CORRUPT. (It also calls cancel(), but
+        // markCorrupt runs first and sets status to CORRUPT, which is already a
+        // terminal state (>= COMPLETE), so cancel() is a no-op here and is not
+        // observable; only the CORRUPT transition is asserted.)
         assertEquals(ResourceConstants.CORRUPT, statusOf(res))
     }
 
