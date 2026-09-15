@@ -235,4 +235,61 @@ class ResourceTransferE2ETest : RnsLiveTestBase() {
 
         link.teardown()
     }
+
+    @Test
+    @DisplayName("In-memory resource above MAX_EFFICIENT_SIZE completes as a split transfer")
+    @Timeout(180)
+    fun `split in-memory resource from kotlin completes to python`() {
+        val link = establishLink()
+
+        link.setResourceStrategy(Link.ACCEPT_ALL)
+
+        // A payload above MAX_EFFICIENT_SIZE (1 MiB - 1) is split into multiple
+        // segments. The Kotlin sender must spill the in-memory payload to a
+        // temporary file and prepare each continuation segment from that file as
+        // the previous segment's proof arrives - the F3.1 path. Without it, the
+        // sender advertised the whole payload as one transfer, prepared no next
+        // segment, and the proof validator waited for a segment that never
+        // existed, spinning the inbound thread under the node jobs lock (remote
+        // DoS) until the transfer timed out.
+        val testData = ByteArray(1024 * 1024 + 512) { (it % 251).toByte() }
+        val completedLatch = CountDownLatch(1)
+        val completedResource = AtomicReference<Resource>()
+
+        println("  [Test] Sending ${testData.size} byte resource from Kotlin (should split into 2 segments)...")
+
+        val resource = Resource.create(
+            data = testData,
+            link = link,
+            callback = { r ->
+                completedResource.set(r)
+                completedLatch.countDown()
+            }
+        )
+
+        assertNotNull(resource)
+        assertTrue(resource.split, "payload above MAX_EFFICIENT_SIZE must be a split transfer")
+        assertEquals(2, resource.totalSegments, "1 MiB + 512 bytes splits into 2 segments")
+
+        val completed = completedLatch.await(120, TimeUnit.SECONDS)
+        assertTrue(completed, "Split resource transfer should complete within 120 seconds")
+
+        // Poll Python for the assembled resource.
+        val deadline = System.currentTimeMillis() + 30_000
+        var pythonResources: List<ReceivedResource> = emptyList()
+        while (System.currentTimeMillis() < deadline) {
+            pythonResources = getPythonResources()
+            if (pythonResources.isNotEmpty()) break
+            Thread.sleep(500)
+        }
+
+        assertTrue(pythonResources.isNotEmpty(), "Python should receive the split resource")
+        assertTrue(
+            testData.contentEquals(pythonResources[0].data),
+            "Assembled split resource data should match (${testData.size} bytes)"
+        )
+        println("  [Test] Kotlin -> Python split resource transfer verified! (${testData.size} bytes, ${resource.totalSegments} segments)")
+
+        link.teardown()
+    }
 }
