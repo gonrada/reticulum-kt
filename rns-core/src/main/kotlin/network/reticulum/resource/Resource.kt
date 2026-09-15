@@ -387,7 +387,14 @@ class Resource private constructor(
      */
     private var tempFile: File? = null
     private var inputFile: java.io.RandomAccessFile? = null
+    // @Volatile: written by the background segment-preparation thread and read by
+    // validateProof() on the Transport inbound thread (a cross-thread handoff by
+    // polling). Volatile gives the publication the happens-before visibility the
+    // code relies on, matching the @Volatile idiom used for the same pattern in
+    // Link.kt / Transport.kt.
+    @Volatile
     private var preparingNextSegment: Boolean = false
+    @Volatile
     private var nextSegment: Resource? = null
 
     // Proof tracking
@@ -506,6 +513,19 @@ class Resource private constructor(
         // read from the parent's file by prepareNextSegment, so it must not
         // re-spill or re-truncate (guard: !segmentContinuation).
         if (!segmentContinuation && split && segmentIndex == 1) {
+            // The first segment's RAW read is MAX_EFFICIENT_SIZE - metadataBlockSize
+            // (python first_read_size, Resource.py:303). A metadata block that fills
+            // or exceeds the whole segment budget makes that read size <= 0: the
+            // reference then reads with a negative size and CPython raises
+            // ValueError, so the reference does not complete this degenerate
+            // transfer either. Fail fast with a clear error before touching the
+            // file instead of a mid-init copyOfRange exception.
+            if (metadataBlockSize >= ResourceConstants.MAX_EFFICIENT_SIZE) {
+                throw IllegalArgumentException(
+                    "metadata block (${metadataBlockSize} bytes) leaves no room " +
+                        "for the first segment payload (budget ${ResourceConstants.MAX_EFFICIENT_SIZE} bytes)"
+                )
+            }
             val temp = File.createTempFile("rns-res-${System.nanoTime()}", ".tmp")
             temp.deleteOnExit()
             temp.outputStream().use { it.write(data) }
@@ -1349,7 +1369,7 @@ class Resource private constructor(
                 // appears. An in-memory resource created with create(data) for a
                 // payload above MAX_EFFICIENT_SIZE marks itself split (totalSegments >
                 // 1) but prepareNextSegment() has no input file to read from, so
-                // nextSegment can never be set and the loop spins forever ΓÇö reachable
+                // nextSegment can never be set and the loop spins forever - reachable
                 // by a peer simply completing an ordinary, valid transfer. Wait at
                 // most SEGMENT_WAIT_MS; if no segment is produced (the source can't be
                 // read, or the preparation thread died and cleared its flag), cancel
@@ -1412,6 +1432,9 @@ class Resource private constructor(
                 val file = inputFile
                 if (file == null) {
                     log("Cannot prepare next segment: no input file")
+                    // Clear the flag so the bounded wait in validateProof() exits
+                    // immediately instead of running the full 15 s deadline.
+                    preparingNextSegment = false
                     return@thread
                 }
 
