@@ -65,6 +65,18 @@ class Resource private constructor(
         private val random = SecureRandom()
 
         /**
+         * Upper bound (ms) on how long validateProof waits for the next segment
+         * of a split transfer to be prepared. The wait runs on the Transport
+         * inbound thread under the global jobs lock, so it must not be unbounded
+         * (F3.1). Preparation is a background bz2 + encrypt of at most
+         * MAX_EFFICIENT_SIZE bytes and is normally finished before the proof
+         * arrives; the bound only matters if the segment source cannot be read or
+         * the preparation thread dies, in which case the transfer is cancelled
+         * rather than the ingest thread stalled forever.
+         */
+        private const val SEGMENT_WAIT_MS: Long = 15_000
+
+        /**
          * Test-only watchdog suppression. Mirrors the reference conformance
          * harness monkeypatching `RNS.Resource.watchdog_job = lambda self: None`
          * around `_build_resource_receiver` (wire_tcp.py:6903) so an inbound
@@ -1210,13 +1222,35 @@ class Resource private constructor(
                     prepareNextSegment()
                 }
 
-                // Wait for next segment to be ready
-                while (nextSegment == null) {
+                // Wait for the next segment, but BOUNDED. validateProof runs on the
+                // Transport inbound thread under the global jobs lock, so an
+                // unbounded `while (nextSegment == null) Thread.sleep(50)` here stalls
+                // inbound processing for every interface on the node until a segment
+                // appears. An in-memory resource created with create(data) for a
+                // payload above MAX_EFFICIENT_SIZE marks itself split (totalSegments >
+                // 1) but prepareNextSegment() has no input file to read from, so
+                // nextSegment can never be set and the loop spins forever ΓÇö reachable
+                // by a peer simply completing an ordinary, valid transfer. Wait at
+                // most SEGMENT_WAIT_MS; if no segment is produced (the source can't be
+                // read, or the preparation thread died and cleared its flag), cancel
+                // the transfer rather than hang the ingest thread.
+                val segmentDeadline = System.currentTimeMillis() + SEGMENT_WAIT_MS
+                while (nextSegment == null &&
+                    preparingNextSegment &&
+                    System.currentTimeMillis() < segmentDeadline
+                ) {
                     Thread.sleep(50)
                 }
 
+                val next = nextSegment
+                if (next == null) {
+                    log("Could not prepare segment ${segmentIndex + 1}/$totalSegments; cancelling transfer")
+                    cancel()
+                    return false
+                }
+
                 // Advertise the next segment
-                nextSegment?.advertise()
+                next.advertise()
 
                 // Clean up this segment's data
                 uncompressedData = null

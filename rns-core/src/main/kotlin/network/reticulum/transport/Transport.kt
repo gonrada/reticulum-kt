@@ -4132,8 +4132,21 @@ object Transport {
 
         // Check if this is data for a local link (destination hash is a link_id)
         // Python iterates ALL matching links and checks attached_interface (Transport.py:1971-1984)
+        //
+        // python Transport.py:2571 gates the active-link lookup on
+        // `packet.destination_type == RNS.Destination.LINK`. Without that gate a
+        // captured link DATA packet whose destination-type bits are rewritten to
+        // PLAIN/GROUP (and hops set to 0) bypasses the packet hashlist entirely ΓÇö
+        // packetFilter never deduplicates PLAIN/GROUP packets ΓÇö and is decrypted
+        // and re-delivered to link.receive without limit, replaying authenticated
+        // link traffic to the application.
         val key = packet.destinationHash.toKey()
-        val matchingLinks = activeLinks.filter { getLinkId(it)?.toKey() == key }
+        val matchingLinks =
+            if (packet.destinationType == DestinationType.LINK) {
+                activeLinks.filter { getLinkId(it)?.toKey() == key }
+            } else {
+                emptyList()
+            }
         if (matchingLinks.isNotEmpty()) {
             for (link in matchingLinks) {
                 // Python: if link.attached_interface == packet.receiving_interface
@@ -4168,6 +4181,19 @@ object Transport {
         // created by the general block (Transport.py:1495-1501).
         val myHash = identity?.hash
         if (packet.transportId != null && myHash != null && packet.transportId!!.contentEquals(myHash)) {
+            return
+        }
+
+        // python Transport.py:1997 ΓÇö forwarding of any kind happens only inside
+        // `if transport_enabled() or from_local_client or for_local_client or
+        // for_local_client_link:`. A node with transport disabled must never relay
+        // packets between its interfaces (including from an open interface into an
+        // IFAC-protected one), and must not grow reverseTable for foreign traffic.
+        // A for_local_client packet already had its transport_id synthesised in
+        // processInbound and was relayed by the general block (then returned by the
+        // transport_id == myHash check above); what remains reaching here is the
+        // shared-instance flow from a local client, so gate on that.
+        if (!transportEnabled && !fromLocalClient(interfaceRef)) {
             return
         }
 
