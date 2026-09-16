@@ -3161,9 +3161,54 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
             "ciphertext" -> raw.copyOf().also { it[payloadOff + 4] = ((it[payloadOff + 4].toInt() + 1) and 0xFF).toByte() }
             "hmac" -> raw.copyOf().also { it[it.size - 1] = ((it[it.size - 1].toInt() + 1) and 0xFF).toByte() }
             "truncate" -> raw.copyOf(raw.size - 1)
-            "none", "foreign_interface" -> raw
+            "none", "foreign_interface", "pristine_link_inbound", "replay_reflag" -> raw
             else -> throw IllegalArgumentException("unknown corruption: $corruption")
         }
+
+        // pristine_link_inbound + replay_reflag must traverse the LIVE
+        // Transport.inbound path - the place where python Transport.data() gates
+        // local-link delivery on packet.destination_type == LINK
+        // (Transport.py:2155) - NOT link.receive, which skips that gate and would
+        // deliver regardless.
+        //
+        // pristine_link_inbound: push an UNTOUCHED (LINK-flagged) link DATA packet
+        // through the live inbound path - the POSITIVE CONTROL for replay_reflag,
+        // proving the inbound path + active-link dispatch + decrypt + handler
+        // delivery all work. MUST deliver on a correct implementation.
+        //
+        // replay_reflag: re-flag a PRISTINE (correctly encrypted/signed) link DATA
+        // packet to a PLAIN, hops-0 packet (link_id still in the destination
+        // position) - the wire capture an attacker makes of a normal link packet.
+        // The token is intact so Link.decrypt still succeeds; the only defense is
+        // the destination_type == LINK gate. flag byte:
+        // header(6:7)|ctx(5)|transport(4)|dest_type(2:3)|packet(0:1); LINK=0b11,
+        // PLAIN=0b10. Python drops it (gate); a port that matches active links by
+        // link_id without checking destination_type re-delivers the replayed
+        // payload (link-data replay).
+        if (corruption == "pristine_link_inbound" || corruption == "replay_reflag") {
+            val inj = raw.copyOf()
+            if (corruption == "replay_reflag") {
+                inj[0] = ((inj[0].toInt() and 0b11111001) or (0b00000010 shl 2)).toByte() // dest-type -> PLAIN
+                inj[1] = 0.toByte()                                                       // hops -> 0
+            }
+            val rx2 = Packet.unpack(inj)
+            val unpacked2 = rx2 != null
+            val ifaceRef = link.attachedInterfaceHash
+                ?.let { Transport.findInterfaceByHashForTest(it) }
+            if (unpacked2 && ifaceRef != null) {
+                Transport.inbound(inj, ifaceRef)
+            }
+            Thread.sleep(50)
+            val after2 = listener.recvBuffer.size
+            return@handleWireCmd3 result(
+                "corruption" to strVal(corruption),
+                "unpacked" to boolVal(unpacked2),
+                "delivered" to boolVal(after2 > before),
+                "link_active" to boolVal(link.status == LinkConstants.ACTIVE),
+                "status_name" to (LINK_STATUS_NAMES[link.status]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            )
+        }
+
         val rx = Packet.unpack(raw)
         val unpacked = rx != null
         if (rx != null) {
@@ -3504,6 +3549,15 @@ private fun handleWireCmd4(command: String, p: JsonObject): JsonObject? = when (
         val sigLen = network.reticulum.common.RnsConstants.SIGNATURE_SIZE
         val proof: ByteArray = when (variant) {
             "valid_explicit" -> receipt.hash + link.sign(receipt.hash)
+            "forged_explicit" -> {
+                // 96B EXPLICIT with the CORRECT proof-hash but a signature under a
+                // THROWAWAY (wrong) identity key. link.validate verifies against
+                // the link's peerSigPub, so a wrong-key signature MUST be rejected
+                // even though the length and leading hash are both correct (the
+                // unauthenticated delivery-proof vector: a Link.validate that
+                // ignores the verification result accepts any 64 bytes).
+                receipt.hash + Identity.create().sign(receipt.hash)
+            }
             "implicit_valid_sig" -> link.sign(receipt.hash)
             "implicit_random" -> crypto.randomBytes(sigLen)
             "wrong_length_short" -> crypto.randomBytes(sigLen / 2)
@@ -4317,6 +4371,51 @@ private fun handleWireCmd5(command: String, p: JsonObject): JsonObject? = when (
                 result(*out.toTypedArray())
             }
         }
+    }
+
+    "wire_build_data_packet" -> {
+        // Build (do NOT send) a genuine HEADER_1 DATA packet to a destination
+        // hash and return the packed raw frame. Mirror of
+        // cmd_wire_build_data_packet (reference/wire_tcp.py). Used by the
+        // F1.2 unconditional-relay repro: the middle node (transport
+        // DISABLED) builds a HEADER_1 (transportId null) DATA packet
+        // addressed to a peer it has a 1-hop path to; the test injects the
+        // frame onto the middle's own interface via
+        // wire_inject_raw_frame/inject_external and watches the other peer's
+        // inbound tap for the relay.
+        //
+        // The destination hash is direction-independent (it is
+        // Identity.hash(name) over identity + app_name + aspects), so the
+        // constructed OUT destination hashes to the same 16 bytes as the
+        // peer's IN destination. Packet.create defaults to HEADER_1 and
+        // pack() never consults the path table or inserts a transport id
+        // (the HEADER_2 upgrade happens at send()/outbound, not pack()), so
+        // the returned raw is a genuine direct frame the live inbound path
+        // will accept. No protocol bytes are assembled here: encrypt and
+        // pack are RNS's own.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val appName = p.get("app_name")?.asString ?: "relay"
+        val aspects = p.get("aspects")?.asJsonArray?.map { it.asString }?.toTypedArray() ?: arrayOf("f12")
+        val payload = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: "relay-probe".toByteArray()
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val identity = Identity.recall(destHash)
+            ?: throw IllegalStateException(
+                "No identity known for ${destHash.toHex()}; the handle must have " +
+                    "received an announce for this destination first.",
+            )
+        val outDest = Destination.create(identity, DestinationDirection.OUT, DestinationType.SINGLE, appName, *aspects)
+        val packet = Packet.create(outDest, payload, createReceipt = false)
+        val raw = packet.pack()
+        inst.destinations.add(identity to outDest)
+        result(
+            "dest_hash" to hexVal(destHash),
+            "frame_len" to intVal(raw.size),
+            "raw" to hexVal(raw),
+        )
     }
 
     "wire_inject_single_proof_format" -> {
