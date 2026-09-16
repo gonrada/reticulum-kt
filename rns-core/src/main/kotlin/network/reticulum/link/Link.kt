@@ -913,14 +913,23 @@ class Link private constructor(
 
     /**
      * Validate a signature from the peer.
+     *
+     * Returns the Ed25519 verification RESULT. Python's Link.validate
+     * (Link.py:1211-1215) calls verify(), which raises on a bad signature, and
+     * returns False; a pass requires the signature to actually verify. This
+     * method previously discarded the boolean from ed25519Verify and returned a
+     * hardcoded `true`, so any 64 bytes were accepted as a valid delivery-proof
+     * signature and a third party who could see a link packet on the wire could
+     * forge a DELIVERED confirmation for it. A missing peer key or any verifier
+     * exception is a failed validation, never a pass.
      */
     fun validate(
         signature: ByteArray,
         message: ByteArray,
     ): Boolean =
         try {
-            crypto.ed25519Verify(peerSigPub!!, message, signature)
-            true
+            val key = peerSigPub ?: return false
+            crypto.ed25519Verify(key, message, signature)
         } catch (e: Exception) {
             false
         }
