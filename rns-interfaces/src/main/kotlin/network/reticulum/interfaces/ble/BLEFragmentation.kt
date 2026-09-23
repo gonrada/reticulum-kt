@@ -153,6 +153,9 @@ private class ReassemblyBuffer(
 ) {
     /** Received fragments indexed by sequence number */
     val fragments: MutableMap<Int, ByteArray> = mutableMapOf()
+
+    /** Payload bytes accumulated so far, bounded by [BLEReassembler.maxPacketBytes]. */
+    var bytes: Int = 0
 }
 
 /**
@@ -161,9 +164,30 @@ private class ReassemblyBuffer(
  * Maintains reassembly buffers per sender and handles timeouts for
  * incomplete packets. Thread-safe via synchronized access.
  *
+ * Reassembly is bounded: a START whose `total` exceeds the number of fragments a
+ * [maxPacketBytes]-byte packet could need (one payload byte per fragment) is rejected
+ * outright, and a buffer whose accumulated payload passes [maxPacketBytes] is dropped.
+ * Without those bounds a peer could open a 65535-fragment buffer and fill it
+ * indefinitely (up to ~32 MB per connection) without ever sending the last fragment.
+ *
  * @param timeoutMs Milliseconds to wait for complete packet before discarding (default 30000)
+ * @param maxPacketBytes Largest reassembled packet accepted (default Reticulum MTU, 500)
  */
-class BLEReassembler(private val timeoutMs: Long = 30_000L) {
+class BLEReassembler(
+    private val timeoutMs: Long = 30_000L,
+    private val maxPacketBytes: Int = network.reticulum.common.RnsConstants.MTU,
+) {
+
+    init {
+        require(maxPacketBytes > 0) { "maxPacketBytes must be positive" }
+    }
+
+    /**
+     * Largest `total` accepted: the fragment count of a [maxPacketBytes]-byte packet
+     * sent with the minimum possible payload (one byte per fragment), capped by the
+     * 16-bit wire field.
+     */
+    val maxTotalFragments: Int = minOf(maxPacketBytes, BLEFragmenter.MAX_FRAGMENTS)
 
     /** Reassembly buffers keyed by sender ID */
     private val buffers: MutableMap<String, ReassemblyBuffer> = mutableMapOf()
@@ -250,15 +274,41 @@ class BLEReassembler(private val timeoutMs: Long = 30_000L) {
                 }
             }
 
+            // Bound accumulated payload: drop the whole buffer once it passes the
+            // largest packet this interface can deliver.
+            if (buffer.bytes + data.size > maxPacketBytes) {
+                buffers.remove(senderId)
+                throw IllegalArgumentException(
+                    "Reassembly for $senderId exceeds $maxPacketBytes bytes " +
+                        "(${buffer.bytes} + ${data.size}); buffer discarded"
+                )
+            }
+
             // Store fragment
             buffer.fragments[sequence] = data
+            buffer.bytes += data.size
         } else {
+            // A total no packet within maxPacketBytes could need is rejected before any
+            // buffer exists, so a bogus START cannot reserve a 65535-slot reassembly.
+            if (total > maxTotalFragments) {
+                throw IllegalArgumentException(
+                    "Fragment total $total from $senderId exceeds max $maxTotalFragments " +
+                        "for a $maxPacketBytes-byte packet"
+                )
+            }
+            if (data.size > maxPacketBytes) {
+                throw IllegalArgumentException(
+                    "Fragment payload ${data.size} from $senderId exceeds $maxPacketBytes bytes"
+                )
+            }
+
             // Create new buffer
             val newBuffer = ReassemblyBuffer(
                 total = total,
                 senderId = senderId
             )
             newBuffer.fragments[sequence] = data
+            newBuffer.bytes = data.size
             buffers[senderId] = newBuffer
         }
 

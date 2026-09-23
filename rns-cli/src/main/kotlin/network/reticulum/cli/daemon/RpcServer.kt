@@ -49,7 +49,9 @@ class RpcServer(
 
     fun start() {
         try {
-            serverSocket = ServerSocket(port)
+            // Bind the loopback address only: the RPC socket carries unauthenticated control
+            // requests and must not be reachable from the network, as in the reference.
+            serverSocket = ServerSocket(port, 50, java.net.InetAddress.getLoopbackAddress())
             serverSocket?.reuseAddress = true
             running.set(true)
 
@@ -113,6 +115,13 @@ class RpcServer(
                     val request = receivePickle(input) ?: break
                     val response = handleRequest(request)
                     sendPickle(output, response)
+                } catch (e: StackOverflowError) {
+                    // Decoding, logging or answering a request nested deeper than the stack
+                    // overflows it. That is a malformed request, not a fatal condition:
+                    // only the Exception branch below caught before, so the handler thread
+                    // died instead of closing the connection.
+                    Logger.debug("Rejected an RPC request nested beyond the stack")
+                    break
                 } catch (e: Exception) {
                     Logger.debug("RPC request error: ${e.message}")
                     break

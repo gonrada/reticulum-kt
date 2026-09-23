@@ -184,6 +184,15 @@ class BLEPeerInterface(
     }
 
     /**
+     * Drop reassembly buffers that have waited longer than the reassembler's timeout.
+     * Driven by the parent's zombie-detection tick; without it an incomplete packet's
+     * fragments were retained for the life of the connection.
+     *
+     * @return Number of stale buffers removed
+     */
+    internal fun cleanupStaleReassembly(): Int = reassembler.cleanupStale()
+
+    /**
      * Fragment outgoing data and send via BLE connection.
      *
      * Transport calls this synchronously. BLE send is async (suspend function),

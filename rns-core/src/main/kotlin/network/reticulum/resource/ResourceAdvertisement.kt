@@ -130,22 +130,21 @@ class ResourceAdvertisement private constructor() {
                         "t" -> adv.transferSize = unpacker.unpackInt()
                         "d" -> adv.dataSize = unpacker.unpackInt()
                         "n" -> adv.numParts = unpacker.unpackInt()
-                        "h" -> {
-                            val len = unpacker.unpackBinaryHeader()
-                            adv.hash = unpacker.readPayload(len)
-                        }
-                        "r" -> {
-                            val len = unpacker.unpackBinaryHeader()
-                            adv.randomHash = unpacker.readPayload(len)
-                        }
-                        "o" -> {
-                            val len = unpacker.unpackBinaryHeader()
-                            adv.originalHash = unpacker.readPayload(len)
-                        }
-                        "m" -> {
-                            val len = unpacker.unpackBinaryHeader()
-                            adv.hashmap = unpacker.readPayload(len)
-                        }
+                        // Every bin field goes through readBinary, which checks the
+                        // declared length against the buffer before anything is
+                        // allocated. Fixed-size fields: h and o are full hashes, r is
+                        // RANDOM_HASH_SIZE bytes (Resource.py:1340-1342 packs
+                        // resource.hash / random_hash / original_hash).
+                        "h" -> adv.hash = readBinary(unpacker, data.size, exact = ResourceConstants.RESOURCE_HASH_LEN)
+                            ?: return null
+                        "r" -> adv.randomHash = readBinary(unpacker, data.size, exact = ResourceConstants.RANDOM_HASH_SIZE)
+                            ?: return null
+                        "o" -> adv.originalHash = readBinary(unpacker, data.size, exact = ResourceConstants.RESOURCE_HASH_LEN)
+                            ?: return null
+                        // The hashmap slice carries at most HASHMAP_MAX_LEN entries
+                        // (Resource.py:1347, pack's segment slicing).
+                        "m" -> adv.hashmap = readBinary(unpacker, data.size, max = HASHMAP_MAX_LEN * ResourceConstants.MAPHASH_LEN)
+                            ?: return null
                         "f" -> adv.flags = unpacker.unpackInt()
                         "i" -> adv.segmentIndex = unpacker.unpackInt()
                         "l" -> adv.totalSegments = unpacker.unpackInt()
@@ -153,8 +152,10 @@ class ResourceAdvertisement private constructor() {
                             if (unpacker.tryUnpackNil()) {
                                 adv.requestId = null
                             } else {
-                                val len = unpacker.unpackBinaryHeader()
-                                adv.requestId = unpacker.readPayload(len)
+                                // A request id is a truncated hash; allow up to a
+                                // full hash but never more.
+                                adv.requestId = readBinary(unpacker, data.size, max = ResourceConstants.RESOURCE_HASH_LEN)
+                                    ?: return null
                             }
                         }
                         else -> unpacker.skipValue()
@@ -165,6 +166,22 @@ class ResourceAdvertisement private constructor() {
                 // Reject an advertisement missing any required key, mirroring the
                 // KeyError python's unpack would raise (Resource.py:1363-1373).
                 if (!seenKeys.containsAll(REQUIRED_KEYS)) {
+                    return null
+                }
+
+                // Reject an implausible transfer size before it reaches the
+                // part-count allocation in Resource.initializeFromAdvertisement
+                // (arrayOfNulls of ceil(size / sdu), twice). Mirrors python
+                // `ResourceAdvertisement.unpack` (Resource.py:1363), which raises
+                // ValueError on t > MAX_EFFICIENT_SIZE*3, caught by Resource.accept
+                // and treated as a dropped advertisement. Without this a peer could
+                // advertise a size near Int.MAX_VALUE and force tens of megabytes
+                // of array allocation per advertisement. The negative guard also
+                // rejects a msgpack-signed size that would otherwise reach
+                // arrayOfNulls(negative).
+                if (adv.transferSize < 0 ||
+                    adv.transferSize > ResourceConstants.MAX_EFFICIENT_SIZE * 3
+                ) {
                     return null
                 }
 
@@ -180,6 +197,34 @@ class ResourceAdvertisement private constructor() {
             } catch (e: Exception) {
                 null
             }
+        }
+
+        /**
+         * Read one msgpack bin value, refusing to allocate for a declared length
+         * that the input cannot back. msgpack-core's `readPayload(n)` allocates
+         * `new byte[n]` before reading, so a 5-byte bin32 header claiming up to
+         * 2^31-1 bytes inside a ~430-byte packet forced a multi-hundred-megabyte
+         * allocation, or an OutOfMemoryError that no `catch (Exception)` sees.
+         * Python's umsgpack reads `fp.read(n)` and raises InsufficientDataException
+         * without allocating; this is the equivalent.
+         *
+         * @param total  size of the buffer being unpacked
+         * @param exact  required length, when the field has a fixed size
+         * @param max    upper bound, when the field is variable-length
+         * @return the payload, or null if the declared length is out of bounds
+         */
+        private fun readBinary(
+            unpacker: org.msgpack.core.MessageUnpacker,
+            total: Int,
+            exact: Int? = null,
+            max: Int = Int.MAX_VALUE,
+        ): ByteArray? {
+            val len = unpacker.unpackBinaryHeader()
+            val remaining = total - unpacker.totalReadBytes
+            if (len < 0 || len > remaining) return null
+            if (exact != null && len != exact) return null
+            if (len > max) return null
+            return unpacker.readPayload(len)
         }
 
         private fun buildFlags(

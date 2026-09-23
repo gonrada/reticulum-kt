@@ -687,6 +687,15 @@ class BLEInterface(
             delay(BLEConstants.ZOMBIE_CHECK_INTERVAL_MS)
             val now = System.currentTimeMillis()
 
+            // Expire incomplete reassemblies on the same tick, so an unfinished packet's
+            // fragments are not retained for the life of the connection.
+            for ((identityHex, peerInterface) in peers.toMap()) {
+                try {
+                    val removed = peerInterface.cleanupStaleReassembly()
+                    if (removed > 0) log("Dropped $removed stale reassembly buffer(s) for ${identityHex.take(8)}")
+                } catch (_: Exception) {}
+            }
+
             for ((identityHex, peerInterface) in peers.toMap()) {
                 val lastTraffic = peerInterface.lastTrafficReceived
                 if (now - lastTraffic > BLEConstants.ZOMBIE_TIMEOUT_MS) {

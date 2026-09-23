@@ -110,7 +110,9 @@ class I2PInterfacePeer(
     private var tunnelJob: Job? = null
     private var samSessionConnection: SamConnection? = null
 
-    private val hdlcDeframer = HDLC.createDeframer { data ->
+    // A peer that never sends a closing FLAG must not grow the deframer without limit:
+    // one MTU of payload escapes to at most twice its size.
+    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = 2 * hwMtu + 16) { data ->
         processIncoming(data)
     }
 
@@ -277,6 +279,13 @@ class I2PInterfacePeer(
             // Normal shutdown
         } catch (e: IOException) {
             if (!detached.get()) {
+                setOnline(false)
+            }
+        } catch (e: Exception) {
+            // python TCPInterface.py:426-434 / I2PInterface.py read_loop catch Exception:
+            // go offline so the teardown/reconnect path below runs.
+            if (!detached.get()) {
+                log("Read loop error: ${e.javaClass.name}: ${e.message}")
                 setOnline(false)
             }
         }

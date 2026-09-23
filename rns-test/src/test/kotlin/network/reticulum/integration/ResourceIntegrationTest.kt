@@ -110,7 +110,8 @@ class ResourceIntegrationTest {
         packer.packInt(5)     // num parts
 
         packer.packString("h")
-        val hash = ByteArray(16) { it.toByte() }
+        // Resource hashes are full SHA-256 digests (Resource.py: hash = full_hash(...)).
+        val hash = ByteArray(32) { it.toByte() }
         packer.packBinaryHeader(hash.size)
         packer.writePayload(hash)
 

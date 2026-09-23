@@ -102,13 +102,34 @@ object InterfaceConfigFactory {
             targetHost = targetHost,
             targetPort = targetPort,
             maxReconnectAttempts = config.maxReconnectTries,
-        )
+            // network_name / passphrase / ifac_size were parsed into the options map but
+            // never handed to the interface, so a configured IFAC ran in the clear.
+            ifacNetname = config.ifacNetname,
+            ifacNetkey = config.ifacNetkey,
+            ifacSizeBits = config.ifacSizeBits,
+        ).also { applyIngressControlKnobs(it, config) }
+    }
+
+    /**
+     * Apply the announce ingress-control knobs of an interface section. They were parsed
+     * into the options map but never reached the interface, so an operator's tuning had
+     * no effect and the limiter ran on its defaults.
+     */
+    internal fun applyIngressControlKnobs(iface: Interface, config: InterfaceConfig) {
+        config.ingressControl?.let { iface.setIngressControl(it) }
+        config.icNewTimeSeconds?.let { iface.icNewTimeMs = (it * 1000).toLong() }
+        config.icBurstFreqNew?.let { iface.icBurstFreqNew = it }
+        config.icBurstFreq?.let { iface.icBurstFreq = it }
+        config.icBurstHoldSeconds?.let { iface.icBurstHoldMs = (it * 1000).toLong() }
+        config.icBurstPenaltySeconds?.let { iface.icBurstPenaltyMs = (it * 1000).toLong() }
+        config.icHeldReleaseIntervalSeconds?.let { iface.icHeldReleaseIntervalMs = (it * 1000).toLong() }
+        config.icMaxHeldAnnounces?.let { iface.icMaxHeldAnnounces = it }
     }
 
     /**
      * Create a TCP server interface.
      */
-    private fun createTcpServer(config: InterfaceConfig): Interface? {
+    internal fun createTcpServer(config: InterfaceConfig): Interface? {
         val listenIp = config.listenIp ?: "0.0.0.0"
         val listenPort = config.listenPort
 
@@ -122,8 +143,11 @@ object InterfaceConfigFactory {
         return TCPServerInterface(
             name = config.name,
             bindAddress = listenIp,
-            bindPort = listenPort
-        )
+            bindPort = listenPort,
+            ifacNetname = config.ifacNetname,
+            ifacNetkey = config.ifacNetkey,
+            ifacSizeBits = config.ifacSizeBits,
+        ).also { applyIngressControlKnobs(it, config) }
     }
 
     /**

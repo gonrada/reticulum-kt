@@ -35,7 +35,7 @@ dependencies {
     api("io.kotest:kotest-assertions-core:$kotestVersion")
 
     // MessagePack for resource tests
-    testImplementation("org.msgpack:msgpack-core:0.9.8")
+    testImplementation("org.msgpack:msgpack-core:0.9.12")
 
     // Testing
     testImplementation(kotlin("test"))

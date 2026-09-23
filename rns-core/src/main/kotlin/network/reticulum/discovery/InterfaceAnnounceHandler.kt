@@ -112,7 +112,7 @@ class InterfaceAnnounceHandler(
             repeat(mapSize) {
                 val key = unpacker.unpackInt()
                 present.add(key)
-                fields[key] = unpackValue(unpacker)
+                fields[key] = unpackValue(unpacker, packed.size)
             }
 
             // python: `if INTERFACE_TYPE in unpacked:` ... else info stays None
@@ -278,7 +278,7 @@ class InterfaceAnnounceHandler(
         println("[Discovery:Handler] $msg")
     }
 
-    private fun unpackValue(unpacker: org.msgpack.core.MessageUnpacker): Any? {
+    private fun unpackValue(unpacker: org.msgpack.core.MessageUnpacker, inputLimit: Int = Int.MAX_VALUE): Any? {
         val format = unpacker.nextFormat
         return when (format.valueType) {
             org.msgpack.value.ValueType.NIL -> { unpacker.unpackNil(); null }
@@ -291,7 +291,11 @@ class InterfaceAnnounceHandler(
             org.msgpack.value.ValueType.FLOAT -> unpacker.unpackDouble()
             org.msgpack.value.ValueType.STRING -> unpacker.unpackString()
             org.msgpack.value.ValueType.BINARY -> {
+                // The declared length is attacker-controlled and msgpack-core allocates it
+                // before reading; a bin32 header claiming gigabytes inside a 500-byte
+                // announce must not reach `ByteArray(len)`. Bound it by what is left.
                 val len = unpacker.unpackBinaryHeader()
+                if (len < 0 || len > inputLimit) throw IllegalArgumentException("discovery record bin length $len exceeds the record")
                 unpacker.readPayload(len)
             }
             else -> { unpacker.skipValue(); null }

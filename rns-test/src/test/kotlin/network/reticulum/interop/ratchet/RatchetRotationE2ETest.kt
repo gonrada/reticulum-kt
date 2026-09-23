@@ -19,7 +19,7 @@ import kotlin.test.assertTrue
  * Ratchets provide forward secrecy: a destination generates an X25519 keypair,
  * embeds the public half in announces, and peers use it for an extra encryption
  * layer. When the ratchet rotates, a new keypair is generated and announced.
- * Old ratchets remain available for backward compatibility.
+ * Exactly one ratchet is kept per destination, so a rotation replaces the stored key.
  */
 @DisplayName("Ratchet Rotation E2E Tests")
 class RatchetRotationE2ETest : RnsLiveTestBase() {
@@ -131,13 +131,8 @@ class RatchetRotationE2ETest : RnsLiveTestBase() {
             "Kotlin's new ratchet ID should match Python's rotated ID"
         )
 
-        // Verify old ratchet is still available in the fallback list
-        val allRatchets = Identity.getRatchets(pythonDestHash!!)
-        assertTrue(allRatchets.size >= 2, "Should have at least 2 ratchets (old + new)")
-        println("  [Test] Total stored ratchets: ${allRatchets.size}")
-
-        // The newest ratchet (index 0) should match the rotated one
-        val newestRatchet = allRatchets[0]
+        // Exactly one ratchet is kept per destination: the stored one must be the rotated one
+        val newestRatchet = Identity.getRatchet(pythonDestHash!!)!!
         val newestRatchetId = network.reticulum.crypto.Hashes.fullHash(newestRatchet)
             .copyOfRange(0, 10)
         assertEquals(
@@ -146,6 +141,6 @@ class RatchetRotationE2ETest : RnsLiveTestBase() {
             "Newest stored ratchet should match rotated ratchet"
         )
 
-        println("  [Test] Ratchet rotation verified — old ratchet preserved, new ratchet active!")
+        println("  [Test] Ratchet rotation verified: the rotated ratchet is the stored one")
     }
 }

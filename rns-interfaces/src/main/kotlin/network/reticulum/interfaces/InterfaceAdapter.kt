@@ -21,6 +21,11 @@ class InterfaceAdapter private constructor(
     override val rxBytes: Long get() = iface.rxBytes.get()
     override val txBytes: Long get() = iface.txBytes.get()
     override val mode: InterfaceMode get() = iface.modeOverride ?: iface.mode
+    // Never forwarded before, so every adapted interface reported the InterfaceRef
+    // default of 0. The announce-cap egress spacing is (len*8/bitrate)/announce_cap,
+    // and a zero bitrate made that wait zero: the 2% announce bandwidth cap was a
+    // silent no-op on every real interface that goes through this adapter.
+    override val bitrate: Int get() = iface.bitrate
     override val announceCap: Double get() = iface.announceCap
     override val hwMtu: Int get() = iface.hwMtu ?: RnsConstants.MTU
     override val supportsLinkMtuDiscovery: Boolean get() = iface.supportsLinkMtuDiscovery

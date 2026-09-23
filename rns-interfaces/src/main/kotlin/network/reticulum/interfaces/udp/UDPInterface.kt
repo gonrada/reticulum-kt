@@ -270,6 +270,13 @@ class UDPInterface(
                 if (running.get() && !detached.get()) {
                     log("Read error: ${e.message}")
                 }
+            } catch (e: Exception) {
+                // Catch-all (python TCPInterface.py:426-434 pattern): a RuntimeException
+                // ends this loop, so report offline instead of leaving a zombie interface.
+                if (running.get() && !detached.get()) {
+                    log("Read loop error: ${e.javaClass.name}: ${e.message}")
+                    setOnline(false)
+                }
             }
 
             log("Read loop stopped")
@@ -299,6 +306,12 @@ class UDPInterface(
             } catch (e: IOException) {
                 if (running.get() && !detached.get()) {
                     log("Multicast read error: ${e.message}")
+                }
+            } catch (e: Exception) {
+                // Catch-all (python TCPInterface.py:426-434 pattern): see startReadLoop.
+                if (running.get() && !detached.get()) {
+                    log("Multicast read loop error: ${e.javaClass.name}: ${e.message}")
+                    setOnline(false)
                 }
             }
 

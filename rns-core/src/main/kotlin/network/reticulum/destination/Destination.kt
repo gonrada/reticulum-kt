@@ -114,6 +114,21 @@ class Destination private constructor(
     var acceptLinkRequests: Boolean = true
 
     /**
+     * python Destination.max_request_size: null means unlimited. Applied by Link to the
+     * packed size of a packet request and to the advertised size of a request resource,
+     * so an application can refuse oversized requests before they are received.
+     */
+    @Volatile
+    var maxRequestSize: Int? = null
+        private set
+
+    /** python Destination.set_max_request_size (Destination.py:369). */
+    fun setMaxRequestSize(size: Int) {
+        require(size >= 0) { "Maximum request size cannot be negative" }
+        maxRequestSize = size
+    }
+
+    /**
      * Callback for incoming packets. Set this to receive packets.
      */
     var packetCallback: ((data: ByteArray, packet: Any) -> Unit)? = null
@@ -338,12 +353,14 @@ class Destination private constructor(
      * store, mirroring the reference's `destination.ratchets = None;
      * _reload_ratchets(path)`. Returns reloadRatchets()'s success flag.
      */
+    @network.reticulum.RnsTestSeam
     fun reloadRatchetsFromDiskForTest(): Boolean {
         ratchets.clear()
         return reloadRatchets()
     }
 
     /** Append a raw ratchet private key (reference pad: ratchets.append(...)). */
+    @network.reticulum.RnsTestSeam
     fun addRatchetForTest(ratchetPrivate: ByteArray) {
         ratchets.add(ratchetPrivate.copyOf())
     }
@@ -571,11 +588,16 @@ class Destination private constructor(
                     when (key) {
                         "signature" -> {
                             val len = outerUnpacker.unpackBinaryHeader()
+                            // Local, signed file, but the length is read before the
+                            // signature is checked: bound it by the file so a corrupt
+                            // header cannot ask for gigabytes.
+                            if (len < 0 || len > fileData.size) throw java.io.IOException("Ratchet file signature length $len exceeds the file")
                             signature = ByteArray(len)
                             outerUnpacker.readPayload(signature!!)
                         }
                         "ratchets" -> {
                             val len = outerUnpacker.unpackBinaryHeader()
+                            if (len < 0 || len > fileData.size) throw java.io.IOException("Ratchet file payload length $len exceeds the file")
                             packedRatchets = ByteArray(len)
                             outerUnpacker.readPayload(packedRatchets!!)
                         }
@@ -598,6 +620,7 @@ class Destination private constructor(
                 val loadedRatchets = mutableListOf<ByteArray>()
                 for (i in 0 until arraySize) {
                     val binarySize = innerUnpacker.unpackBinaryHeader()
+                    if (binarySize < 0 || binarySize > packed.size) throw java.io.IOException("Ratchet entry length $binarySize exceeds the payload")
                     val ratchet = ByteArray(binarySize)
                     innerUnpacker.readPayload(ratchet)
                     loadedRatchets.add(ratchet)
@@ -1145,8 +1168,12 @@ class Destination private constructor(
                     "Cannot encrypt for SINGLE destination without identity"
                 )
 
-                // Check for stored ratchet public key for this destination
-                val ratchet = getRatchetForDestination(hash)
+                // Check for a ratchet public key for this destination: the in-process
+                // announce cache first, then the persisted peer-ratchet store (which
+                // reads ratchets/<hash> with its expiry). Without the fallback, every
+                // send after a restart used the static identity key until the peer's
+                // next announce was heard.
+                val ratchet = getRatchetForDestination(hash) ?: Identity.getRatchet(hash)
 
                 // Debug logging
                 println("[Destination] encrypt() for ${hash.toHexString()}: ratchet=${if (ratchet != null) "present (${ratchet.size} bytes)" else "null"}")

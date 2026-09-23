@@ -319,7 +319,7 @@ data class TunnelInfo(
     var lastActivity: Long = System.currentTimeMillis(),
 
     /** When this tunnel expires (epoch millis). */
-    var expires: Long = System.currentTimeMillis() + TransportConstants.DESTINATION_TIMEOUT,
+    var expires: Long = System.currentTimeMillis() + TransportConstants.TUNNEL_TIMEOUT,
 
     /** Total bytes transmitted through this tunnel. */
     var txBytes: Long = 0,

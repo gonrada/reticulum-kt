@@ -29,6 +29,11 @@ subprojects {
                 compilerOptions {
                     jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
                     freeCompilerArgs.add("-Xjsr305=strict")
+                    // Members annotated @RnsTestSeam (rns-core) require opt-in. Every module in
+                    // THIS build opts in — the library uses a few of them internally and the
+                    // conformance bridge and tests use all of them — so the requirement only
+                    // bites a consumer of the published artifacts, which is the point.
+                    freeCompilerArgs.add("-opt-in=network.reticulum.RnsTestSeam")
                 }
             }
 

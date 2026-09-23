@@ -340,4 +340,32 @@ class SppInterfaceTest {
         override fun listPairedDevices(): List<SppDevice> = emptyList()
         override fun shutdown() {}
     }
+
+    @Test
+    fun `IFAC tag is 8 bytes as on the reference's serial interfaces`() {
+        // A 16-byte tag would fail verification against every serial peer sharing the
+        // network name and key.
+        val driver = MockSppDriver(connectException = IOException("not started"))
+        drivers.add(driver)
+
+        val withIfac = SppInterface(
+            name = "IfacSPP",
+            driver = driver,
+            targetAddress = "AA:BB:CC:DD:EE:FF",
+            ifacNetname = "serial-net",
+            ifacNetkey = "serial-key",
+        )
+        interfaces.add(withIfac)
+        assertNotNull(withIfac.ifacKey)
+        assertEquals(8, withIfac.ifacSize)
+
+        val withoutIfac = SppInterface(
+            name = "PlainSPP",
+            driver = driver,
+            targetAddress = "AA:BB:CC:DD:EE:FF",
+        )
+        interfaces.add(withoutIfac)
+        assertNull(withoutIfac.ifacKey)
+        assertEquals(0, withoutIfac.ifacSize)
+    }
 }

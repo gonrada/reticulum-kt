@@ -54,7 +54,9 @@ class PipeInterface(
     override val bitrate: Int = bitrateEstimate
     override val hwMtu: Int = HW_MTU
 
-    private val hdlcDeframer = HDLC.createDeframer { data ->
+    // A peer that never sends a closing FLAG must not grow the deframer without limit:
+    // one MTU of payload escapes to at most twice its size.
+    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = 2 * hwMtu + 16) { data ->
         processIncoming(data)
     }
 

@@ -67,6 +67,13 @@ class LocalClientInterface : Interface {
 
         /** Hardware MTU for local IPC. */
         const val HW_MTU = 262144
+
+        /**
+         * Escaped-buffer bound of the HDLC deframer: an unterminated run longer than this
+         * is discarded and the deframer resyncs on the next FLAG (python util/HDLC.py:81-83,
+         * 2*mtu; +16 for the same slack the stream interfaces allow).
+         */
+        const val MAX_FRAME_BYTES = 2 * HW_MTU + 16
     }
 
     private val useUnixSocket: Boolean
@@ -85,7 +92,11 @@ class LocalClientInterface : Interface {
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var readJob: Job? = null
 
-    private val hdlcDeframer = HDLC.createDeframer { data ->
+    // Bounded like python LocalInterface.py:79-80 (ReceiveBuffer(mtu=HW_MTU,
+    // max_frame_len=HW_MTU)), whose util/HDLC.py:81-83 discards an unterminated run
+    // longer than 2*HW_MTU. An unbounded deframer let any local process grow this
+    // buffer without limit by never sending a closing FLAG.
+    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = MAX_FRAME_BYTES) { data ->
         processIncoming(data)
     }
 

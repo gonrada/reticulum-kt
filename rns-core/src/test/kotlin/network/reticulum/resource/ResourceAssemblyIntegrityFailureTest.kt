@@ -150,10 +150,11 @@ class ResourceAssemblyIntegrityFailureTest {
 
         res.assembleForTest()
 
-        // The bomb guard marks the transfer CORRUPT. (It also calls cancel(), but
-        // markCorrupt runs first and sets status to CORRUPT, which is already a
-        // terminal state (>= COMPLETE), so cancel() is a no-op here and is not
-        // observable; only the CORRUPT transition is asserted.)
+        // The bomb guard marks the transfer CORRUPT. (It then rejects the
+        // resource and tears the link down; on this never-active link the
+        // reject packet cannot be encrypted and is skipped. ResourceBombTeardownTest
+        // covers the teardown on a real link; only the CORRUPT transition is
+        // asserted here.)
         assertEquals(ResourceConstants.CORRUPT, statusOf(res))
     }
 

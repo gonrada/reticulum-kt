@@ -37,7 +37,7 @@ dependencies {
     implementation("com.google.code.gson:gson:2.10.1")
 
     // MessagePack (already in rns-core, but explicit for bridge use)
-    implementation("org.msgpack:msgpack-core:0.9.8")
+    implementation("org.msgpack:msgpack-core:0.9.12")
 
     // BZ2 compression (already in rns-core)
     implementation("org.apache.commons:commons-compress:1.26.0")

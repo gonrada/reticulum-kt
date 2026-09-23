@@ -78,7 +78,7 @@ class LinkResourceDedupTest {
     @Timeout(5)
     fun `hasIncomingResource returns true after registering a resource`() {
         val link = freshLink()
-        val advHash = ByteArray(16) { 0x55.toByte() }
+        val advHash = ByteArray(32) { 0x55.toByte() }
         val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
         assertNotNull(adv, "Advertisement should unpack")
 
@@ -111,7 +111,7 @@ class LinkResourceDedupTest {
     @Timeout(5)
     fun `registerIncomingResource is idempotent for the same instance`() {
         val link = freshLink()
-        val advHash = ByteArray(16) { 0x77.toByte() }
+        val advHash = ByteArray(32) { 0x77.toByte() }
         val resource = makeResourceWithHash(link, advHash)
 
         link.registerIncomingResource(resource)
@@ -135,7 +135,7 @@ class LinkResourceDedupTest {
         // hasIncomingResource must catch that. The production fix in
         // Link.processResourceAdv consults this method before accepting.
         val link = freshLink()
-        val advHash = ByteArray(16) { 0x42.toByte() }
+        val advHash = ByteArray(32) { 0x42.toByte() }
 
         // First "accept": register a Resource for advHash.
         val firstResource = makeResourceWithHash(link, advHash)
@@ -164,7 +164,7 @@ class LinkResourceDedupTest {
     @Timeout(5)
     fun `Resource accept invokes resource started before requesting parts`() {
         val link = freshLink()
-        val advHash = ByteArray(16) { 0xAC.toByte() }
+        val advHash = ByteArray(32) { 0xAC.toByte() }
         val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
         assertNotNull(adv, "Test sanity: advertisement should unpack")
 
@@ -219,7 +219,7 @@ class LinkResourceDedupTest {
     @Timeout(5)
     fun `Resource accept does not restart watchdog after resource started cancels`() {
         val link = freshLink()
-        val advHash = ByteArray(16) { 0xAD.toByte() }
+        val advHash = ByteArray(32) { 0xAD.toByte() }
         val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
         assertNotNull(adv, "Test sanity: advertisement should unpack")
 
@@ -250,7 +250,7 @@ class LinkResourceDedupTest {
     @Timeout(5)
     fun `Concurrent cancel and watchdog start leave Resource terminal and stopped`() {
         val link = freshLink()
-        val advHash = ByteArray(16) { 0xAE.toByte() }
+        val advHash = ByteArray(32) { 0xAE.toByte() }
         val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
         assertNotNull(adv, "Test sanity: advertisement should unpack")
         link.setResourceStartedCallback { }
@@ -309,7 +309,7 @@ class LinkResourceDedupTest {
         // `not link.has_incoming_resource(resource)` guard sits inside
         // accept(), so every call site benefits uniformly.
         val link = freshLink()
-        val advHash = ByteArray(16) { 0xCD.toByte() }
+        val advHash = ByteArray(32) { 0xCD.toByte() }
 
         // Seed the link's incomingResources with a Resource for advHash.
         link.registerIncomingResource(makeResourceWithHash(link, advHash))

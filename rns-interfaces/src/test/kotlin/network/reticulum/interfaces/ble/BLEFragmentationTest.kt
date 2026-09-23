@@ -751,4 +751,83 @@ class BLEFragmentationTest {
         assertNull(reassembler.receiveFragment(fragmentsB[1], "B"))
         assertArrayEquals(packetB, reassembler.receiveFragment(fragmentsB[2], "B"))
     }
+
+    // ========================================================================
+    // Reassembly bounds
+    // ========================================================================
+
+    private fun frag(type: Byte, seq: Int, total: Int, payload: ByteArray): ByteArray {
+        val buf = ByteBuffer.allocate(5 + payload.size).order(ByteOrder.BIG_ENDIAN)
+        buf.put(type)
+        buf.putShort(seq.toShort())
+        buf.putShort(total.toShort())
+        buf.put(payload)
+        return buf.array()
+    }
+
+    @Test
+    fun `default bound is the Reticulum MTU and caps total at one byte per fragment`() {
+        val reassembler = BLEReassembler()
+        assertEquals(500, reassembler.maxTotalFragments)
+    }
+
+    @Test
+    fun `START with a total no packet within the bound could need is rejected without opening a buffer`() {
+        val reassembler = BLEReassembler(maxPacketBytes = 500)
+
+        // total = 65535 (the wire maximum) while a 500-byte packet needs at most 500 fragments
+        val start = frag(BLEFragmenter.TYPE_START, 0, 65535, ByteArray(10) { 0x41 })
+        assertThrows<IllegalArgumentException> {
+            reassembler.receiveFragment(start, "attacker")
+        }
+        assertEquals(0, reassembler.statistics.pendingPackets)
+
+        // One past the bound is rejected, the bound itself is accepted
+        assertThrows<IllegalArgumentException> {
+            reassembler.receiveFragment(frag(BLEFragmenter.TYPE_START, 0, 501, byteArrayOf(0x41)), "a")
+        }
+        assertNull(reassembler.receiveFragment(frag(BLEFragmenter.TYPE_START, 0, 500, byteArrayOf(0x41)), "b"))
+        assertEquals(1, reassembler.statistics.pendingPackets)
+    }
+
+    @Test
+    fun `accumulated payload past the bound drops the buffer`() {
+        val reassembler = BLEReassembler(maxPacketBytes = 100)
+
+        // total = 3 is allowed; each fragment carries 60 bytes so the second one passes 100
+        assertNull(reassembler.receiveFragment(frag(BLEFragmenter.TYPE_START, 0, 3, ByteArray(60) { 0x41 }), "peer"))
+        assertEquals(1, reassembler.statistics.pendingPackets)
+
+        assertThrows<IllegalArgumentException> {
+            reassembler.receiveFragment(frag(BLEFragmenter.TYPE_CONTINUE, 1, 3, ByteArray(60) { 0x42 }), "peer")
+        }
+        assertEquals(0, reassembler.statistics.pendingPackets, "over-bound buffer must be discarded, not retained")
+
+        // The sender can start over afterwards
+        assertNull(reassembler.receiveFragment(frag(BLEFragmenter.TYPE_START, 0, 2, ByteArray(40) { 0x43 }), "peer"))
+        assertEquals(1, reassembler.statistics.pendingPackets)
+    }
+
+    @Test
+    fun `a single fragment larger than the bound is rejected`() {
+        val reassembler = BLEReassembler(maxPacketBytes = 100)
+        assertThrows<IllegalArgumentException> {
+            reassembler.receiveFragment(frag(BLEFragmenter.TYPE_START, 0, 1, ByteArray(101) { 0x41 }), "peer")
+        }
+        assertEquals(0, reassembler.statistics.pendingPackets)
+    }
+
+    @Test
+    fun `a packet exactly at the bound still reassembles`() {
+        val fragmenter = BLEFragmenter(mtu = 185)
+        val reassembler = BLEReassembler(maxPacketBytes = 500)
+        val original = ByteArray(500) { (it % 251).toByte() }
+        val fragments = fragmenter.fragment(original)
+
+        var result: ByteArray? = null
+        for (f in fragments) result = reassembler.receiveFragment(f, "peer")
+        assertNotNull(result)
+        assertArrayEquals(original, result)
+        assertEquals(0, reassembler.statistics.pendingPackets)
+    }
 }

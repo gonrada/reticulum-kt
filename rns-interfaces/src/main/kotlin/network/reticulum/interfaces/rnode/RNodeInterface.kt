@@ -725,6 +725,13 @@ class RNodeInterface(
                 log("Read loop error: ${e.message}")
                 setOnline(false)
             }
+        } catch (e: Exception) {
+            // python RNodeInterface.py:1156-1159 readLoop catches Exception (as TCPInterface.py:426-434):
+            // mark offline instead of leaving a zombie interface.
+            if (!detached.get()) {
+                log("Read loop error: ${e.javaClass.name}: ${e.message}")
+                setOnline(false)
+            }
         }
 
         if (online.value) {

@@ -63,20 +63,20 @@ class PathStoreWriteThroughTest {
     inner class RegisterLinkPath {
 
         @Test
-        fun `writes to store when configured`() {
+        fun `does not persist link paths even when a store is configured`() {
             Transport.pathStore = store
             val linkId = ByteArray(16) { it.toByte() }
             val interfaceHash = ByteArray(16) { 0xFF.toByte() }
 
-            // `hops = 2` is accepted for call-site compatibility but the
-            // stored entry always carries hops = 1 so that outbound link
-            // DATA packets don't get HEADER_2-wrapped with the linkId as
-            // transport_id. See Transport.registerLinkPath doc comment.
+            // A link-id path entry is an in-memory routing hint for the life of the
+            // link; it is never written through. The stored entry always carries
+            // hops = 1 so that outbound link DATA packets don't get HEADER_2-wrapped
+            // with the linkId as transport_id.
             Transport.registerLinkPath(linkId, interfaceHash, hops = 2)
 
-            store.data.size shouldBe 1
-            store.data[linkId.toKey()] shouldNotBe null
-            store.data[linkId.toKey()]!!.hops shouldBe 1
+            store.data.size shouldBe 0
+            Transport.pathTable[linkId.toKey()] shouldNotBe null
+            Transport.pathTable[linkId.toKey()]!!.hops shouldBe 1
         }
 
         @Test

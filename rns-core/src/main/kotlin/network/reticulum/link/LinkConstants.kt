@@ -54,6 +54,13 @@ object LinkConstants {
     // Keepalive
     const val KEEPALIVE_MAX_RTT = 1.75
     const val KEEPALIVE_TIMEOUT_FACTOR = 4
+
+    /** Cap on concurrent half-open (unproven) receiver links, to bound a
+     *  LINKREQUEST flood (hardening beyond the reference, which is unbounded).
+     *  Each half-open link holds key-agreement state + a watchdog for the
+     *  establishment window (~6s/hop + KEEPALIVE); 512 is generous for a busy
+     *  transport node. */
+    const val MAX_PENDING_LINKS = 512
     const val STALE_GRACE = 5_000L  // 5 seconds
     const val KEEPALIVE_MAX = 360_000L  // 360 seconds
     const val KEEPALIVE_MIN = 5_000L   // 5 seconds
@@ -62,6 +69,14 @@ object LinkConstants {
     val STALE_TIME = STALE_FACTOR * KEEPALIVE
 
     const val WATCHDOG_MAX_SLEEP = 5_000L  // 5 seconds
+
+    /** Upper bound applied to the peer-supplied LRRTT value. Python trusts
+     *  the float as-is (Link.py:541) but float arithmetic never wraps; here
+     *  an unbounded value saturates `(seconds * 1000).toLong()` and every
+     *  derived Long timeout (request, channel, stale grace) overflows. One
+     *  hour is far beyond any real link RTT and keeps `rtt * factor + grace`
+     *  finite. */
+    const val MAX_REMOTE_RTT_MS = 3_600_000L
 
     /**
      * Calculate the Link MDU (Maximum Data Unit).

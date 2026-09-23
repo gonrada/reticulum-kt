@@ -89,21 +89,47 @@ object HDLC {
     /**
      * Create a frame deframer for streaming data.
      *
+     * @param maxFrameBytes caps the accumulated (escaped) frame. A peer that
+     *   streams bytes without ever sending a closing FLAG would otherwise grow
+     *   the buffer without limit; once the bound is hit the partial frame is
+     *   discarded and the deframer resyncs on the next FLAG. Defaults to
+     *   unbounded so existing callers are unchanged; stream interfaces should
+     *   pass a bound derived from their HW_MTU.
      * @param onFrame Callback invoked with each complete deframed packet
      * @return Deframer instance
      */
-    fun createDeframer(onFrame: (ByteArray) -> Unit): Deframer {
-        return Deframer(onFrame)
+    fun createDeframer(
+        maxFrameBytes: Int = Int.MAX_VALUE,
+        onFrame: (ByteArray) -> Unit,
+    ): Deframer {
+        return Deframer(onFrame, maxFrameBytes)
     }
 
     /**
      * Streaming HDLC deframer.
      *
-     * Accumulates incoming bytes and emits complete frames via callback.
+     * Accumulates incoming bytes and emits complete frames via callback. The
+     * escaped accumulation buffer is bounded by [maxFrameBytes]; a frame that
+     * exceeds it is discarded (memory freed) and the deframer resyncs on the
+     * next FLAG, so a peer that never closes a frame cannot exhaust memory.
      */
-    class Deframer(private val onFrame: (ByteArray) -> Unit) {
+    class Deframer(
+        private val onFrame: (ByteArray) -> Unit,
+        private val maxFrameBytes: Int = Int.MAX_VALUE,
+    ) {
         private var buffer = ByteArrayOutputStream()
         private var inFrame = false
+        private var overflowed = false
+
+        /**
+         * Empty the accumulation buffer, giving its array back when it has grown large.
+         * `ByteArrayOutputStream.reset()` keeps the capacity, so one oversized run would
+         * otherwise leave a large array pinned per connection for its whole lifetime.
+         * Python rebinds `data_buffer = b""` per frame, releasing the bytes.
+         */
+        private fun recycleBuffer() {
+            if (buffer.size() > SHRINK_ABOVE) buffer = ByteArrayOutputStream() else buffer.reset()
+        }
 
         /**
          * Process incoming bytes.
@@ -113,10 +139,9 @@ object HDLC {
         fun process(data: ByteArray) {
             for (byte in data) {
                 if (byte == FLAG) {
-                    if (inFrame && buffer.size() > 0) {
+                    if (inFrame && !overflowed && buffer.size() > 0) {
                         // End of frame
                         val frameData = buffer.toByteArray()
-                        buffer.reset()
                         val unescaped = unescape(frameData)
                         // Python RNS: Only accept frames larger than HEADER_MINSIZE (19 bytes)
                         // Rejects malformed/tiny frames that can't contain a valid packet
@@ -126,9 +151,17 @@ object HDLC {
                     }
                     // Start of new frame (or just a flag)
                     inFrame = true
-                    buffer.reset()
+                    overflowed = false
+                    recycleBuffer()
                 } else if (inFrame) {
-                    buffer.write(byte.toInt())
+                    if (overflowed) continue
+                    if (buffer.size() < maxFrameBytes) {
+                        buffer.write(byte.toInt())
+                    } else {
+                        // Bound hit without a closing FLAG: discard and resync.
+                        overflowed = true
+                        recycleBuffer()
+                    }
                 }
             }
         }
@@ -137,8 +170,14 @@ object HDLC {
          * Reset the deframer state.
          */
         fun reset() {
-            buffer.reset()
+            recycleBuffer()
             inFrame = false
+            overflowed = false
+        }
+
+        private companion object {
+            /** Accumulations above this are released rather than kept for reuse. */
+            const val SHRINK_ABOVE = 64 * 1024
         }
     }
 }

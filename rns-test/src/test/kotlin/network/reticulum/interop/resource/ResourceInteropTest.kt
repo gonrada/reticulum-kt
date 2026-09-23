@@ -40,9 +40,9 @@ class ResourceInteropTest : InteropTestBase() {
             val transferSize = 102400  // 100KB
             val dataSize = 204800  // 200KB (before compression)
             val numParts = 50
-            val resourceHash = crypto.randomBytes(16)
+            val resourceHash = crypto.randomBytes(32)
             val randomHash = crypto.randomBytes(4)
-            val originalHash = crypto.randomBytes(16)
+            val originalHash = crypto.randomBytes(32)
             val segmentIndex = 1
             val totalSegments = 2
             val flags = 0x06  // compressed + split
@@ -88,9 +88,9 @@ class ResourceInteropTest : InteropTestBase() {
             val transferSize = 51200
             val dataSize = 102400
             val numParts = 25
-            val resourceHash = crypto.randomBytes(16)
+            val resourceHash = crypto.randomBytes(32)
             val randomHash = crypto.randomBytes(4)
-            val originalHash = crypto.randomBytes(16)
+            val originalHash = crypto.randomBytes(32)
             val segmentIndex = 1
             val totalSegments = 1
             val flags = 0x02  // compressed only
@@ -381,9 +381,9 @@ class ResourceInteropTest : InteropTestBase() {
             val transferSize = 2048000  // ~2MB
             val dataSize = 4096000  // ~4MB before compression
             val numParts = 200  // More than fits in one advertisement
-            val resourceHash = crypto.randomBytes(16)
+            val resourceHash = crypto.randomBytes(32)
             val randomHash = crypto.randomBytes(4)
-            val originalHash = crypto.randomBytes(16)
+            val originalHash = crypto.randomBytes(32)
             val flags = 0x06  // compressed + split
 
             // Create hashmap
@@ -458,9 +458,9 @@ class ResourceInteropTest : InteropTestBase() {
             val transferSize = 10240
             val dataSize = 20480
             val numParts = 10
-            val resourceHash = crypto.randomBytes(16)
+            val resourceHash = crypto.randomBytes(32)
             val randomHash = crypto.randomBytes(4)
-            val originalHash = crypto.randomBytes(16)
+            val originalHash = crypto.randomBytes(32)
             val segmentIndex = 1
             val totalSegments = 1
             val flags = 0x22  // compressed + has_metadata
@@ -509,9 +509,9 @@ class ResourceInteropTest : InteropTestBase() {
             val transferSize = 204800
             val dataSize = 409600
             val numParts = 100
-            val resourceHash = crypto.randomBytes(16)
+            val resourceHash = crypto.randomBytes(32)
             val randomHash = crypto.randomBytes(4)
-            val originalHash = crypto.randomBytes(16)
+            val originalHash = crypto.randomBytes(32)
             val segmentIndex = 2
             val totalSegments = 3
             val requestId = crypto.randomBytes(16)

@@ -277,6 +277,11 @@ class PacketReceipt internal constructor(
         // packet.receipt.validate_proof so the Channel retransmits to exhaustion.
         if (link.failProofValidationForTest) return false
 
+        // python Transport.py:2758 — only a receipt still in SENT can be concluded
+        // by a proof. A receipt already FAILED or CULLED by the receipt sweep must
+        // not be flipped to DELIVERED (and its delivery callback fired) by a late proof.
+        if (status != SENT) return false
+
         // For now, only handle explicit proofs
         if (proof.size == EXPL_LENGTH) {
             // Extract proof components
@@ -319,6 +324,9 @@ class PacketReceipt internal constructor(
     fun validateProof(proof: ByteArray, proofPacket: Packet? = null): Boolean {
         // Conformance test seam (wire_channel_send drop_acks): see validateLinkProof.
         if (link?.failProofValidationForTest == true) return false
+
+        // Only a receipt still in SENT can be concluded by a proof; see validateLinkProof.
+        if (status != SENT) return false
 
         when (proof.size) {
             EXPL_LENGTH -> {

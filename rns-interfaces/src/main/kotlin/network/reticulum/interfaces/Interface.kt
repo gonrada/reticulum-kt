@@ -210,6 +210,26 @@ abstract class Interface(
 
     // Ingress control for announce rate limiting
     protected val ingressControl = AtomicBoolean(true)
+
+    /** python `ingress_control = no` (Reticulum.py:819-820): disable announce ingress limiting. */
+    fun setIngressControl(enabled: Boolean) {
+        ingressControl.set(enabled)
+    }
+
+    fun ingressControlEnabled(): Boolean = ingressControl.get()
+
+    // python keeps the ingress-control tuning on the instance (Interface.py:138-150) so
+    // config can override it per interface (`ic_*` keys, Reticulum.py:817-857); here the
+    // class constants are the defaults and these are what the limiter reads. Times are
+    // milliseconds.
+    @Volatile var icNewTimeMs: Long = IC_NEW_TIME
+    @Volatile var icBurstFreqNew: Double = IC_BURST_FREQ_NEW
+    @Volatile var icBurstFreq: Double = IC_BURST_FREQ
+    @Volatile var icBurstHoldMs: Long = IC_BURST_HOLD
+    @Volatile var icBurstPenaltyMs: Long = IC_BURST_PENALTY
+    @Volatile var icHeldReleaseIntervalMs: Long = IC_HELD_RELEASE_INTERVAL
+    @Volatile var icMaxHeldAnnounces: Int = MAX_HELD_ANNOUNCES
+
     private val incomingAnnounceTimestamps = ConcurrentLinkedDeque<Long>()
     private val outgoingAnnounceTimestamps = ConcurrentLinkedDeque<Long>()
     private val burstActive = AtomicBoolean(false)
@@ -225,12 +245,15 @@ abstract class Interface(
         const val OA_FREQ_SAMPLES = 48
 
         /**
-         * Minimum samples in the frequency deque before a burst may activate or
-         * deactivate (python IC_BURST_MIN_SAMPLES, Interface.py:84). Without
-         * this gate the ingress limiter trips on as few as 2 announces, holding
-         * legitimate distinct announces that python would process.
+         * Samples required before a frequency reads as non-zero (python
+         * IC_DEQUE_MIN_SAMPLE, Interface.py:84). The frequency reading zero for two
+         * lone announces is what keeps them from tripping the limiter; a separate,
+         * larger sample gate would only arm it later than the reference does.
          */
-        const val IC_BURST_MIN_SAMPLES = 6
+        const val IC_DEQUE_MIN_SAMPLE = 2
+
+        /** Oldest-sample decay for the announce window (python AR_FREQ_DECAY = 1/AR_MINFREQ_HZ = 10 s), in ms. */
+        const val AR_FREQ_DECAY = 10 * 1000L
 
         /** Maximum held announces. */
         const val MAX_HELD_ANNOUNCES = 256
@@ -352,19 +375,21 @@ abstract class Interface(
     }
 
     /**
-     * Calculate incoming announce frequency (announces per second).
+     * python `incoming_announce_frequency` (Interface.py:346-355): zero until more than
+     * `IC_DEQUE_MIN_SAMPLE` samples exist, the oldest sample dropped once the span exceeds
+     * `AR_FREQ_DECAY`, otherwise samples per second over the span back to the oldest one.
      */
     fun incomingAnnounceFrequency(): Double {
-        val timestamps = incomingAnnounceTimestamps.toList()
-        if (timestamps.size <= 1) return 0.0
-
-        var deltaSum = 0L
-        for (i in 1 until timestamps.size) {
-            deltaSum += timestamps[i] - timestamps[i - 1]
-        }
-        deltaSum += System.currentTimeMillis() - timestamps.last()
-
-        return if (deltaSum == 0L) 0.0 else 1000.0 / (deltaSum.toDouble() / timestamps.size)
+        val n = incomingAnnounceTimestamps.size
+        if (n <= IC_DEQUE_MIN_SAMPLE) return 0.0
+        val oldest = incomingAnnounceTimestamps.peekFirst() ?: return 0.0
+        val span = System.currentTimeMillis() - oldest
+        if (span > AR_FREQ_DECAY) incomingAnnounceTimestamps.pollFirst()
+        // python returns 0 for a non-positive span, but its clock is sub-microsecond and
+        // never produces one. Ours is milliseconds: a real burst of announces that all
+        // land inside one tick would read as ZERO hertz and never trip the limiter. Floor
+        // the span at one millisecond so such a burst reads as what it is: very fast.
+        return n / (maxOf(1L, span) / 1000.0)
     }
 
     /**
@@ -385,31 +410,33 @@ abstract class Interface(
 
     /**
      * Check if ingress should be limited due to announce burst.
+     *
+     * python `should_ingress_limit` (Interface.py:188-206). The frequency itself reads
+     * zero until more than `IC_DEQUE_MIN_SAMPLE` samples exist, which is what keeps two
+     * lone announces from tripping the limiter; the reference has no further sample
+     * gate on activation, and a larger one here armed the limiter later than the
+     * reference does (a burst of five announces at any rate never tripped it).
      */
     fun shouldIngressLimit(): Boolean {
         if (!ingressControl.get()) return false
 
-        val freqThreshold = if (age() < IC_NEW_TIME) IC_BURST_FREQ_NEW else IC_BURST_FREQ
+        val freqThreshold = if (age() < icNewTimeMs) icBurstFreqNew else icBurstFreq
         val iaFreq = incomingAnnounceFrequency()
 
-        val sampleCount = incomingAnnounceTimestamps.size
         if (burstActive.get()) {
-            // python Interface.py:151-152 — deactivate only once the burst hold
-            // has elapsed AND at least IC_BURST_MIN_SAMPLES are in the deque.
+            // python Interface.py:196-198 — deactivate only once the burst hold has
+            // elapsed AND at least IC_DEQUE_MIN_SAMPLE samples are in the deque.
             // (python does NOT touch ic_held_release in this arm.)
-            if (iaFreq < freqThreshold && System.currentTimeMillis() > burstActivatedAt + IC_BURST_HOLD) {
-                if (sampleCount >= IC_BURST_MIN_SAMPLES) burstActive.set(false)
+            if (iaFreq < freqThreshold && System.currentTimeMillis() > burstActivatedAt + icBurstHoldMs) {
+                if (incomingAnnounceTimestamps.size >= IC_DEQUE_MIN_SAMPLE) burstActive.set(false)
             }
             return true
         } else {
-            // python Interface.py:155-160 — activate only when over threshold
-            // AND the deque holds at least IC_BURST_MIN_SAMPLES samples. The
-            // min-samples gate is what stops 2 distinct announces from tripping
-            // the limiter.
-            if (iaFreq > freqThreshold && sampleCount >= IC_BURST_MIN_SAMPLES) {
+            // python Interface.py:202-207 — activate on frequency alone.
+            if (iaFreq > freqThreshold) {
                 burstActive.set(true)
                 burstActivatedAt = System.currentTimeMillis()
-                heldReleaseAt = System.currentTimeMillis() + IC_BURST_PENALTY
+                heldReleaseAt = System.currentTimeMillis() + icBurstPenaltyMs
                 return true
             }
             return false
@@ -421,11 +448,14 @@ abstract class Interface(
      * Matches Python Interface.hold_announce() (Interface.py:170-174).
      */
     fun holdAnnounce(destinationHash: ByteArray, raw: ByteArray, hops: Int, receivingInterface: InterfaceRef) {
+        // An announce already at the hop ceiling would be dropped on release; holding it
+        // only spends one of the slots (python Interface.py: hops >= PATHFINDER_M - 1).
+        if (hops >= TransportConstants.PATHFINDER_M - 1) return
         val key = destinationHash.toKey()
         val held = HeldAnnounce(destinationHash.copyOf(), raw.copyOf(), hops, receivingInterface)
         heldAnnounces.compute(key) { _, existing ->
             if (existing != null) held                              // update existing
-            else if (heldAnnounces.size < MAX_HELD_ANNOUNCES) held  // insert new
+            else if (heldAnnounces.size < icMaxHeldAnnounces) held  // insert new
             else existing                                           // full — drop new (Python behavior)
         }
     }
@@ -441,7 +471,7 @@ abstract class Interface(
             val now = System.currentTimeMillis()
             if (now <= heldReleaseAt) return
 
-            val freqThreshold = if (age() < IC_NEW_TIME) IC_BURST_FREQ_NEW else IC_BURST_FREQ
+            val freqThreshold = if (age() < icNewTimeMs) icBurstFreqNew else icBurstFreq
             val iaFreq = incomingAnnounceFrequency()
             if (iaFreq >= freqThreshold) return
 
@@ -458,7 +488,7 @@ abstract class Interface(
             }
 
             if (selectedAnnounce != null && selectedKey != null) {
-                heldReleaseAt = now + IC_HELD_RELEASE_INTERVAL
+                heldReleaseAt = now + icHeldReleaseIntervalMs
                 heldAnnounces.remove(selectedKey)
                 // Re-inject via daemon thread to avoid re-entrancy (matches Python)
                 val raw = selectedAnnounce.raw

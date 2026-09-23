@@ -12,6 +12,9 @@ import network.reticulum.crypto.defaultCryptoProvider
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 
@@ -103,7 +106,13 @@ class Identity private constructor(
         private val identityHashIndex = ConcurrentHashMap<ByteArrayKey, ByteArray>()
 
         /**
-         * Storage for ratchets: destination_hash -> list of (ratchet, timestamp) pairs
+         * Storage for ratchets: destination_hash -> the current (ratchet, timestamp).
+         *
+         * Invariant: each list holds at most ONE entry. The reference keeps exactly
+         * one ratchet per destination and a new ratchet replaces the old one;
+         * accumulating them here let any announcer grow this map by one entry per
+         * announce for RATCHET_EXPIRY. The list type is kept so the existing
+         * callers and locking are unchanged.
          */
         private val destinationRatchets = ConcurrentHashMap<ByteArrayKey, MutableList<RatchetEntry>>()
 
@@ -686,10 +695,10 @@ class Identity private constructor(
                 }
                 packer.close()
 
-                // Write to file atomically
+                // Write to file atomically (temp file, then replace)
                 val tempFile = java.io.File(storagePath, "known_destinations.tmp")
                 tempFile.writeBytes(buffer.toByteArray())
-                tempFile.renameTo(destFile)
+                replaceFile(tempFile, destFile)
 
                 val saveTime = System.currentTimeMillis() - saveStart
                 val timeStr = if (saveTime < 1000) {
@@ -805,8 +814,9 @@ class Identity private constructor(
 
         /**
          * Remember a ratchet for a destination.
-         * Stores the ratchet with the current timestamp and adds it to the front of the list (newest first).
-         * Automatically cleans expired ratchets for this destination.
+         * Stores the ratchet with the current timestamp, replacing any previous
+         * ratchet for that destination: exactly one ratchet is kept per
+         * destination, as the reference does.
          *
          * @param destHash The destination hash
          * @param ratchet The ratchet public key bytes (32 bytes)
@@ -824,17 +834,16 @@ class Identity private constructor(
             synchronized(destinationRatchets) {
                 val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
 
-                // Check if this ratchet already exists
+                // Already the current ratchet: nothing to do (the reference compares
+                // only against the one stored ratchet).
                 if (entries.any { it.ratchet.contentEquals(ratchet) }) {
                     return // Already stored
                 }
 
-                // Prepend (newest first)
-                entries.add(0, entry)
+                // Replace rather than accumulate.
+                entries.clear()
+                entries.add(entry)
                 shouldPersist = true
-
-                // Clean expired entries for this destination
-                entries.removeIf { now - it.timestamp > RATCHET_EXPIRY }
             }
 
             // Persist to storage
@@ -869,17 +878,39 @@ class Identity private constructor(
                     packer.packDouble(timestamp / 1000.0)
                     packer.close()
 
-                    // Write atomically
+                    // Write atomically (temp file, then replace)
                     val hexHash = destHash.toHexString()
                     val outFile = File(ratchetDir, "$hexHash.out")
                     val finalFile = File(ratchetDir, hexHash)
                     outFile.writeBytes(buffer.toByteArray())
-                    outFile.renameTo(finalFile)
+                    replaceFile(outFile, finalFile)
                 } finally {
                     ratchetPersistLock.unlock()
                 }
             } catch (e: Exception) {
                 println("Could not persist ratchet for ${destHash.toHexString()}: ${e.message}")
+            }
+        }
+
+        /**
+         * Atomically replace [dst] with [src]. `File.renameTo` was used before; it
+         * returns false (and the result was discarded) when the target already
+         * exists on Windows, so the known-destinations file and the per-peer
+         * ratchet files were never updated after their first write. Falls back to
+         * a non-atomic replace where the filesystem cannot do an atomic one.
+         * Failures propagate to the caller, which logs them.
+         */
+        private fun replaceFile(src: File, dst: File) {
+            try {
+                Files.move(
+                    src.toPath(),
+                    dst.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE
+                )
+            } catch (e: AtomicMoveNotSupportedException) {
+                println("Atomic replace of ${dst.name} unsupported here (${e.message}); replacing non-atomically")
+                Files.move(src.toPath(), dst.toPath(), StandardCopyOption.REPLACE_EXISTING)
             }
         }
 
@@ -912,11 +943,14 @@ class Identity private constructor(
                 val result = store.getRatchet(destHash) ?: return null
                 val (ratchet, timestamp) = result
                 if (System.currentTimeMillis() - timestamp > RATCHET_EXPIRY) return null
-                // Cache in memory
+                // Cache in memory. Only fill an empty slot: an entry that appeared
+                // meanwhile came from rememberRatchet and is at least as fresh as
+                // the store (write-through follows the in-memory update), and the
+                // slot holds at most one entry.
                 synchronized(destinationRatchets) {
                     val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
-                    if (!entries.any { it.ratchet.contentEquals(ratchet) }) {
-                        entries.add(0, RatchetEntry(ratchet.copyOf(), timestamp))
+                    if (entries.isEmpty()) {
+                        entries.add(RatchetEntry(ratchet.copyOf(), timestamp))
                     }
                 }
                 return ratchet
@@ -976,12 +1010,12 @@ class Identity private constructor(
                     return null
                 }
 
-                // Add to in-memory cache
+                // Add to in-memory cache (single slot; see getRatchet)
                 val key = destHash.toKey()
                 synchronized(destinationRatchets) {
                     val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
-                    if (!entries.any { it.ratchet.contentEquals(ratchet!!) }) {
-                        entries.add(0, RatchetEntry(ratchet!!.copyOf(), receivedMs))
+                    if (entries.isEmpty()) {
+                        entries.add(RatchetEntry(ratchet!!.copyOf(), receivedMs))
                     }
                 }
 
@@ -993,11 +1027,13 @@ class Identity private constructor(
         }
 
         /**
-         * Get all non-expired ratchets for a destination (newest first).
-         * Used for trying multiple ratchets during decryption.
+         * Get the non-expired ratchet for a destination as a list of at most one
+         * element. Only one ratchet is retained per destination (the reference has
+         * no multi-ratchet fallback), so this never returns more than [getRatchet]
+         * does. Kept for API compatibility.
          *
          * @param destHash The destination hash
-         * @return List of ratchets, newest first
+         * @return The current in-memory ratchet, or an empty list
          */
         fun getRatchets(destHash: ByteArray): List<ByteArray> {
             val key = destHash.toKey()
@@ -1023,6 +1059,7 @@ class Identity private constructor(
          * reference/wire_tcp.py cmd_wire_identity_ratchet_persist), which forces
          * the disk-load path. Read-only on disk; no port logic.
          */
+        @network.reticulum.RnsTestSeam
         fun dropRatchetCacheForTest(destHash: ByteArray) {
             synchronized(destinationRatchets) {
                 destinationRatchets.remove(destHash.toKey())

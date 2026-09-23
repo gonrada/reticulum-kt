@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
@@ -18,6 +19,7 @@ import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
+import network.reticulum.interfaces.util.TcpKeepalive
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -59,6 +61,9 @@ class TCPServerInterface(
         const val HW_MTU = 262144
         /** Default IFAC tag length in bytes for packet/IP media (python TCPInterface.py:454). */
         const val DEFAULT_IFAC_SIZE = 16
+
+        /** Pause after a failed accept() so an EMFILE condition cannot spin the loop. */
+        const val ACCEPT_ERROR_DELAY_MS = 250L
     }
 
     // IFAC credentials - derived lazily from network name/passphrase
@@ -224,11 +229,15 @@ class TCPServerInterface(
                 // Normal cancellation, exit loop
                 break
             } catch (e: SocketException) {
-                if (!detached.get()) {
-                    log("Accept error: ${e.message}")
-                }
+                // Keep listening through transient accept failures, but pause so an
+                // EMFILE condition cannot spin this loop with a log line per iteration.
+                if (detached.get() || serverSocket?.isClosed != false) break
+                log("Accept error: ${e.message}")
+                delay(ACCEPT_ERROR_DELAY_MS)
             } catch (e: Exception) {
+                if (detached.get() || serverSocket?.isClosed != false) break
                 log("Error accepting connection: ${e.message}")
+                delay(ACCEPT_ERROR_DELAY_MS)
             }
         }
     }
@@ -340,7 +349,9 @@ class TCPServerClientInterface internal constructor(
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var readJob: Job? = null
 
-    private val hdlcDeframer = HDLC.createDeframer { data ->
+    // A peer that never sends a closing FLAG must not grow the deframer without limit:
+    // one MTU of payload escapes to at most twice its size.
+    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = 2 * hwMtu + 16) { data ->
         processIncoming(data)
     }
 
@@ -353,6 +364,12 @@ class TCPServerClientInterface internal constructor(
     override fun start() {
         socket.tcpNoDelay = true
         socket.soTimeout = 0
+        // Dead-peer detection on every accepted socket (python TCPInterface.py:143-147
+        // calls set_timeouts_linux on each connected_socket; :183-197 sets SO_KEEPALIVE,
+        // TCP_KEEPIDLE=5, TCP_KEEPINTVL=2, TCP_KEEPCNT=12). Without it a peer that
+        // vanished without FIN held one of the maxClients slots until the OS default
+        // keepalive (~2 h), or forever with keepalive off.
+        TcpKeepalive.apply(socket)
         setOnline(true)
 
         readJob = ioScope.launch {
@@ -387,6 +404,13 @@ class TCPServerClientInterface internal constructor(
         } catch (e: IOException) {
             if (!detached.get()) {
                 // Client disconnected
+            }
+        } catch (e: Exception) {
+            // python TCPInterface.py:426-434 catches Exception and tears the client
+            // down; without this the slot in the parent's client list leaked.
+            if (!detached.get()) {
+                log("Read loop error: ${e.javaClass.name}: ${e.message}")
+                setOnline(false)
             }
         }
 

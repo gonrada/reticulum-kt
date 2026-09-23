@@ -68,7 +68,49 @@ data class InterfaceConfig(
             } ?: throw IllegalArgumentException("max_reconnect_tries must be a 32-bit integer")
         }
 
+    // IFAC. Both spellings feed one attribute and the underscored form wins when both
+    // are present: python assigns from "networkname" then lets "network_name" overwrite
+    // it (Reticulum.py:805-812). An empty string means unset, not an empty name.
+    val ifacNetname: String? get() = ifacCredential("networkname", "network_name")
+    val ifacNetkey: String? get() = ifacCredential("passphrase", "pass_phrase")
+
+    /**
+     * Configured `ifac_size` in BITS as the config expresses it, or null when unset.
+     * The interface applies python's floor rule (below IFAC_MIN_SIZE*8 falls back to
+     * the class default, Reticulum.py:802-803).
+     */
+    val ifacSizeBits: Int?
+        get() = when (val v = options["ifac_size"]) {
+            is Number -> v.toInt()
+            is String -> v.trim().toIntOrNull()
+            else -> null
+        }
+
+    private fun ifacCredential(vararg keys: String): String? =
+        keys.mapNotNull { options[it]?.toString() }.lastOrNull { it.isNotEmpty() }
+
     // AutoInterface options
+    // Announce ingress-control knobs (python Reticulum.py: ingress_control, ic_*). Times
+    // are seconds in the file; the interface fields take milliseconds.
+    val ingressControl: Boolean? get() = when (val v = options["ingress_control"]) {
+        is Boolean -> v
+        is String -> v.trim().lowercase() in setOf("yes", "true", "on", "1")
+        else -> null
+    }
+    val icNewTimeSeconds: Double? get() = optDouble("ic_new_time")
+    val icBurstFreqNew: Double? get() = optDouble("ic_burst_freq_new")
+    val icBurstFreq: Double? get() = optDouble("ic_burst_freq")
+    val icBurstHoldSeconds: Double? get() = optDouble("ic_burst_hold")
+    val icBurstPenaltySeconds: Double? get() = optDouble("ic_burst_penalty")
+    val icHeldReleaseIntervalSeconds: Double? get() = optDouble("ic_held_release_interval")
+    val icMaxHeldAnnounces: Int? get() = optDouble("ic_max_held_announces")?.toInt()
+
+    private fun optDouble(key: String): Double? = when (val v = options[key]) {
+        is Number -> v.toDouble()
+        is String -> v.trim().toDoubleOrNull()
+        else -> null
+    }
+
     val groupId: String? get() = options["group_id"] as? String
     val discoveryPort: Int? get() = (options["discovery_port"] as? Number)?.toInt()
     val dataPort: Int? get() = (options["data_port"] as? Number)?.toInt()

@@ -69,6 +69,9 @@ class SppInterface(
         /** SDP service name for Reticulum SPP connections. */
         const val SERVICE_NAME = "Reticulum SPP"
 
+        /** IFAC tag length in bytes on serial media (python SerialInterface.py:53). */
+        const val DEFAULT_IFAC_SIZE = 8
+
         /**
          * Hardware MTU matching Python SerialInterface.HW_MTU.
          * Serial links don't negotiate MTU — this is a fixed upper bound.
@@ -104,8 +107,13 @@ class SppInterface(
         IfacUtils.deriveIfacCredentials(ifacNetname, ifacNetkey)
     }
 
+    /**
+     * IFAC tag length for serial media. The reference's serial-class interfaces use an
+     * 8-byte tag; a 16-byte tag fails verification against every peer sharing the
+     * network name and key.
+     */
     override val ifacSize: Int
-        get() = if (_ifacCredentials != null) 16 else 0
+        get() = if (_ifacCredentials != null) DEFAULT_IFAC_SIZE else 0
 
     override val ifacKey: ByteArray?
         get() = _ifacCredentials?.key
@@ -165,7 +173,9 @@ class SppInterface(
     }
 
     // HDLC deframer — identical to TCPClientInterface
-    private val hdlcDeframer = HDLC.createDeframer { data ->
+    // A peer that never sends a closing FLAG must not grow the deframer without limit:
+    // one MTU of payload escapes to at most twice its size.
+    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = 2 * hwMtu + 16) { data ->
         val frameNum = framesReceived.incrementAndGet()
         if (DEBUG) {
             val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }

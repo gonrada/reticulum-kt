@@ -189,6 +189,22 @@ object KISS {
         private var inFrame = false
         private var command: Byte = CMD_UNKNOWN
 
+        // Ceiling on the escaped accumulation buffer. Every KISS-escaped byte expands to at
+        // most two, so 2*hwMtu escaped bytes always decode to at least hwMtu bytes; +2 covers
+        // a trailing escape pair. Without it a peer that opens a data frame and never sends
+        // FEND grows this buffer without limit.
+        private val maxEscapedBytes: Int =
+            if (hwMtu >= Int.MAX_VALUE / 2) Int.MAX_VALUE else hwMtu * 2 + 2
+
+        /**
+         * Empty the accumulation buffer, releasing a large array rather than keeping it.
+         * `ByteArrayOutputStream.reset()` keeps the capacity, so one oversized run would
+         * otherwise leave a large array pinned per connection for its whole lifetime.
+         */
+        private fun recycleBuffer() {
+            if (buffer.size() > SHRINK_ABOVE) buffer = ByteArrayOutputStream() else buffer.reset()
+        }
+
         /**
          * Process incoming bytes.
          *
@@ -201,7 +217,7 @@ object KISS {
                         if (inFrame && buffer.size() > 0 && command == CMD_DATA) {
                             // End of frame
                             val frameData = buffer.toByteArray()
-                            buffer.reset()
+                            recycleBuffer()
                             val unescaped = unescape(frameData)
                             // python TCPInterface.py:370 — payload bytes past HW_MTU
                             // are never accumulated; truncate the decoded frame to match.
@@ -213,7 +229,7 @@ object KISS {
                         // Start of new frame
                         inFrame = true
                         command = CMD_UNKNOWN
-                        buffer.reset()
+                        recycleBuffer()
                     }
                     inFrame && buffer.size() == 0 && command == CMD_UNKNOWN -> {
                         // First byte after FEND is the command
@@ -221,7 +237,7 @@ object KISS {
                         command = (byte.toInt() and 0x0F).toByte()
                     }
                     inFrame && command == CMD_DATA -> {
-                        buffer.write(byte.toInt() and 0xFF)
+                        if (buffer.size() < maxEscapedBytes) buffer.write(byte.toInt() and 0xFF)
                     }
                 }
             }
@@ -231,9 +247,14 @@ object KISS {
          * Reset the deframer state.
          */
         fun reset() {
-            buffer.reset()
+            recycleBuffer()
             inFrame = false
             command = CMD_UNKNOWN
+        }
+
+        private companion object {
+            /** Accumulations above this are released rather than kept for reuse. */
+            const val SHRINK_ABOVE = 64 * 1024
         }
     }
 }

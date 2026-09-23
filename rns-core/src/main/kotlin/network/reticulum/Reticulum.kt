@@ -174,6 +174,7 @@ class Reticulum private constructor(
          * python Reticulum.py:555-558 / the bridge's `_Reticulum__use_implicit_proof`,
          * wire_tcp.py:5871). No port logic — just exposes the static flag.
          */
+        @network.reticulum.RnsTestSeam
         fun setUseImplicitProofForTest(enabled: Boolean) {
             implicitProofPolicy = enabled
         }

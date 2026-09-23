@@ -1,10 +1,12 @@
 package network.reticulum.resource
 
+import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.DestinationType
 import network.reticulum.common.PacketContext
 import network.reticulum.common.PacketType
 import network.reticulum.common.RnsConstants
 import network.reticulum.common.toHexString
+import network.reticulum.common.toKey
 import network.reticulum.crypto.Hashes
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
@@ -89,6 +91,7 @@ class Resource private constructor(
          * build and resets it in resetWireState().
          */
         @Volatile
+        @network.reticulum.RnsTestSeam
         var watchdogDisabledForTest: Boolean = false
 
         /**
@@ -463,7 +466,15 @@ class Resource private constructor(
         // metadata without the msgpack wrapper, growing total_size by only
         // 3 + len(metadata) instead of 3 + len(umsgpack.packb(metadata)).
         var dataWithMetadata = data
-        if (metadata != null && metadata.size <= ResourceConstants.METADATA_MAX_SIZE) {
+        if (metadata != null) {
+            // The reference raises on metadata over METADATA_MAX_SIZE
+            // (Resource.py:264-265). Dropping it silently sent a transfer without
+            // the metadata flag, so the receiver parsed a file response as a plain
+            // msgpack response and failed with no error reaching the sender.
+            // Refuse it here instead.
+            require(metadata.size <= ResourceConstants.METADATA_MAX_SIZE) {
+                "Resource metadata size of ${metadata.size} bytes exceeds the maximum of ${ResourceConstants.METADATA_MAX_SIZE} bytes"
+            }
             this.metadata = metadata
             this.hasMetadata = true
             val packedMetadata = msgpackPackBinary(metadata)
@@ -1098,15 +1109,17 @@ class Resource private constructor(
         // (sendPart AND an inline increment), double-counting sent_parts: an
         // 8-part serve reported sent_parts=16 and reached AWAITING_PROOF after
         // only half the parts were actually sent.
-        val searchScope = parts.slice(searchStart until minOf(searchEnd, parts.size))
-        for ((index, part) in searchScope.withIndex()) {
-            if (part != null) {
-                val partMapHash = getMapHash(part)
-                if (mapHashes.any { it.contentEquals(partMapHash) }) {
-                    val actualIndex = searchStart + index
-                    sendPart(actualIndex, part)
-                    lastActivity = System.currentTimeMillis()
-                }
+        // Use the map hashes computed once at construction (hashmap[i], the
+        // sender-side equivalent of python's precomputed part.map_hash,
+        // Resource.py:1021/1047) instead of re-hashing every candidate part per
+        // request: a ~100-byte RESOURCE_REQ otherwise cost about
+        // 2 x COLLISION_GUARD_SIZE SHA-256s on the ingest thread.
+        for (actualIndex in searchStart until minOf(searchEnd, parts.size)) {
+            val part = parts[actualIndex] ?: continue
+            val partMapHash = hashmap[actualIndex] ?: continue
+            if (mapHashes.any { it.contentEquals(partMapHash) }) {
+                sendPart(actualIndex, part)
+                lastActivity = System.currentTimeMillis()
             }
         }
 
@@ -1119,9 +1132,10 @@ class Resource private constructor(
             for (i in searchStart until minOf(searchEnd, parts.size)) {
                 val part = parts[i]
                 if (part != null) {
-                    val partMapHash = getMapHash(part)
+                    // Precomputed map hash (see the send loop above).
+                    val partMapHash = hashmap[i]
                     partIndex++
-                    if (partMapHash.contentEquals(lastMapHash)) {
+                    if (partMapHash != null && partMapHash.contentEquals(lastMapHash)) {
                         break
                     }
                 } else {
@@ -1195,6 +1209,10 @@ class Resource private constructor(
      */
     fun handleHashmapUpdate(plaintext: ByteArray) {
         if (status == ResourceConstants.FAILED) return
+        // Only apply an update we asked for (`if self.waiting_for_hmu`,
+        // Resource.py:489-490). An unsolicited one otherwise rewrote hashmap
+        // slots and reflected one RESOURCE_REQ per packet back to the sender.
+        if (!waitingForHmu) return
 
         lastActivity = System.currentTimeMillis()
         retries = 0
@@ -1211,6 +1229,18 @@ class Resource private constructor(
 
             val segment = unpacker.unpackInt()
             val hashmapLen = unpacker.unpackBinaryHeader()
+            // Never allocate for a declared bin length the packet cannot back:
+            // msgpack-core's readPayload(n) is `new byte[n]` before any read, so
+            // an attacker-declared bin32 length near 2^31 forced a huge
+            // allocation or an OutOfMemoryError. A genuine update carries at
+            // most HASHMAP_MAX_LEN map hashes (Resource.py:1057-1069).
+            val remaining = msgpackData.size - unpacker.totalReadBytes
+            if (hashmapLen < 0 || hashmapLen > remaining ||
+                hashmapLen > ResourceAdvertisement.HASHMAP_MAX_LEN * ResourceConstants.MAPHASH_LEN
+            ) {
+                log("Invalid hashmap update length $hashmapLen, ignoring")
+                return
+            }
             val hashmapBytes = unpacker.readPayload(hashmapLen)
             unpacker.close()
 
@@ -1237,16 +1267,35 @@ class Resource private constructor(
         val segLen = ResourceAdvertisement.HASHMAP_MAX_LEN
         val hashes = hashmapBytes.size / ResourceConstants.MAPHASH_LEN
 
+        // A negative segment has no meaning (python's negative list index
+        // would silently write at the tail, Resource.py:503-504); treat it
+        // like an empty update and cancel.
+        if (segment < 0) {
+            log("Invalid HMU segment $segment received, cancelling transfer")
+            cancel()
+            return
+        }
+
         for (i in 0 until hashes) {
-            val idx = i + segment * segLen
-            if (idx < hashmap.size && hashmap[idx] == null) {
+            // Long arithmetic: a huge segment must not overflow into a
+            // negative index that passes the `< hashmap.size` check.
+            val idxLong = i.toLong() + segment.toLong() * segLen
+            if (idxLong >= hashmap.size) continue
+            val idx = idxLong.toInt()
+            if (hashmap[idx] == null) {
                 hashmapHeight++
             }
-            if (idx < hashmap.size) {
-                val start = i * ResourceConstants.MAPHASH_LEN
-                val end = start + ResourceConstants.MAPHASH_LEN
-                hashmap[idx] = hashmapBytes.copyOfRange(start, end)
-            }
+            val start = i * ResourceConstants.MAPHASH_LEN
+            val end = start + ResourceConstants.MAPHASH_LEN
+            hashmap[idx] = hashmapBytes.copyOfRange(start, end)
+        }
+
+        // `if hashes < 1: cancel()` (Resource.py:506-508): an empty update is
+        // invalid, not a reason to re-request.
+        if (hashes < 1) {
+            log("Invalid HMU received, cancelling transfer")
+            cancel()
+            return
         }
 
         waitingForHmu = false
@@ -1348,15 +1397,20 @@ class Resource private constructor(
                 return false
             }
 
-            // Mark resource as complete
-            status = ResourceConstants.COMPLETE
-            stopWatchdog()
-            link.resourceConcluded(this)
-            log("Resource ${hash.toHexString()} proof validated successfully")
-
-            // Handle multi-segment resources
+            // Multi-segment: resolve the next segment BEFORE concluding this one.
+            // Python sets COMPLETE first and then blocks in
+            // `while self.next_segment == None: time.sleep(0.05)`
+            // (Resource.py:816-826), safe there because __prepare_next_segment
+            // always succeeds from the tempfile and validate_proof runs on its
+            // own thread. Here the wait is bounded and a segment that cannot be
+            // produced cancels the transfer, and cancel() is a no-op once status
+            // >= COMPLETE: with COMPLETE published first, a transfer whose next
+            // segment never appeared was left concluded on the link with neither
+            // callback fired and its input file still open. Ordering the wait
+            // first keeps cancel()'s `status < COMPLETE` guard effective.
+            var next: Resource? = null
             if (segmentIndex < totalSegments) {
-                // Prepare and advertise next segment
+                // Prepare the next segment if advertise() did not already start it
                 if (!preparingNextSegment) {
                     log("Preparing next segment ${segmentIndex + 1}/$totalSegments")
                     prepareNextSegment()
@@ -1382,13 +1436,21 @@ class Resource private constructor(
                     Thread.sleep(50)
                 }
 
-                val next = nextSegment
+                next = nextSegment
                 if (next == null) {
                     log("Could not prepare segment ${segmentIndex + 1}/$totalSegments; cancelling transfer")
                     cancel()
                     return false
                 }
+            }
 
+            // Mark resource as complete
+            status = ResourceConstants.COMPLETE
+            stopWatchdog()
+            link.resourceConcluded(this)
+            log("Resource ${hash.toHexString()} proof validated successfully")
+
+            if (next != null) {
                 // Advertise the next segment
                 next.advertise()
 
@@ -1563,7 +1625,14 @@ class Resource private constructor(
             var assembled = if (compressed) {
                 decompressBounded(decryptedData, maxDecompressedSize) ?: run {
                     markCorrupt("Decompressed resource exceeded maximum decompressed size")
-                    cancel()
+                    // Python's cancel() on a CORRUPT resource rejects the
+                    // advertisement (RESOURCE_RCL) and tears the link down
+                    // (Resource.py:1096-1099). cancel() here is a no-op once
+                    // status >= COMPLETE, so without this the peer could feed an
+                    // unbounded sequence of maximum-size inflations over one
+                    // link; the hash-mismatch CORRUPT path below stays as it is
+                    // because python does not tear down there.
+                    rejectAndTeardownLink()
                     return
                 }
             } else {
@@ -1637,6 +1706,55 @@ class Resource private constructor(
         link.resourceConcluded(this)
         callbacks.failed?.invoke(this)
     }
+
+    /**
+     * Mirror of python `Resource.cancel`'s CORRUPT branch (Resource.py:1096-1099):
+     * `self.reject(self.advertisement_packet)` sends a RESOURCE_RCL carrying the
+     * advertised resource hash (`reject`, Resource.py:156-162, packs `adv.h`
+     * as a link packet), then `self.link.teardown()`. Used only on the
+     * decompression-bomb verdict; markCorrupt has already concluded the
+     * resource on the link.
+     */
+    private fun rejectAndTeardownLink() {
+        try {
+            val rejectPacket = Packet.createRaw(
+                destinationHash = link.linkId,
+                data = link.encrypt(hash),
+                packetType = PacketType.DATA,
+                destinationType = DestinationType.LINK,
+                context = PacketContext.RESOURCE_RCL,
+                mtu = link.mtu,
+            )
+            rejectPacket.send()
+        } catch (e: Exception) {
+            log("Could not send resource reject packet: ${e.message}")
+        }
+        try {
+            link.teardown()
+        } catch (e: Exception) {
+            log("Error tearing down link after rejected resource: ${e.message}")
+        }
+    }
+
+    /**
+     * Packet hashes of the part requests already served for this resource (python
+     * `Resource.req_hashlist`, Resource.py:380). Held for the life of the resource
+     * object, as in the reference.
+     */
+    private val servedRequestHashes = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<ByteArrayKey, Boolean>(),
+    )
+
+    /**
+     * Record a request packet as served, returning false if it was already seen
+     * (python `Link.py:1113-1114`, `if not packet.packet_hash in resource.req_hashlist`).
+     *
+     * The duplicate is dropped rather than answered: the peer asks for parts by index, so
+     * re-serving one request re-sends parts it has already taken and desynchronises the
+     * window it uses to pick the next request.
+     */
+    fun admitRequestPacket(packetHash: ByteArray): Boolean =
+        servedRequestHashes.add(packetHash.toKey())
 
     /**
      * Cancel this resource transfer.
@@ -1842,6 +1960,12 @@ class Resource private constructor(
     private fun msgpackUnpackBinary(data: ByteArray): ByteArray {
         val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(data)
         val len = unpacker.unpackBinaryHeader()
+        // Same allocate-before-read hazard as the advertisement fields: the
+        // metadata block is peer-supplied, so refuse a declared length the
+        // block cannot back instead of letting readPayload allocate it.
+        if (len < 0 || len > data.size - unpacker.totalReadBytes) {
+            throw IllegalArgumentException("Declared metadata length $len exceeds block of ${data.size} bytes")
+        }
         val payload = unpacker.readPayload(len)
         unpacker.close()
         return payload
@@ -2000,6 +2124,7 @@ class Resource private constructor(
     fun maxDecompressedSizeForTest(): Int = maxDecompressedSize
     fun autoCompressLimitForTest(): Int = autoCompressLimit
     /** Lower the per-resource decompression bound (listener bomb-guard hook). */
+    @network.reticulum.RnsTestSeam
     fun setMaxDecompressedSizeForTest(value: Int) { maxDecompressedSize = value }
 
     /** Instrumentation counters (see the fields for what each event is). */

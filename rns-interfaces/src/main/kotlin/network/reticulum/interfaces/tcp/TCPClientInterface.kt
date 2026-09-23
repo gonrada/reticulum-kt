@@ -17,6 +17,7 @@ import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
+import network.reticulum.interfaces.util.TcpKeepalive
 import java.io.IOException
 import java.io.InputStream
 import java.net.InetSocketAddress
@@ -188,7 +189,9 @@ class TCPClientInterface(
         }
     }
 
-    private val hdlcDeframer = HDLC.createDeframer { data ->
+    // A peer that never sends a closing FLAG must not grow the deframer without limit:
+    // one MTU of payload escapes to at most twice its size.
+    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = 2 * hwMtu + 16) { data ->
         val frameNum = framesReceived.incrementAndGet()
         if (DEBUG) {
             val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
@@ -231,6 +234,10 @@ class TCPClientInterface(
             sock.connect(InetSocketAddress(targetHost, targetPort), connectTimeoutMs)
             sock.tcpNoDelay = true
             sock.keepAlive = keepAlive
+            // Python's probe timing (TCPInterface.py:183-197: TCP_KEEPIDLE=5,
+            // TCP_KEEPINTVL=2, TCP_KEEPCNT=12) so a dead peer is noticed in ~30 s rather
+            // than the OS default (~2 h on Linux). Best-effort; no-op where unsupported.
+            if (keepAlive) TcpKeepalive.apply(sock)
             sock.soTimeout = 0 // Block on read
             sock.setSoLinger(true, 5) // Clean shutdown with 5s linger (prevents RST on close)
 
@@ -437,6 +444,13 @@ class TCPClientInterface(
                     }
                 }
                 if (!detached.get()) {
+                    setOnline(false)
+                }
+            } catch (e: Exception) {
+                // python TCPInterface.py:426-434 catches Exception: go offline and
+                // reconnect, rather than leaving a zombie interface behind.
+                if (!detached.get()) {
+                    log("Read loop error: ${e.javaClass.name}: ${e.message}")
                     setOnline(false)
                 }
             }

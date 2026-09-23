@@ -56,14 +56,33 @@ object TransportConstants {
     /** Minimum interval for automated path requests in milliseconds. */
     const val PATH_REQUEST_MI = 20_000L
 
+    /**
+     * How long an outstanding path request stays in the path-request table, in
+     * milliseconds (python PATH_REQUEST_GATE_TIMEOUT = 45 s, Transport.py:135). The table
+     * is consulted to exempt an announce from ingress holding, so an entry that never
+     * aged out was a permanent exemption for that destination.
+     */
+    const val PATH_REQUEST_GATE_TIMEOUT = 45_000L
+
+    /**
+     * Floor applied to an interface's reported bitrate wherever it sizes a wait
+     * (python Reticulum.MINIMUM_BITRATE). A bitrate of 0 otherwise turns the announce
+     * cap into a no-op.
+     */
+    const val MINIMUM_BITRATE = 5
+
     /** Reverse table entry timeout in milliseconds (8 minutes). */
     const val REVERSE_TIMEOUT = 8L * 60 * 1000
 
     /** Link proof timeout in milliseconds (10 minutes). */
     const val LINK_PROOF_TIMEOUT = 10L * 60 * 1000
 
-    /** Link table entry timeout for validated links (1 hour). */
-    const val LINK_TIMEOUT = 60L * 60 * 1000
+    /** Link table entry timeout for validated links: python `LINK_TIMEOUT = RNS.Link.STALE_TIME * 1.25` (Transport.py:152), 900 s. */
+    val LINK_TIMEOUT: Long = (network.reticulum.link.LinkConstants.STALE_TIME * 1.25).toLong()
+
+    /** python `TUNNEL_TIMEOUT` / `TUNNEL_PATH_TIMEOUT` (Transport.py:157-158): eight hours unused. */
+    const val TUNNEL_TIMEOUT = 8L * 60 * 60 * 1000
+    const val TUNNEL_PATH_TIMEOUT = 8L * 60 * 60 * 1000
 
     /** Destination table entry timeout (1 week in milliseconds). */
     const val DESTINATION_TIMEOUT = 7L * 24 * 60 * 60 * 1000

@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -58,6 +59,9 @@ class LocalServerInterface : Interface {
 
         /** Maximum number of concurrent clients. */
         const val MAX_CLIENTS = 256
+
+        /** Pause after a failed accept() so an EMFILE condition cannot spin the loop. */
+        const val ACCEPT_ERROR_DELAY_MS = 250L
 
         /** Bitrate for local IPC (1 Gbps). */
         const val BITRATE = 1_000_000_000
@@ -288,16 +292,28 @@ class LocalServerInterface : Interface {
                 // Normal cancellation, exit loop
                 break
             } catch (e: SocketException) {
-                if (!detached.get()) {
-                    log("Accept error: ${e.message}")
-                }
-                break
+                // A transient accept failure (EMFILE, a peer that reset mid-handshake)
+                // must not retire the shared instance's listener for good — python's
+                // socketserver.serve_forever tolerates OSError on accept. Only stop when
+                // detached or the listening socket itself is gone.
+                if (detached.get() || listenerClosed()) break
+                log("Accept error: ${e.message}")
+                delay(ACCEPT_ERROR_DELAY_MS)
             } catch (e: Exception) {
-                if (!detached.get()) {
-                    log("Error accepting connection: ${e.message}")
-                }
+                if (detached.get() || listenerClosed()) break
+                log("Error accepting connection: ${e.message}")
+                delay(ACCEPT_ERROR_DELAY_MS)
             }
         }
+    }
+
+    /** True when the listening socket/channel has been closed underneath the accept loop. */
+    private fun listenerClosed(): Boolean {
+        val channel = serverChannel
+        if (channel != null) return !channel.isOpen
+        val socket = serverSocket
+        if (socket != null) return socket.isClosed
+        return true
     }
 
     private fun acceptUnixSocket(): Socket? {
