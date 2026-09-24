@@ -1,20 +1,18 @@
 package network.reticulum.resource
 
-import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.DestinationType
 import network.reticulum.common.PacketContext
 import network.reticulum.common.PacketType
+import network.reticulum.common.ByteArrayKey
+import network.reticulum.common.toKey
 import network.reticulum.common.RnsConstants
 import network.reticulum.common.toHexString
-import network.reticulum.common.toKey
 import network.reticulum.crypto.Hashes
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
-import java.io.File
-import java.io.RandomAccessFile
 import java.security.SecureRandom
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
@@ -58,27 +56,81 @@ class ResourceCallbacks {
  * }
  * ```
  */
+/**
+ * Receive-side accumulation of one split transfer's completed segments, owned by the
+ * [Link] the transfer arrives on and released when that link tears down. Python keeps the
+ * equivalent as a file under storagepath keyed by the original hash (Resource.py:200,
+ * 721-723). Besides the bytes it records what a well-behaved sender is bound to — the
+ * segment count advertised by the first segment and the next index expected — so a
+ * sender that changes `l` mid-transfer or replays a segment is refused rather than
+ * accumulated.
+ */
+internal class SegmentAccumulator(val expectedSegments: Int) {
+    val buffer = ByteArrayOutputStream()
+    var metadata: ByteArray? = null
+    var nextIndex: Int = 1
+    /** Stamped by the owning Resource from its clock when the accumulator is created and on every segment. */
+    @Volatile var lastProgressAt: Long = 0L
+}
+
 class Resource private constructor(
     /** The link this resource is being transferred over. */
     val link: Link,
     /** Whether this side initiated the transfer. */
     val initiator: Boolean
 ) {
+    /**
+     * Every timestamp in this class is taken from here. Tests replace it so the
+     * watchdog's waits of seconds to minutes are driven in milliseconds and to the
+     * exact millisecond. Production never
+     * sets it; `ResourceWatchdogTimingTest` greps this file so no direct clock read
+     * can reappear.
+     */
+    @Volatile
+    @network.reticulum.RnsTestSeam
+    internal var clock: () -> Long = { System.currentTimeMillis() }
+
     companion object {
-        private val resourceCounter = AtomicInteger(0)
-        private val random = SecureRandom()
+        /**
+         * Bound on hashmap rebuild attempts after a map-hash collision. Each retry draws a
+         * fresh random_hash, so repeats are vanishingly unlikely; the bound turns a
+         * pathological case into an error rather than a hang.
+         */
+        private const val MAX_HASHMAP_REBUILDS = 16
 
         /**
-         * Upper bound (ms) on how long validateProof waits for the next segment
-         * of a split transfer to be prepared. The wait runs on the Transport
-         * inbound thread under the global jobs lock, so it must not be unbounded
-         * (F3.1). Preparation is a background bz2 + encrypt of at most
-         * MAX_EFFICIENT_SIZE bytes and is normally finished before the proof
-         * arrives; the bound only matters if the segment source cannot be read or
-         * the preparation thread dies, in which case the transfer is cancelled
-         * rather than the ingest thread stalled forever.
+         * Test-only hook over [getMapHash]. Receives the resource and the genuine map hash
+         * and may substitute another value, which is how the conformance bridge forces a
+         * map-hash collision without fabricating bytes: it returns one part's real hash a
+         * second time. Null in normal operation.
          */
-        private const val SEGMENT_WAIT_MS: Long = 15_000
+        @Volatile
+        @network.reticulum.RnsTestSeam
+        var mapHashInterceptorForTest: ((Resource, ByteArray) -> ByteArray?)? = null
+
+        /**
+         * Receive-side segment accumulator, keyed by `originalHash` — the one field that
+         * is identical across every segment of a split transfer.
+         *
+         * Python accumulates on disk: `resource.storagepath = resourcepath + "/" +
+         * original_hash.hex()` (Resource.py:200), each segment appends with
+         * `open(storagepath, "ab")` (Resource.py:722-723), and the user callback fires
+         * only once `segment_index == total_segments` (Resource.py:738). The metadata
+         * block rides on segment 1 alone and is re-attached at the end.
+         *
+         * Without this, every segment was delivered as its own COMPLETE resource holding
+         * only its own bytes, so a >1 MiB transfer from a python sender arrived as N
+         * fragments instead of one payload — right total length, wrong content, no error,
+         * because each segment passes its own hash check.
+         */
+        // The accumulations themselves live on the Link (`Link.segmentAccumulators`), not
+        // here: a transfer is bound to the link it arrives on, so link teardown can release
+        // every partial accumulation that link owned. A process-wide map keyed only by the
+        // sender-supplied original hash could not be released by anything but completion,
+        // and a peer that never completed retained heap for the life of the process.
+
+        private val resourceCounter = AtomicInteger(0)
+        private val random = SecureRandom()
 
         /**
          * Test-only watchdog suppression. Mirrors the reference conformance
@@ -114,6 +166,7 @@ class Resource private constructor(
             autoCompress: Boolean = true,
             callback: ((Resource) -> Unit)? = null,
             progressCallback: ((Resource) -> Unit)? = null,
+            failedCallback: ((Resource) -> Unit)? = null,
             requestId: ByteArray? = null,
             isResponse: Boolean = false,
             timeout: Long? = null
@@ -122,9 +175,15 @@ class Resource private constructor(
 
             callback?.let { resource.callbacks.completed = it }
             progressCallback?.let { resource.callbacks.progress = it }
+            // Wire the failed callback BEFORE advertise() starts the watchdog. Setting it via
+            // resource.callbacks.failed after create() returns leaves a window where a watchdog
+            // timeout could fire against a null failed callback and drop the failure
+            // notification (null-safe, no crash, but silent).
+            failedCallback?.let { resource.callbacks.failed = it }
 
             resource.requestId = requestId
             resource.isResponse = isResponse
+            timeout?.let { resource.timeoutMs = it }
 
             resource.initializeForSending(data, metadata, autoCompress)
 
@@ -213,22 +272,37 @@ class Resource private constructor(
         }
 
         /**
-         * Reject an incoming resource advertisement.
+         * Refuse an advertised resource, telling the sender so rather than letting it
+         * discover the refusal by timing out (python `Resource.reject`, `Resource.py:156-165`).
+         *
+         * The packet is addressed to the LINK and its payload encrypted to it, exactly like
+         * every other link packet. An earlier version addressed it to the resource hash and
+         * sent the hash in clear: the sender's RCL handler decrypts the payload before
+         * matching, so nothing matched, and every rejected transfer ran to its full watchdog
+         * timeout and reported FAILED instead of REJECTED.
          */
         fun reject(advertisement: ResourceAdvertisement, link: Link) {
             try {
                 val rejectPacket = Packet.createRaw(
-                    destinationHash = advertisement.hash,
-                    data = advertisement.hash,
-                    context = PacketContext.RESOURCE_RCL
+                    destinationHash = link.linkId,
+                    data = link.encrypt(advertisement.hash),
+                    packetType = PacketType.DATA,
+                    destinationType = DestinationType.LINK,
+                    context = PacketContext.RESOURCE_RCL,
+                    mtu = link.mtu,
                 )
-                link.send(rejectPacket.raw ?: ByteArray(0))
+                rejectPacket.send()
             } catch (e: Exception) {
                 log("Error rejecting resource: ${e.message}")
             }
         }
 
+        // Off by default: resource-op logging includes hashes/sizes and fires on
+        // every transfer step. Opt in with -Dreticulum.resource.debug=true.
+        private val DEBUG = System.getProperty("reticulum.resource.debug", "false").toBoolean()
+
         private fun log(message: String) {
+            if (!DEBUG) return
             val timestamp = java.time.LocalDateTime.now().format(
                 java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
             )
@@ -318,10 +392,17 @@ class Resource private constructor(
 
     // Timing
     private var rtt: Long? = null
-    private var lastActivity: Long = System.currentTimeMillis()
+    private var lastActivity: Long = clock()
     private var lastPartSent: Long = 0
     private var startedTransferring: Long? = null
-    private var retries: Int = 0
+    // python Resource.py:345-350, 383-384. `retriesLeft` counts down and is refilled at
+    // the sites the reference refills it; `timeoutFactor` drops to PROOF_TIMEOUT_FACTOR
+    // in AWAITING_PROOF; `partTimeoutFactor` drops after the first RTT sample.
+    private var retriesLeft: Int = ResourceConstants.MAX_RETRIES
+    private var timeoutFactor: Int = link.trafficTimeoutFactor
+    private var partTimeoutFactor: Int = ResourceConstants.PART_TIMEOUT_FACTOR
+    /** python `self.timeout` (Resource.py:383-384): the constructor argument, else rtt × traffic_timeout_factor. */
+    private var timeoutMs: Long = (link.rtt ?: 0L) * link.trafficTimeoutFactor
 
     // Request/response timing for RTT calculation
     private var reqSent: Long = 0
@@ -366,39 +447,20 @@ class Resource private constructor(
     private var assembledData: ByteArray? = null
     private var metadata: ByteArray? = null
 
-    // Multi-segment support
-    /**
-     * Size of the wire metadata BLOCK (3-byte big-endian length + msgpack-packed
-     * metadata), 0 when there is no metadata. Mirrors python `self.metadata_size`
-     * (Resource.py:258-268), which counts the whole prefixed block and is what
-     * the first-segment read bound (`MAX_EFFICIENT_SIZE - metadata_size`)
-     * subtracts. Distinct from the raw [metadata] payload length.
-     */
-    private var metadataBlockSize: Int = 0
-    /**
-     * The auto-compress OPTION as the application passed it (true/false),
-     * carried across split segments. Mirrors python `self.auto_compress_option`
-     * (Resource.py:369), which each prepared segment re-applies to its own
-     * content (Resource.py:773). Not the per-segment [compressed] RESULT:
-     * whether a segment actually shrank is decided per segment.
-     */
-    private var autoCompressOption: Boolean = true
-    /**
-     * The temporary file backing a split transfer's [inputFile] (python
-     * `tempfile.TemporaryFile`, Resource.py:277). Deleted once the transfer
-     * reaches a terminal state (final segment concluded or cancel).
-     */
-    private var tempFile: File? = null
+    // Multi-segment support. Python spools a >MAX_EFFICIENT_SIZE payload to a
+    // tempfile and every segment re-reads its own range from it
+    // (Resource.py:275-322, 779-792). The port keeps the full payload in
+    // memory instead: [segmentSource] is the in-memory equivalent of python's
+    // `input_file`, shared (not copied) between the segments of one transfer.
+    // [inputFile] is retained for a file-backed source. Both flags are
+    // @Volatile: the preparation thread writes them, validateProof (on the
+    // Transport ingest thread) reads them.
     private var inputFile: java.io.RandomAccessFile? = null
-    // @Volatile: written by the background segment-preparation thread and read by
-    // validateProof() on the Transport inbound thread (a cross-thread handoff by
-    // polling). Volatile gives the publication the happens-before visibility the
-    // code relies on, matching the @Volatile idiom used for the same pattern in
-    // Link.kt / Transport.kt.
-    @Volatile
-    private var preparingNextSegment: Boolean = false
-    @Volatile
-    private var nextSegment: Resource? = null
+    private var segmentSource: ByteArray? = null
+    private var segmentMetadataSize: Int = 0
+    private var autoCompressOption: Boolean = true
+    @Volatile private var preparingNextSegment: Boolean = false
+    @Volatile private var nextSegment: Resource? = null
 
     // Proof tracking
     private var expectedProof: ByteArray? = null
@@ -437,24 +499,7 @@ class Resource private constructor(
      * Initialize resource for sending.
      * Matches Python RNS Resource.__init__() protocol.
      */
-    private fun initializeForSending(
-        data: ByteArray,
-        metadata: ByteArray?,
-        autoCompress: Boolean,
-        segmentContinuation: Boolean = false,
-        totalPayloadSize: Int? = null
-    ) {
-        uncompressedData = data
-        // Total transfer size. The ROOT resource is total_size = raw_payload +
-        // metadata_block (python Resource.py:283, total_size = data_size +
-        // metadata_size). A SPLIT CONTINUATION segment carries the transfer's full
-        // RAW payload size (the spilled file length) so the auto-compress decision
-        // (python Resource.py:390, data_size = full payload) and the advertisement's
-        // data_size (Resource.py:1300, adv.d) match the reference for every segment.
-        totalSize = totalPayloadSize ?: data.size
-        uncompressedSize = data.size
-        autoCompressOption = autoCompress
-
+    private fun initializeForSending(data: ByteArray, metadata: ByteArray?, autoCompress: Boolean) {
         // Handle metadata. Mirrors python Resource.__init__ (Resource.py:260-268):
         //   packed_metadata = umsgpack.packb(metadata)
         //   self.metadata   = struct.pack(">I", len(packed_metadata))[1:] + packed_metadata
@@ -465,13 +510,10 @@ class Resource private constructor(
         // 3 + len(packed) metadata block. A previous build prepended the raw
         // metadata without the msgpack wrapper, growing total_size by only
         // 3 + len(metadata) instead of 3 + len(umsgpack.packb(metadata)).
-        var dataWithMetadata = data
+        var metadataBlock = ByteArray(0)
         if (metadata != null) {
-            // The reference raises on metadata over METADATA_MAX_SIZE
-            // (Resource.py:264-265). Dropping it silently sent a transfer without
-            // the metadata flag, so the receiver parsed a file response as a plain
-            // msgpack response and failed with no error reaching the sender.
-            // Refuse it here instead.
+            // python Resource.py:264-265 raises; dropping the metadata silently sent a
+            // transfer the receiver could not interpret.
             require(metadata.size <= ResourceConstants.METADATA_MAX_SIZE) {
                 "Resource metadata size of ${metadata.size} bytes exceeds the maximum of ${ResourceConstants.METADATA_MAX_SIZE} bytes"
             }
@@ -484,95 +526,69 @@ class Resource private constructor(
                 ((metaSize shr 8) and 0xFF).toByte(),
                 (metaSize and 0xFF).toByte()
             )
-            dataWithMetadata = metaPrefix + packedMetadata + data
-            totalSize = dataWithMetadata.size
-            metadataBlockSize = 3 + metaSize
+            metadataBlock = metaPrefix + packedMetadata
         }
+        autoCompressOption = autoCompress
+        segmentMetadataSize = metadataBlock.size
+        totalSize = data.size + segmentMetadataSize
 
-        // Decide the split before touching the data, from the TOTAL payload size
-        // (mirrors python Resource.py:295-301, computed from total_size before any
-        // read). A split transfer is driven segment by segment: each segment is an
-        // independent, self-contained transfer (own random_hash, compression
-        // decision, encryption, hash, expected proof and part map) announced in
-        // turn, exactly as python builds one Resource per segment (Resource.py:
-        // 296-329 for the file read, __prepare_next_segment at 765-779 for the
-        // follow-ups).
+        // Segmentation. Mirrors python Resource.__init__ (Resource.py:275-322):
+        // a payload whose metadata_size + len(data) exceeds MAX_EFFICIENT_SIZE
+        // is spooled and only the FIRST segment's range
+        // (MAX_EFFICIENT_SIZE - metadata_size bytes) becomes this resource's
+        // data; later segments are built by prepareNextSegment() from the
+        // retained source. A previous build set split/totalSegments > 1 while
+        // still packing the whole payload into this one resource and had no
+        // segment source for prepareNextSegment(), so validateProof spun
+        // forever waiting for a segment that could never be built.
+        val segmentData: ByteArray
         if (totalSize > ResourceConstants.MAX_EFFICIENT_SIZE) {
             totalSegments = ((totalSize - 1) / ResourceConstants.MAX_EFFICIENT_SIZE) + 1
+            segmentIndex = 1
             split = true
-        }
-
-        // SPLIT path (F3.1 parity): spill the payload to a temporary file, keep
-        // it open as [inputFile] (python `self.input_file`, Resource.py:274-314),
-        // and process ONLY the first segment in memory. prepareNextSegment reads
-        // the following chunks from the file when the previous segment's proof
-        // arrives (validateProof -> prepareNextSegment). Without the spill, an
-        // in-memory payload above MAX_EFFICIENT_SIZE marked split had no file to
-        // read segment 2 from: the proof validator waited forever for a segment
-        // that could never be produced (the remote DoS), and a port that merely
-        // bounds that wait (cancel after a deadline) still never CONCLUDES the
-        // transfer.
-        //
-        // First-segment content is [metadata block] + the first
-        // (MAX_EFFICIENT_SIZE - metadataBlockSize) RAW payload bytes; segment N>1
-        // content is the raw chunk at offset (N-2)*MAX_EFFICIENT_SIZE. Note the
-        // segment bounds are expressed in RAW payload bytes, and the metadata
-        // block is counted inside the first segment's MAX_EFFICIENT_SIZE budget
-        // (python first_read_size = MAX_EFFICIENT_SIZE - self.metadata_size,
-        // Resource.py:303-313). Only the ROOT resource (segment 1, non-continuation)
-        // spills and truncates; a continuation segment is ALREADY a single chunk
-        // read from the parent's file by prepareNextSegment, so it must not
-        // re-spill or re-truncate (guard: !segmentContinuation).
-        if (!segmentContinuation && split && segmentIndex == 1) {
-            // The first segment's RAW read is MAX_EFFICIENT_SIZE - metadataBlockSize
+            segmentSource = data
+            // The first segment's raw read is MAX_EFFICIENT_SIZE - metadata block
             // (python first_read_size, Resource.py:303). A metadata block that fills
-            // or exceeds the whole segment budget makes that read size <= 0: the
+            // the whole segment budget makes that read size zero or negative: the
             // reference then reads with a negative size and CPython raises
-            // ValueError, so the reference does not complete this degenerate
-            // transfer either. Fail fast with a clear error before touching the
-            // file instead of a mid-init copyOfRange exception.
-            if (metadataBlockSize >= ResourceConstants.MAX_EFFICIENT_SIZE) {
+            // ValueError, so it does not complete this degenerate transfer either.
+            // Fail fast with a clear error instead of advertising an empty segment.
+            if (segmentMetadataSize >= ResourceConstants.MAX_EFFICIENT_SIZE) {
                 throw IllegalArgumentException(
-                    "metadata block (${metadataBlockSize} bytes) leaves no room " +
-                        "for the first segment payload (budget ${ResourceConstants.MAX_EFFICIENT_SIZE} bytes)"
+                    "metadata block ($segmentMetadataSize bytes) leaves no room " +
+                        "for the first segment payload (budget ${ResourceConstants.MAX_EFFICIENT_SIZE} bytes)",
                 )
             }
-            val temp = File.createTempFile("rns-res-${System.nanoTime()}", ".tmp")
-            temp.deleteOnExit()
-            temp.outputStream().use { it.write(data) }
-            tempFile = temp
-            inputFile = RandomAccessFile(temp, "rw")
-
-            // First segment raw read: MAX_EFFICIENT_SIZE - metadataBlockSize.
-            // (python first_read_size / segment_read_size, Resource.py:303-313)
-            val firstChunk = ResourceConstants.MAX_EFFICIENT_SIZE - metadataBlockSize
-            val readLen = min(firstChunk, data.size)
-            val firstSegmentData = data.copyOfRange(0, readLen)
-
-            // Rebuild the metadata-prefixed content for this segment only: the
-            // metadata block (3-byte BE length + msgpack) + this segment's raw
-            // chunk. Non-first segments carry no metadata block.
-            dataWithMetadata = if (metadataBlockSize > 0 && metadata != null) {
-                val packedMetadata = msgpackPackBinary(metadata)
-                val metaPrefix = byteArrayOf(
-                    ((packedMetadata.size shr 16) and 0xFF).toByte(),
-                    ((packedMetadata.size shr 8) and 0xFF).toByte(),
-                    (packedMetadata.size and 0xFF).toByte()
-                )
-                metaPrefix + packedMetadata + firstSegmentData
-            } else {
-                firstSegmentData
-            }
-            uncompressedData = dataWithMetadata
-            uncompressedSize = dataWithMetadata.size
+            val firstReadSize = ResourceConstants.MAX_EFFICIENT_SIZE - segmentMetadataSize
+            segmentData = data.copyOfRange(0, min(firstReadSize, data.size))
+        } else {
+            totalSegments = 1
+            segmentIndex = 1
+            split = false
+            segmentData = data
         }
 
-        // Compress if requested and within limits. Mirrors python
-        // Resource.py:389-418: the auto-compress decision is made against the
-        // TOTAL payload size (data_size <= auto_compress_limit), applied per
-        // segment, and a segment is marked compressed only if compression
-        // actually shrank its own content.
-        val compressedResult = if (autoCompress && totalSize <= ResourceConstants.AUTO_COMPRESS_MAX_SIZE) {
+        val dataWithMetadata = if (metadataBlock.isEmpty()) segmentData else metadataBlock + segmentData
+        initializeSegmentPayload(dataWithMetadata, autoCompress)
+    }
+
+    /**
+     * Build this resource's transfer payload (compress, encrypt, split into
+     * parts, hashmap, hash and expected proof) from ONE segment's data —
+     * [dataWithMetadata] is `self.metadata + resource_data` for the first
+     * segment and the bare segment range for later ones (Resource.py:335-337).
+     * Shared by [initializeForSending] (segment 1) and [buildNextSegment].
+     * Does not touch totalSize / totalSegments / segmentIndex / split, which
+     * the caller has already set for the whole transfer.
+     */
+    private fun initializeSegmentPayload(dataWithMetadata: ByteArray, autoCompress: Boolean) {
+        // Python: self.uncompressed_data = data; self.uncompressed_size = len(...)
+        // (Resource.py:402) — the segment payload including its metadata block.
+        uncompressedData = dataWithMetadata
+        uncompressedSize = dataWithMetadata.size
+
+        // Compress if requested and within limits
+        val compressedResult = if (autoCompress && dataWithMetadata.size <= ResourceConstants.AUTO_COMPRESS_MAX_SIZE) {
             compress(dataWithMetadata)
         } else {
             dataWithMetadata
@@ -583,9 +599,6 @@ class Resource private constructor(
 
         // Use compressed data if it's smaller, otherwise uncompressed
         val contentData = if (compressed) compressedResult else dataWithMetadata
-
-        // Generate random hash for hash calculations (this is sent in advertisement)
-        randomHash = ByteArray(ResourceConstants.RANDOM_HASH_SIZE).also { random.nextBytes(it) }
 
         // Generate random prefix for the data stream (different from randomHash!)
         // This provides uniqueness for the encrypted stream
@@ -599,48 +612,82 @@ class Resource private constructor(
         encrypted = true
 
         size = encryptedData.size
-        log("initializeForSending: prefixedData=${prefixedData.size} bytes, encryptedData=${encryptedData.size} bytes (seg $segmentIndex/$totalSegments)")
+        log("initializeForSending: prefixedData=${prefixedData.size} bytes, encryptedData=${encryptedData.size} bytes")
 
-        // Split encrypted data into parts
         val totalParts = ceil(size.toDouble() / sdu).toInt()
-        parts = arrayOfNulls(totalParts)
-        hashmap = arrayOfNulls(totalParts)
 
-        // Create hashmap and parts from encrypted data
-        val hashmapBuilder = ByteArrayOutputStream()
-        for (i in 0 until totalParts) {
-            val start = i * sdu
-            val end = min(start + sdu, size)
-            val part = encryptedData.copyOfRange(start, end)
-            parts[i] = part
+        // Build the hashmap, rebuilding under a fresh random_hash if two parts inside the
+        // receiver's COLLISION_GUARD window map to the same hash (python Resource.py:440-477).
+        //
+        // A map hash is what the receiver uses to ask for a specific part. Two parts sharing
+        // one inside the window are indistinguishable to it: a request resolves to whichever
+        // the receiver finds first, so one part is delivered twice and the other never, and
+        // the transfer fails its final hash check after moving all the data. The map hash is
+        // salted with random_hash, so drawing a new one re-rolls every part's hash at once.
+        var attempts = 0
+        while (true) {
+            // Regenerating random_hash changes the resource hash, so it must be drawn
+            // INSIDE the loop — the hashes below are derived from whichever draw wins.
+            randomHash = ByteArray(ResourceConstants.RANDOM_HASH_SIZE).also { random.nextBytes(it) }
 
-            // Calculate part hash: full_hash(part + randomHash)[:MAPHASH_LEN]
-            val partHash = getMapHash(part)
-            hashmap[i] = partHash
-            hashmapBuilder.write(partHash)
+            val candidateParts = arrayOfNulls<ByteArray>(totalParts)
+            val candidateHashes = arrayOfNulls<ByteArray>(totalParts)
+            val hashmapBuilder = ByteArrayOutputStream()
+            val collisionGuard = ArrayDeque<ByteArrayKey>()
+            var collided = false
+
+            for (i in 0 until totalParts) {
+                val start = i * sdu
+                val end = min(start + sdu, size)
+                val part = encryptedData.copyOfRange(start, end)
+
+                // Calculate part hash: full_hash(part + randomHash)[:MAPHASH_LEN]
+                val partHash = getMapHash(part)
+                val key = partHash.toKey()
+                if (collisionGuard.contains(key)) {
+                    log("Found hash collision in resource map, remapping...")
+                    collided = true
+                    break
+                }
+                collisionGuard.addLast(key)
+                if (collisionGuard.size > ResourceAdvertisement.COLLISION_GUARD_SIZE) {
+                    collisionGuard.removeFirst()
+                }
+
+                candidateParts[i] = part
+                candidateHashes[i] = partHash
+                hashmapBuilder.write(partHash)
+            }
+
+            if (!collided) {
+                parts = candidateParts
+                hashmap = candidateHashes
+                hashmapRaw = hashmapBuilder.toByteArray()
+                break
+            }
+
+            // Each retry is an independent draw over a 4-byte hash, so the chance of
+            // repeated collisions falls off immediately. A bound still beats an unbounded
+            // loop here: giving up leaves the caller with an error instead of a hang.
+            attempts++
+            if (attempts >= MAX_HASHMAP_REBUILDS) {
+                throw IllegalStateException(
+                    "Could not build a collision-free resource hashmap for $totalParts " +
+                        "parts after $attempts attempts",
+                )
+            }
         }
-        hashmapRaw = hashmapBuilder.toByteArray()
 
-        // Calculate resource hash from the segment's UNCOMPRESSED content (with
-        // metadata for segment 1) + randomHash. Mirrors python Resource.py:440-443
-        // where hash/expected_proof are computed over THIS segment's `data`
-        // (the compressed/uncompressed segment content), and original_hash chains
-        // from the previous segment (Resource.py:445-448, 772).
+        // Calculate resource hash from UNCOMPRESSED data (with metadata) + randomHash
+        // This matches Python: self.hash = RNS.Identity.full_hash(data+self.random_hash)
         hash = Hashes.fullHash(dataWithMetadata + randomHash)
-        // The ROOT resource's original_hash is its own hash (the first-segment hash
-        // the whole transfer is keyed by, which continuations chain from, python
-        // Resource.py:445-446). A continuation segment instead inherits the parent's
-        // original_hash (python Resource.py:772, set by prepareNextSegment), so it
-        // must NOT re-derive it from its own hash here.
-        if (!segmentContinuation) {
-            originalHash = hash.copyOf()
-        }
+        originalHash = hash.copyOf()
 
-        // Calculate expected proof: full_hash(segment content + hash)
+        // Calculate expected proof: full_hash(uncompressed_data + hash)
         expectedProof = Hashes.fullHash(dataWithMetadata + hash)
 
         status = ResourceConstants.QUEUED
-        log("Resource ${hash.toHexString()} created: $size bytes in ${parts.size} parts (compressed=$compressed, encrypted=$encrypted, seg $segmentIndex/$totalSegments)")
+        log("Resource ${hash.toHexString()} created: $size bytes in ${parts.size} parts (compressed=$compressed, encrypted=$encrypted)")
     }
 
     /**
@@ -686,7 +733,7 @@ class Resource private constructor(
         // the WINDOW=4 default, preserving multi-resource throughput.
         link.getLastResourceWindow()?.let { window = it }
 
-        lastActivity = System.currentTimeMillis()
+        lastActivity = clock()
         startedTransferring = lastActivity
 
         // Register with link
@@ -736,48 +783,44 @@ class Resource private constructor(
         link.registerOutgoingResource(this)
 
         status = ResourceConstants.ADVERTISED
-        val adv = ResourceAdvertisement.fromResource(this)
-        val advData = adv.pack()
+        rtt = null
+        retriesLeft = ResourceConstants.MAX_ADV_RETRIES
+        sendAdvertisementPacket()
+        startWatchdog()
+        log("Advertised resource ${hash.toHexString()}")
 
-        // Debug: log the advertisement content
-        log("Advertisement content:")
-        log("  transferSize=${adv.transferSize}, dataSize=${adv.dataSize}, numParts=${adv.numParts}")
-        log("  hash=${adv.hash.toHexString()} (${adv.hash.size} bytes)")
-        log("  randomHash=${adv.randomHash.toHexString()} (${adv.randomHash.size} bytes)")
-        log("  flags=${adv.flags}, segmentIndex=${adv.segmentIndex}, totalSegments=${adv.totalSegments}")
-        log("  advData size=${advData.size} bytes")
+        // Start building the next segment in the background while this one
+        // transfers, so validateProof normally finds it ready (Resource.py:525-527).
+        if (segmentIndex < totalSegments) {
+            prepareNextSegment()
+        }
+    }
 
-        // Send encrypted via link
+    /** Count of RESOURCE_ADV packets this sender has emitted (initial + watchdog re-sends). */
+    @Volatile
+    private var advSendCount = 0
+
+    /**
+     * Build and send this resource's RESOURCE_ADV packet and refresh the advertisement clocks.
+     * Extracted from [doAdvertise] so the sender watchdog can re-advertise when no part requests
+     * arrive: a lost initial advertisement leaves the receiver unaware, and only the sender can
+     * recover by re-advertising (Python watchdog ADVERTISED branch, Resource.py:585-598).
+     */
+    private fun sendAdvertisementPacket() {
+        advSendCount++
+        val advData = ResourceAdvertisement.fromResource(this).pack()
         val encrypted = link.encrypt(advData)
-        log("  encrypted size=${encrypted.size} bytes")
-
         val packet = Packet.createRaw(
             destinationHash = link.linkId,
             data = encrypted,
             packetType = PacketType.DATA,
             destinationType = DestinationType.LINK,
             context = PacketContext.RESOURCE_ADV,
-            mtu = link.mtu
+            mtu = link.mtu,
         )
-
-        log("  packet linkId=${link.linkId.toHexString()}, raw size=${packet.raw?.size ?: "null"}")
-        log("  link status=${link.status}")
-        val receipt = packet.send()
-        log("  send result: receipt=${receipt != null}, packet.sent=${packet.sent}")
-        lastActivity = System.currentTimeMillis()
+        packet.send()
+        lastActivity = clock()
         advSent = lastActivity
-
-        // Pre-prepare the next segment of a split transfer in the background
-        // (python `advertise()`, Resource.py:528-530: a daemon thread runs
-        // __prepare_next_segment whenever segment_index < total_segments), so
-        // the segment is built by the time this one's proof arrives instead of
-        // the proof validator waiting for it.
-        if (split && segmentIndex < totalSegments) {
-            prepareNextSegment()
-        }
-
-        startWatchdog()
-        log("Advertised resource ${hash.toHexString()}")
     }
 
     /**
@@ -807,12 +850,22 @@ class Resource private constructor(
         // Send just the data - no index prefix!
         // Python identifies parts by computing the map hash of the received data
         link.sendResourceData(data)
-        lastActivity = System.currentTimeMillis()
+        lastActivity = clock()
         lastPartSent = lastActivity
 
         // Track sent parts
         if (sentPartsSet.add(index)) {
             sentParts++
+            // Outgoing progress: fire on the sender as each new part is
+            // transmitted, mirroring the receiver-side callback in receivePart().
+            // Resends do not re-enter this block (sentPartsSet.add returns false), so
+            // progress only advances on the first send of each part. Matches Python
+            // get_progress(), which uses sent_parts/total_parts for the initiator.
+            try {
+                callbacks.progress?.invoke(this)
+            } catch (e: Exception) {
+                log("Error in progress callback: ${e.message}")
+            }
         }
     }
 
@@ -821,17 +874,46 @@ class Resource private constructor(
      * Parts are identified by their map hash, not by index.
      * Matches Python RNS receive_part() protocol.
      */
+    /**
+     * True if [data]'s map hash falls in this resource's current receive window,
+     * i.e. this part belongs to this resource. Side-effect-free — the Link uses it
+     * to route an inbound RESOURCE part to the ONE resource it belongs to, so two
+     * concurrent transfers on a single link no longer send every part to the first
+     * transferring resource. The map hash is resource-specific (it mixes the
+     * resource's randomHash), so membership can only be decided per-resource; this
+     * mirrors [receivePart]'s window search without mutating any state, and a
+     * completed resource (searchStart == parts.size) correctly returns false.
+     */
+    fun acceptsPart(data: ByteArray): Boolean {
+        receiveLock.lock()
+        try {
+            if (status == ResourceConstants.FAILED) return false
+            val partHash = getMapHash(data)
+            val searchStart = if (consecutiveCompletedHeight >= 0) consecutiveCompletedHeight else 0
+            for (i in searchStart until minOf(searchStart + window, parts.size)) {
+                val mapHash = hashmap[i]
+                if (mapHash != null && mapHash.contentEquals(partHash)) return true
+            }
+            return false
+        } finally {
+            receiveLock.unlock()
+        }
+    }
+
     fun receivePart(data: ByteArray) {
         receiveLock.lock()
         try {
             receivingPart = true
-            lastActivity = System.currentTimeMillis()
-            retries = 0
+            lastActivity = clock()
+            retriesLeft = ResourceConstants.MAX_RETRIES
 
             // RTT calculation on first response
             if (reqResp == null) {
                 reqResp = lastActivity
                 val rttMs = reqResp!! - reqSent
+                // python Resource.py:853: once an RTT sample exists the part timeout
+                // factor halves.
+                partTimeoutFactor = ResourceConstants.PART_TIMEOUT_FACTOR_AFTER_RTT
 
                 if (rtt == null) {
                     rtt = link.rtt ?: rttMs
@@ -923,7 +1005,7 @@ class Resource private constructor(
 
                 // Calculate data rate
                 if (reqSent != 0L) {
-                    val rttMs = System.currentTimeMillis() - reqSent
+                    val rttMs = clock() - reqSent
                     val reqTransferred = rttRxdBytes - rttRxdBytesAtPartReq
 
                     if (rttMs != 0L) {
@@ -1041,7 +1123,7 @@ class Resource private constructor(
             )
 
             packet.send()
-            lastActivity = System.currentTimeMillis()
+            lastActivity = clock()
             reqSent = lastActivity
             reqSentBytes = encrypted.size
             reqResp = null
@@ -1058,17 +1140,17 @@ class Resource private constructor(
         if (status == ResourceConstants.FAILED) return
 
         // Calculate RTT
-        val rttMs = System.currentTimeMillis() - advSent
+        val rttMs = clock() - advSent
         if (rtt == null) {
             rtt = rttMs
         }
 
         if (status != ResourceConstants.TRANSFERRING) {
             status = ResourceConstants.TRANSFERRING
-            startedTransferring = System.currentTimeMillis()
+            startedTransferring = clock()
         }
 
-        retries = 0
+        retriesLeft = ResourceConstants.MAX_RETRIES
 
         // Parse request format: [hmu_flag] [last_map_hash?] [resource_hash] [requested_hashes...]
         val wantsMoreHashmap = data[0].toInt() and 0xFF == ResourceConstants.HASHMAP_IS_EXHAUSTED
@@ -1112,14 +1194,14 @@ class Resource private constructor(
         // Use the map hashes computed once at construction (hashmap[i], the
         // sender-side equivalent of python's precomputed part.map_hash,
         // Resource.py:1021/1047) instead of re-hashing every candidate part per
-        // request: a ~100-byte RESOURCE_REQ otherwise cost about
-        // 2 x COLLISION_GUARD_SIZE SHA-256s on the ingest thread.
+        // request: a ~100-byte RESOURCE_REQ otherwise cost ~2 x COLLISION_GUARD_SIZE
+        // SHA-256s on the ingest thread.
         for (actualIndex in searchStart until minOf(searchEnd, parts.size)) {
             val part = parts[actualIndex] ?: continue
             val partMapHash = hashmap[actualIndex] ?: continue
             if (mapHashes.any { it.contentEquals(partMapHash) }) {
                 sendPart(actualIndex, part)
-                lastActivity = System.currentTimeMillis()
+                lastActivity = clock()
             }
         }
 
@@ -1130,16 +1212,11 @@ class Resource private constructor(
             // Find the part that matches last_map_hash
             var partIndex = receiverMinConsecutiveHeight
             for (i in searchStart until minOf(searchEnd, parts.size)) {
-                val part = parts[i]
-                if (part != null) {
-                    // Precomputed map hash (see the send loop above).
-                    val partMapHash = hashmap[i]
-                    partIndex++
-                    if (partMapHash != null && partMapHash.contentEquals(lastMapHash)) {
-                        break
-                    }
-                } else {
-                    partIndex++
+                // Precomputed map hash (see the send loop above).
+                val partMapHash = if (parts[i] != null) hashmap[i] else null
+                partIndex++
+                if (partMapHash != null && partMapHash.contentEquals(lastMapHash)) {
+                    break
                 }
             }
 
@@ -1190,7 +1267,7 @@ class Resource private constructor(
                     mtu = link.mtu
                 )
                 hmuPacket.send()
-                lastActivity = System.currentTimeMillis()
+                lastActivity = clock()
             } catch (e: Exception) {
                 log("Failed to send hashmap update: ${e.message}")
             }
@@ -1199,6 +1276,7 @@ class Resource private constructor(
         // Check if all parts have been sent
         if (sentParts >= parts.size) {
             status = ResourceConstants.AWAITING_PROOF
+            retriesLeft = 3 // python Resource.py:1083: three cache re-queries for the proof
             log("All parts sent, awaiting proof for ${hash.toHexString()}")
         }
     }
@@ -1209,13 +1287,13 @@ class Resource private constructor(
      */
     fun handleHashmapUpdate(plaintext: ByteArray) {
         if (status == ResourceConstants.FAILED) return
-        // Only apply an update we asked for (`if self.waiting_for_hmu`,
+        // Only apply an HMU we asked for (`if self.waiting_for_hmu`,
         // Resource.py:489-490). An unsolicited one otherwise rewrote hashmap
-        // slots and reflected one RESOURCE_REQ per packet back to the sender.
+        // slots and reflected one RESOURCE_REQ per packet.
         if (!waitingForHmu) return
 
-        lastActivity = System.currentTimeMillis()
-        retries = 0
+        lastActivity = clock()
+        retriesLeft = ResourceConstants.MAX_RETRIES
 
         // Parse: resource_hash (32 bytes) + msgpack([segment, hashmap])
         if (plaintext.size <= ResourceConstants.RESOURCE_HASH_LEN) return
@@ -1232,8 +1310,8 @@ class Resource private constructor(
             // Never allocate for a declared bin length the packet cannot back:
             // msgpack-core's readPayload(n) is `new byte[n]` before any read, so
             // an attacker-declared bin32 length near 2^31 forced a huge
-            // allocation or an OutOfMemoryError. A genuine update carries at
-            // most HASHMAP_MAX_LEN map hashes (Resource.py:1057-1069).
+            // allocation / OutOfMemoryError. A genuine HMU carries at most
+            // HASHMAP_MAX_LEN map hashes (Resource.py:1057-1069).
             val remaining = msgpackData.size - unpacker.totalReadBytes
             if (hashmapLen < 0 || hashmapLen > remaining ||
                 hashmapLen > ResourceAdvertisement.HASHMAP_MAX_LEN * ResourceConstants.MAPHASH_LEN
@@ -1269,7 +1347,7 @@ class Resource private constructor(
 
         // A negative segment has no meaning (python's negative list index
         // would silently write at the tail, Resource.py:503-504); treat it
-        // like an empty update and cancel.
+        // like an empty HMU and cancel.
         if (segment < 0) {
             log("Invalid HMU segment $segment received, cancelling transfer")
             cancel()
@@ -1290,7 +1368,7 @@ class Resource private constructor(
             hashmap[idx] = hashmapBytes.copyOfRange(start, end)
         }
 
-        // `if hashes < 1: cancel()` (Resource.py:506-508): an empty update is
+        // `if hashes < 1: cancel()` (Resource.py:506-508): an empty HMU is
         // invalid, not a reason to re-request.
         if (hashes < 1) {
             log("Invalid HMU received, cancelling transfer")
@@ -1314,8 +1392,10 @@ class Resource private constructor(
         } else if (previousEifr != null) {
             previousEifr!!
         } else {
-            // Estimate from link establishment cost
-            (link.mdu * 8).toDouble() / (currentRtt.toDouble() / 1000.0)
+            // python Resource.py:568: link.establishment_cost * 8 / rtt. A link whose
+            // cost was never recorded falls back to one MDU so the rate is never zero.
+            val costBytes = if (link.establishmentCost > 0) link.establishmentCost else link.mdu
+            (costBytes * 8).toDouble() / (currentRtt.toDouble() / 1000.0)
         }
 
         eifr = expectedInflightRate
@@ -1397,48 +1477,21 @@ class Resource private constructor(
                 return false
             }
 
-            // Multi-segment: resolve the next segment BEFORE concluding this one.
-            // Python sets COMPLETE first and then blocks in
+            // Multi-segment: resolve the next segment BEFORE concluding this
+            // one. Python sets COMPLETE first and then blocks in
             // `while self.next_segment == None: time.sleep(0.05)`
-            // (Resource.py:816-826), safe there because __prepare_next_segment
+            // (Resource.py:816-826) — safe there because __prepare_next_segment
             // always succeeds from the tempfile and validate_proof runs on its
-            // own thread. Here the wait is bounded and a segment that cannot be
-            // produced cancels the transfer, and cancel() is a no-op once status
-            // >= COMPLETE: with COMPLETE published first, a transfer whose next
-            // segment never appeared was left concluded on the link with neither
-            // callback fired and its input file still open. Ordering the wait
-            // first keeps cancel()'s `status < COMPLETE` guard effective.
+            // own thread. Here validateProof runs on the Transport ingest thread
+            // under jobsLock, so the wait is bounded (see awaitNextSegment) and a
+            // segment that cannot be built cancels the transfer instead of
+            // spinning; ordering the wait first keeps cancel()'s
+            // `status < COMPLETE` guard effective.
             var next: Resource? = null
             if (segmentIndex < totalSegments) {
-                // Prepare the next segment if advertise() did not already start it
-                if (!preparingNextSegment) {
-                    log("Preparing next segment ${segmentIndex + 1}/$totalSegments")
-                    prepareNextSegment()
-                }
-
-                // Wait for the next segment, but BOUNDED. validateProof runs on the
-                // Transport inbound thread under the global jobs lock, so an
-                // unbounded `while (nextSegment == null) Thread.sleep(50)` here stalls
-                // inbound processing for every interface on the node until a segment
-                // appears. An in-memory resource created with create(data) for a
-                // payload above MAX_EFFICIENT_SIZE marks itself split (totalSegments >
-                // 1) but prepareNextSegment() has no input file to read from, so
-                // nextSegment can never be set and the loop spins forever - reachable
-                // by a peer simply completing an ordinary, valid transfer. Wait at
-                // most SEGMENT_WAIT_MS; if no segment is produced (the source can't be
-                // read, or the preparation thread died and cleared its flag), cancel
-                // the transfer rather than hang the ingest thread.
-                val segmentDeadline = System.currentTimeMillis() + SEGMENT_WAIT_MS
-                while (nextSegment == null &&
-                    preparingNextSegment &&
-                    System.currentTimeMillis() < segmentDeadline
-                ) {
-                    Thread.sleep(50)
-                }
-
-                next = nextSegment
+                next = awaitNextSegment()
                 if (next == null) {
-                    log("Could not prepare segment ${segmentIndex + 1}/$totalSegments; cancelling transfer")
+                    log("Could not prepare segment ${segmentIndex + 1}/$totalSegments, cancelling transfer")
                     cancel()
                     return false
                 }
@@ -1451,23 +1504,24 @@ class Resource private constructor(
             log("Resource ${hash.toHexString()} proof validated successfully")
 
             if (next != null) {
-                // Advertise the next segment
+                // Advertise the next segment (Resource.py:834)
                 next.advertise()
 
-                // Clean up this segment's data
+                // Clean up this segment's data (Resource.py:827-832); the next
+                // segment holds its own reference to the shared source.
                 uncompressedData = null
                 compressedData = null
                 assembledData = null
                 parts = arrayOf()
+                segmentSource = null
             } else {
-                // All segments complete, invoke callback
+                // All segments complete, invoke callback (Resource.py:800-814)
                 callbacks.completed?.invoke(this)
 
-                // The transfer's input file (and backing temp file) is no longer
-                // needed: the final segment's proof validated, so no further
-                // segment will be read from it. Mirrors python closing
-                // input_file on the final segment (Resource.py:796-805).
-                closeInputFile()
+                // Close input file if present
+                inputFile?.close()
+                inputFile = null
+                segmentSource = null
             }
 
             return true
@@ -1485,87 +1539,127 @@ class Resource private constructor(
     private fun prepareNextSegment() {
         if (preparingNextSegment) return
         if (segmentIndex >= totalSegments) return
+        if (segmentSource == null && inputFile == null) {
+            log("Cannot prepare next segment: no segment source")
+            return
+        }
 
         preparingNextSegment = true
         log("Preparing segment ${segmentIndex + 1} of $totalSegments")
 
-        thread(name = "segment-prep-${hash.toHexString().take(8)}") {
+        thread(isDaemon = true, name = "segment-prep-${hash.toHexString().take(8)}") {
             try {
-                val file = inputFile
-                if (file == null) {
-                    log("Cannot prepare next segment: no input file")
-                    // Clear the flag so the bounded wait in validateProof() exits
-                    // immediately instead of running the full 15 s deadline.
-                    preparingNextSegment = false
-                    return@thread
-                }
-
-                // Segment N's RAW read window (python Resource.py:299-313), where N
-                // is the segment being PREPARED = segmentIndex + 1:
-                //   first_read_size = MAX_EFFICIENT_SIZE - metadata_size
-                //   segment 1:        seek 0,                       read first_read_size
-                //   segment N>=2:     seek first_read_size + (N-2)*MAX, read MAX
-                // So the segment we are preparing (N = segmentIndex+1, hence N>=2)
-                // starts at first_read_size + (segmentIndex-1)*MAX. Note
-                // metadata_size is the WIRE block size (3-byte length + packed),
-                // i.e. [metadataBlockSize], NOT the raw metadata payload length.
-                val firstSegmentSize = ResourceConstants.MAX_EFFICIENT_SIZE - metadataBlockSize
-                val dataStart = firstSegmentSize.toLong() +
-                    (segmentIndex - 1L) * ResourceConstants.MAX_EFFICIENT_SIZE
-                val readSize = min(
-                    ResourceConstants.MAX_EFFICIENT_SIZE.toLong(),
-                    file.length() - dataStart
-                ).toInt()
-
-                // Read next segment data
-                file.seek(dataStart)
-                val segmentData = ByteArray(readSize)
-                file.readFully(segmentData)
-
-                // Create the next segment resource (continuation: no metadata
-                // block of its own, carries the transfer's full total size and the
-                // root's original_hash). Mirrors python __prepare_next_segment
-                // (Resource.py:765-779): a fresh Resource on the same input file at
-                // segment_index+1, auto_compress = the transfer's auto_compress_option
-                // (so the segment re-runs its own compression decision), original_hash
-                // and request/response context carried from the parent.
-                nextSegment = Resource(link, initiator = true).apply {
-                    this.callbacks.completed = this@Resource.callbacks.completed
-                    this.callbacks.progress = this@Resource.callbacks.progress
-                    this.callbacks.failed = this@Resource.callbacks.failed
-                    this.requestId = this@Resource.requestId
-                    this.isResponse = this@Resource.isResponse
-
-                    initializeForSending(
-                        data = segmentData,
-                        metadata = null,
-                        autoCompress = this@Resource.autoCompressOption,
-                        segmentContinuation = true,
-                        totalPayloadSize = this@Resource.totalSize
-                    )
-
-                    // Update segment tracking
-                    this.segmentIndex = this@Resource.segmentIndex + 1
-                    this.totalSegments = this@Resource.totalSegments
-                    this.split = true
-                    // python continuation segments keep has_metadata True (via
-                    // sent_metadata_size, Resource.py:268-269/773) so the
-                    // advertisement's x flag matches the reference for every
-                    // segment; their content carries no metadata block, and the
-                    // receiver only strips at segment_index == 1 (Resource.py:697).
-                    this.hasMetadata = this@Resource.hasMetadata
-                    this.originalHash = this@Resource.originalHash
-                    this.metadataBlockSize = this@Resource.metadataBlockSize
-                    this.inputFile = this@Resource.inputFile
-                    this.tempFile = this@Resource.tempFile
-                }
-
+                nextSegment = buildNextSegment()
                 log("Next segment prepared: ${nextSegment?.hash?.toHexString()}")
-
             } catch (e: Exception) {
                 log("Error preparing next segment: ${e.message}")
+                // Clearing the flag lets awaitNextSegment stop waiting at once.
                 preparingNextSegment = false
             }
+        }
+    }
+
+    /**
+     * Upper bound on how long [validateProof] waits for a background
+     * [prepareNextSegment] to finish. Preparation starts at advertise time and
+     * is a bz2 + encrypt of at most MAX_EFFICIENT_SIZE bytes, so it is normally
+     * long done when the proof arrives; the bound only matters if the
+     * preparation thread is starved or dies, and then the transfer is
+     * cancelled rather than the ingest thread stalled forever.
+     */
+    private val nextSegmentWaitMs: Long = 15_000
+
+    /**
+     * Return the next segment, building it synchronously if nobody has started
+     * to (Resource.py:820-823 does the same), or waiting a bounded time for an
+     * in-flight [prepareNextSegment]. Returns null if no segment could be built.
+     */
+    private fun awaitNextSegment(): Resource? {
+        nextSegment?.let { return it }
+        if (!preparingNextSegment) {
+            log("Next segment preparation not started yet, preparing now")
+            return try {
+                buildNextSegment().also { nextSegment = it }
+            } catch (e: Exception) {
+                log("Error preparing next segment: ${e.message}")
+                null
+            }
+        }
+        val deadline = clock() + nextSegmentWaitMs
+        while (nextSegment == null && preparingNextSegment && clock() < deadline) {
+            try {
+                Thread.sleep(50)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+        return nextSegment
+    }
+
+    /**
+     * Read [maxLen] bytes of the shared transfer source starting at [start],
+     * clamped to the source length — the port's equivalent of python's
+     * `data.seek(seek_position); data.read(segment_read_size)` on the tempfile
+     * (Resource.py:320-321).
+     */
+    private fun readSegmentRange(start: Long, maxLen: Int): ByteArray {
+        segmentSource?.let { source ->
+            val from = min(start, source.size.toLong()).toInt()
+            val to = min(from.toLong() + maxLen, source.size.toLong()).toInt()
+            return source.copyOfRange(from, to)
+        }
+        inputFile?.let { file ->
+            val from = min(start, file.length())
+            val readSize = min(maxLen.toLong(), file.length() - from).toInt()
+            file.seek(from)
+            return ByteArray(readSize).also { file.readFully(it) }
+        }
+        throw IllegalStateException("No segment source for multi-segment resource")
+    }
+
+    /**
+     * Build the Resource for segment [segmentIndex]+1 from the shared source.
+     * Mirrors python `Resource.__prepare_next_segment` + the segment branch of
+     * `Resource.__init__` (Resource.py:306-322, 779-792): seek_index =
+     * next_index - 1, first_read_size = MAX_EFFICIENT_SIZE - metadata_size,
+     * seek_position = first_read_size + (seek_index - 1) * MAX_EFFICIENT_SIZE,
+     * read MAX_EFFICIENT_SIZE bytes. Later segments carry no metadata block
+     * but keep has_metadata set (sent_metadata_size > 0, Resource.py:270-271),
+     * inherit original_hash, request_id, is_response and the auto-compress
+     * option, and share the callbacks.
+     */
+    private fun buildNextSegment(): Resource {
+        val nextIndex = segmentIndex + 1
+        val firstReadSize = max(0, ResourceConstants.MAX_EFFICIENT_SIZE - segmentMetadataSize)
+        val seekPosition = firstReadSize.toLong() +
+            (nextIndex - 2).toLong() * ResourceConstants.MAX_EFFICIENT_SIZE
+        val segmentData = readSegmentRange(seekPosition, ResourceConstants.MAX_EFFICIENT_SIZE)
+
+        val parent = this
+        return Resource(link, initiator = true).apply {
+            callbacks.completed = parent.callbacks.completed
+            callbacks.progress = parent.callbacks.progress
+            callbacks.failed = parent.callbacks.failed
+
+            requestId = parent.requestId
+            isResponse = parent.isResponse
+            hasMetadata = parent.hasMetadata
+            segmentSource = parent.segmentSource
+            inputFile = parent.inputFile
+            segmentMetadataSize = parent.segmentMetadataSize
+            autoCompressOption = parent.autoCompressOption
+
+            totalSize = parent.totalSize
+            totalSegments = parent.totalSegments
+            segmentIndex = nextIndex
+            split = true
+
+            initializeSegmentPayload(segmentData, parent.autoCompressOption)
+
+            // initializeSegmentPayload sets originalHash = hash; every segment
+            // of one transfer advertises the FIRST segment's hash as `o`.
+            originalHash = parent.originalHash
         }
     }
 
@@ -1627,9 +1721,9 @@ class Resource private constructor(
                     markCorrupt("Decompressed resource exceeded maximum decompressed size")
                     // Python's cancel() on a CORRUPT resource rejects the
                     // advertisement (RESOURCE_RCL) and tears the link down
-                    // (Resource.py:1096-1099). cancel() here is a no-op once
-                    // status >= COMPLETE, so without this the peer could feed an
-                    // unbounded sequence of maximum-size inflations over one
+                    // (Resource.py:1096-1099). The port's cancel() is a no-op
+                    // once status >= COMPLETE, so without this the peer could
+                    // feed an unbounded sequence of 64 MiB inflations over one
                     // link; the hash-mismatch CORRUPT path below stays as it is
                     // because python does not tear down there.
                     rejectAndTeardownLink()
@@ -1670,20 +1764,100 @@ class Resource private constructor(
                 }
             }
 
-            // assembledData = data after metadata stripped (what caller receives)
-            // uncompressedData = data with metadata (for proof calculation)
-            assembledData = assembled
+            // uncompressedData is THIS segment's data including its metadata block, which
+            // is what prove() hashes — python proves per segment the same way.
             uncompressedData = dataForProof
+
+            // Decide THIS segment's delivered payload before anything observes the
+            // resource. resourceConcluded consumers read `data` synchronously (the
+            // conformance bridge does exactly that), so assembledData must be final
+            // before the conclusion fires.
+            val isFinalSegment = !split || totalSegments <= 1 || segmentIndex >= totalSegments
+            if (!split || totalSegments <= 1) {
+                assembledData = assembled
+            } else {
+                // Split transfer: append to this LINK's accumulation keyed on originalHash,
+                // which python keys its storagepath by (Resource.py:200, 722-723). Every
+                // segment advertises the first segment's hash as `o` (Resource.py:450-453,
+                // 1297). The accumulation is bounded three ways python's disk file is not
+                // (see ResourceConstants.SEGMENT_ACCUMULATOR_*): it is released with the
+                // link, it expires idle, and it may not exceed a per-transfer or per-link
+                // ceiling — the alternative was heap retained until the process died.
+                val accumulators = link.segmentAccumulators
+                val now = clock()
+                accumulators.entries.removeIf { now - it.value.lastProgressAt > ResourceConstants.SEGMENT_ACCUMULATOR_MAX_IDLE_MS }
+                val accKey = ByteArrayKey(originalHash)
+                val acc = accumulators.computeIfAbsent(accKey) { SegmentAccumulator(totalSegments).also { it.lastProgressAt = now } }
+                synchronized(acc) {
+                    // The reference sender advertises a monotonic `i` and a constant `l`
+                    // per transfer (Resource.py:1297); anything else is not a transfer we
+                    // can reassemble, and a sender doing it on purpose is paying 4 KB per
+                    // 64 MiB of our heap. Refuse it as corrupt rather than append.
+                    if (totalSegments != acc.expectedSegments || segmentIndex != acc.nextIndex) {
+                        accumulators.remove(accKey)
+                        markCorrupt(
+                            "Split transfer segment out of sequence: got $segmentIndex/$totalSegments, " +
+                                "expected ${acc.nextIndex}/${acc.expectedSegments}",
+                        )
+                        return
+                    }
+                    val transferTotal = acc.buffer.size().toLong() + assembled.size
+                    val linkTotal = accumulators.values.sumOf { it.buffer.size().toLong() } + assembled.size
+                    if (transferTotal > ResourceConstants.MAX_ACCUMULATED_TRANSFER_SIZE ||
+                        linkTotal > ResourceConstants.MAX_ACCUMULATED_LINK_SIZE
+                    ) {
+                        // Same response as a decompression bomb (above): the peer is asking
+                        // for more memory than this receiver will ever hold for it.
+                        accumulators.remove(accKey)
+                        markCorrupt("Split transfer exceeded the receive-side accumulation bound")
+                        rejectAndTeardownLink()
+                        return
+                    }
+                    if (segmentIndex == 1) acc.metadata = metadata
+                    acc.buffer.write(assembled)
+                    acc.nextIndex = segmentIndex + 1
+                    acc.lastProgressAt = now
+                    if (isFinalSegment) {
+                        assembledData = acc.buffer.toByteArray()
+                        metadata = acc.metadata
+                        accumulators.remove(accKey)
+                    } else {
+                        // Not deliverable yet. Python simply has not written the caller's
+                        // `self.data` at this point either (Resource.py:751).
+                        assembledData = null
+                    }
+                }
+            }
 
             status = ResourceConstants.COMPLETE
             stopWatchdog()
-            link.resourceConcluded(this)
-            log("Resource ${hash.toHexString()} assembled: ${assembled.size} bytes")
+            // Link-level bookkeeping for every segment; the app-visible callback only for
+            // the last one, as python (Resource.py:738-751). Firing it per segment handed
+            // consumers a COMPLETE resource with `data == null`.
+            link.resourceConcluded(this, notifyCallback = isFinalSegment)
 
-            // Send proof to sender
-            prove()
-
-            callbacks.completed?.invoke(this)
+            if (isFinalSegment) {
+                val delivered = assembledData?.size ?: 0
+                if (split && totalSegments > 1) {
+                    log(
+                        "Resource ${originalHash.toHexString()} reassembled from " +
+                            "$totalSegments segments: $delivered bytes",
+                    )
+                } else {
+                    log("Resource ${hash.toHexString()} assembled: $delivered bytes")
+                }
+                prove()
+                callbacks.completed?.invoke(this)
+            } else {
+                // Python logs this and waits for the next segment's advertisement
+                // (Resource.py:762). The proof still goes out per segment — it is what
+                // makes the sender advertise the next one.
+                log(
+                    "Resource segment $segmentIndex of $totalSegments received " +
+                        "(${assembled.size} bytes), waiting for the next segment",
+                )
+                prove()
+            }
 
         } catch (e: Exception) {
             // Mirrors python `Resource.assemble`'s except branch (Resource.py:
@@ -1700,6 +1874,9 @@ class Resource private constructor(
      * No proof is sent on a CORRUPT verdict.
      */
     private fun markCorrupt(reason: String) {
+        // A corrupt segment poisons the whole split transfer: drop the partial
+        // accumulation so a later, unrelated transfer cannot inherit these bytes.
+        dropSegmentAccumulator()
         status = ResourceConstants.CORRUPT
         log(reason)
         stopWatchdog()
@@ -1737,26 +1914,6 @@ class Resource private constructor(
     }
 
     /**
-     * Packet hashes of the part requests already served for this resource (python
-     * `Resource.req_hashlist`, Resource.py:380). Held for the life of the resource
-     * object, as in the reference.
-     */
-    private val servedRequestHashes = java.util.Collections.newSetFromMap(
-        java.util.concurrent.ConcurrentHashMap<ByteArrayKey, Boolean>(),
-    )
-
-    /**
-     * Record a request packet as served, returning false if it was already seen
-     * (python `Link.py:1113-1114`, `if not packet.packet_hash in resource.req_hashlist`).
-     *
-     * The duplicate is dropped rather than answered: the peer asks for parts by index, so
-     * re-serving one request re-sends parts it has already taken and desynchronises the
-     * window it uses to pick the next request.
-     */
-    fun admitRequestPacket(packetHash: ByteArray): Boolean =
-        servedRequestHashes.add(packetHash.toKey())
-
-    /**
      * Cancel this resource transfer.
      *
      * Mirrors python `RNS.Resource.cancel` (Resource.py:1079-1108): set
@@ -1772,28 +1929,67 @@ class Resource private constructor(
      * recovery path that existed pre-dedup.
      */
     /**
-     * Release the split-transfer input file and delete its backing temp file.
-     * Idempotent and safe to call from any terminal path (final-segment proof
-     * or cancel). The delete is best-effort: the file was also registered with
-     * deleteOnExit as a last resort if the process exits before this runs.
+     * Packet hashes of the part requests already served for this resource (python
+     * `Resource.req_hashlist`, `Resource.py:380`). Held for the life of the resource
+     * object, as in the reference.
      */
-    private fun closeInputFile() {
-        try {
-            inputFile?.close()
-        } catch (e: Exception) {
-            log("Error closing resource input file: ${e.message}")
-        }
-        inputFile = null
-        val file = tempFile
-        if (file != null) {
-            tempFile = null
-            if (!file.delete()) {
-                log("Could not delete split-transfer temp file ${file.name}")
+    private val servedRequestHashes = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<ByteArrayKey, Boolean>(),
+    )
+
+    /**
+     * Record a request packet as served, returning false if it was already seen.
+     *
+     * The duplicate is dropped rather than answered: the peer asks for parts by index, so
+     * re-serving one request re-sends parts it has already taken and desynchronises the
+     * window it uses to pick the next request.
+     */
+    fun admitRequestPacket(packetHash: ByteArray): Boolean =
+        servedRequestHashes.add(packetHash.toKey())
+
+    /** Number of distinct request packets served, for the conformance bridge. */
+    fun servedRequestCountForTest(): Int = servedRequestHashes.size
+
+    /**
+     * The receiver refused this resource: mark it REJECTED (python `Resource._rejected`,
+     * `Resource.py:1125-1136`).
+     *
+     * Distinct from [cancel], which reports FAILED. The difference is the whole point of
+     * the RESOURCE_RCL packet: FAILED means the transfer broke — a timeout, a lost link, a
+     * corrupt part — and is worth retrying, whereas REJECTED means the peer looked at the
+     * advertisement and said no, and retrying will get the same answer. An application
+     * that cannot tell them apart retries into a refusal forever.
+     *
+     * Only the initiator can be rejected, and only before the transfer concluded.
+     */
+    fun rejected() {
+        val transitioned = synchronized(this) {
+            if (status >= ResourceConstants.COMPLETE || !initiator) {
+                false
+            } else {
+                status = ResourceConstants.REJECTED
+                stopWatchdog()
+                true
             }
+        }
+        if (!transitioned) return
+        dropSegmentAccumulator()
+        link.resourceConcluded(this)
+        try {
+            callbacks.failed?.invoke(this)
+        } catch (e: Exception) {
+            log("Error in resource reject callback: ${e.message}")
         }
     }
 
+    /** Drop this transfer's partial accumulation — completion, corruption or cancellation. */
+    private fun dropSegmentAccumulator() {
+        if (originalHash.isNotEmpty()) link.segmentAccumulators.remove(ByteArrayKey(originalHash))
+    }
+
     fun cancel() {
+        // Abandoned split transfer: release any partially accumulated segments.
+        dropSegmentAccumulator()
         // Idempotency guard. Mirrors python `Resource.py:1090`'s
         // `elif self.status < Resource.COMPLETE:` check — once a resource
         // has reached a terminal state (COMPLETE / FAILED / CORRUPT,
@@ -1841,7 +2037,6 @@ class Resource private constructor(
         }
         link.resourceConcluded(this)
         callbacks.failed?.invoke(this)
-        closeInputFile()
         log("Resource ${hash.toHexString()} cancelled")
     }
 
@@ -1861,7 +2056,32 @@ class Resource private constructor(
      * Get transfer progress (0.0 to 1.0).
      */
     val progress: Float
-        get() = if (parts.isEmpty()) 0f else receivedCount.toFloat() / parts.size
+        get() = when {
+            parts.isEmpty() -> 0f
+            // Sender (initiator): fraction of parts transmitted — matches Python
+            // get_progress(), which sets processed_parts = sent_parts for the initiator.
+            initiator -> sentParts.toFloat() / parts.size
+            // Receiver: fraction of parts received.
+            else -> receivedCount.toFloat() / parts.size
+        }
+
+    /**
+     * Transfer progress across ALL segments (0.0 to 1.0).
+     *
+     * [progress] is per-segment: it is `receivedCount / parts.size`, which runs
+     * 0..1 once for EACH segment. A 37 MB payload arrives as 36 segments, so a
+     * bar bound to [progress] sweeps full thirty-six times and tells the
+     * operator nothing about the transfer. Segments are advertised with a
+     * monotonic `i` and a constant `l` (Resource.py:1297), so the completed
+     * fraction is exact rather than estimated.
+     */
+    val overallProgress: Float
+        get() {
+            val total = totalSegments
+            if (total <= 1) return progress
+            val done = (segmentIndex - 1).coerceAtLeast(0)
+            return ((done + progress) / total).coerceIn(0f, 1f)
+        }
 
     /**
      * Update hashmap from received data.
@@ -1885,7 +2105,8 @@ class Resource private constructor(
      * Matches Python: RNS.Identity.full_hash(data+self.random_hash)[:MAPHASH_LEN]
      */
     private fun getMapHash(data: ByteArray): ByteArray {
-        return Hashes.fullHash(data + randomHash).copyOf(ResourceConstants.MAPHASH_LEN)
+        val real = Hashes.fullHash(data + randomHash).copyOf(ResourceConstants.MAPHASH_LEN)
+        return mapHashInterceptorForTest?.invoke(this, real) ?: real
     }
 
     /**
@@ -1960,9 +2181,9 @@ class Resource private constructor(
     private fun msgpackUnpackBinary(data: ByteArray): ByteArray {
         val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(data)
         val len = unpacker.unpackBinaryHeader()
-        // Same allocate-before-read hazard as the advertisement fields: the
-        // metadata block is peer-supplied, so refuse a declared length the
-        // block cannot back instead of letting readPayload allocate it.
+        // Same allocate-before-read hazard as the advertisement fields:
+        // the metadata block is attacker-supplied, so refuse a declared length
+        // the block cannot back instead of letting readPayload allocate it.
         if (len < 0 || len > data.size - unpacker.totalReadBytes) {
             throw IllegalArgumentException("Declared metadata length $len exceeds block of ${data.size} bytes")
         }
@@ -2027,41 +2248,9 @@ class Resource private constructor(
         try {
             while (watchdogActive && status < ResourceConstants.ASSEMBLING) {
                 try {
-                    Thread.sleep(ResourceConstants.WATCHDOG_MAX_SLEEP * 1000)
-
+                    val sleepMs = watchdogPass(clock())
                     if (!watchdogActive || status >= ResourceConstants.ASSEMBLING) break
-
-                    val now = System.currentTimeMillis()
-                    val idleTime = now - lastActivity
-
-                    // Check for timeout
-                    val timeout = (link.rtt ?: 5000L) * ResourceConstants.PART_TIMEOUT_FACTOR
-                    if (idleTime > timeout) {
-                        retries++
-                        if (retries > ResourceConstants.MAX_RETRIES) {
-                            // Mirrors python `Resource.py:578, 591, 628, 636, 648,
-                            // 667, 690` etc. — every retries-exhausted branch in
-                            // python's watchdog calls `self.cancel()`. Calling
-                            // cancel() (rather than the previous inline
-                            // `status = FAILED; callbacks.failed?.invoke`) ensures
-                            // `link.resourceConcluded(this)` runs, which removes
-                            // the resource from `incomingResources` so a future
-                            // RESOURCE_ADV with the same hash is no longer
-                            // dropped by the dedup guard inside
-                            // `Resource.accept`. Without this, a single
-                            // watchdog-fail leaves the hash registered for the
-                            // lifetime of the link, killing the recovery path.
-                            log("Resource ${hash.toHexString()} timed out after $retries retries")
-                            cancel()
-                            break
-                        } else {
-                            log("Resource timeout, retry $retries/${ResourceConstants.MAX_RETRIES}")
-                            if (!initiator) {
-                                requestNext()
-                            }
-                        }
-                    }
-
+                    Thread.sleep(minOf(sleepMs, ResourceConstants.WATCHDOG_MAX_SLEEP * 1000).coerceAtLeast(1))
                 } catch (e: InterruptedException) {
                     break
                 } catch (e: Exception) {
@@ -2078,7 +2267,163 @@ class Resource private constructor(
         }
     }
 
+    /** python `ensure_link` (Resource.py:529-535): a transfer on a link that is not ACTIVE is cancelled. */
+    private fun ensureLink(): Boolean {
+        if (link.status != network.reticulum.link.LinkConstants.ACTIVE) {
+            log("Invalid link state for $this, aborting transfer")
+            try {
+                cancel()
+            } catch (e: Exception) {
+                log("Error while cancelling resource on link-state abort: ${e.message}")
+            }
+            return false
+        }
+        return true
+    }
+
+    /**
+     * One watchdog evaluation at [now], python `__watchdog_job`'s loop body
+     * (Resource.py:583-676). Returns the wait until the next evaluation in
+     * milliseconds; every branch that acts returns 1 so the loop re-evaluates at once.
+     *
+     * Every wait is the reference's: ADVERTISED waits the resource timeout plus the
+     * processing grace and re-advertises MAX_ADV_RETRIES times; a receiving transfer
+     * waits a rate-derived time of flight for the outstanding parts plus the hashmap
+     * allowance, the retry grace and a half second per retry used, shrinking its
+     * window on each retry; a sender waiting for part requests holds for
+     * rtt × factor × MAX_RETRIES plus the sender grace plus the summed retry delays;
+     * a sender awaiting proof re-queries the network cache three times, rtt × 3 plus
+     * the sender grace apart. Before this, all of it was one idle timer of
+     * rtt × 4.
+     */
+    internal fun watchdogPass(now: Long): Long {
+        var sleepMs: Long? = null
+        val rttMs = rtt ?: link.rtt ?: 0L
+        when {
+            status == ResourceConstants.ADVERTISED -> {
+                sleepMs = (advSent + timeoutMs + PROCESSING_GRACE_MS) - now
+                if (sleepMs < 0) {
+                    if (retriesLeft <= 0) {
+                        log("Resource transfer timeout after sending advertisement")
+                        cancel()
+                        sleepMs = 1
+                    } else {
+                        try {
+                            log("No part requests received, retrying resource advertisement...")
+                            retriesLeft -= 1
+                            if (!ensureLink()) return 1
+                            sendAdvertisementPacket()
+                            sleepMs = 1
+                        } catch (e: Exception) {
+                            log("Could not resend advertisement packet, cancelling resource. The contained exception was: ${e.message}")
+                            cancel()
+                            sleepMs = 1
+                        }
+                    }
+                }
+            }
+
+            status == ResourceConstants.TRANSFERRING -> {
+                if (!initiator) {
+                    val retriesUsed = ResourceConstants.MAX_RETRIES - retriesLeft
+                    val extraWaitMs = retriesUsed * PER_RETRY_DELAY_MS
+                    updateEifr()
+                    val rateBitsPerS = if (eifr > 0.0) eifr else 1.0
+                    val expectedHmuWaitMs =
+                        if (waitingForHmu || outstandingParts == 0) (sdu * 8 * ResourceConstants.HMU_WAIT_FACTOR) / rateBitsPerS * 1000.0 else 0.0
+                    val expectedTofMs = (outstandingParts.toDouble() * sdu * 8) / rateBitsPerS * 1000.0
+                    val waitMs =
+                        if (reqRespRttRate != 0.0) {
+                            partTimeoutFactor * expectedTofMs + expectedHmuWaitMs + RETRY_GRACE_MS + extraWaitMs
+                        } else {
+                            // python Resource.py:619 uses (3 * sdu) / eifr here, without the
+                            // factor of eight; mirrored as written.
+                            partTimeoutFactor * ((3.0 * sdu) / rateBitsPerS * 1000.0) + RETRY_GRACE_MS + extraWaitMs
+                        }
+                    sleepMs = (lastActivity + waitMs.toLong()) - now
+                    if (sleepMs < 0) {
+                        if (retriesLeft > 0) {
+                            log("Timed out waiting for $outstandingParts part(s), requesting retry on $this")
+                            if (window > windowMin) {
+                                window -= 1
+                                if (windowMax > windowMin) {
+                                    windowMax -= 1
+                                    if ((windowMax - window) > (windowFlexibility - 1)) windowMax -= 1
+                                }
+                            }
+                            sleepMs = 1
+                            retriesLeft -= 1
+                            waitingForHmu = false
+                            requestNext()
+                        } else {
+                            cancel()
+                            sleepMs = 1
+                        }
+                    }
+                } else {
+                    var maxExtraWaitMs = 0L
+                    for (r in 0 until ResourceConstants.MAX_RETRIES) maxExtraWaitMs += (r + 1) * PER_RETRY_DELAY_MS
+                    val maxWaitMs = rttMs * timeoutFactor * ResourceConstants.MAX_RETRIES + SENDER_GRACE_MS + maxExtraWaitMs
+                    sleepMs = (lastActivity + maxWaitMs) - now
+                    if (sleepMs < 0) {
+                        log("Resource timed out waiting for part requests")
+                        cancel()
+                        sleepMs = 1
+                    }
+                }
+            }
+
+            status == ResourceConstants.AWAITING_PROOF -> {
+                // Proof packets are far smaller than a request/response round trip.
+                timeoutFactor = ResourceConstants.PROOF_TIMEOUT_FACTOR
+                sleepMs = (lastPartSent + (rttMs * timeoutFactor + SENDER_GRACE_MS)) - now
+                if (sleepMs < 0) {
+                    if (retriesLeft <= 0) {
+                        log("Resource timed out waiting for proof")
+                        cancel()
+                        sleepMs = 1
+                    } else {
+                        log("All parts sent, but no resource proof received, querying network cache...")
+                        retriesLeft -= 1
+                        val proof = expectedProof
+                        if (proof != null) {
+                            val expectedProofPacket =
+                                Packet.createRaw(
+                                    destinationHash = link.linkId,
+                                    data = hash + proof,
+                                    packetType = PacketType.PROOF,
+                                    destinationType = DestinationType.LINK,
+                                    context = PacketContext.RESOURCE_PRF,
+                                    mtu = link.mtu,
+                                )
+                            expectedProofPacket.pack()
+                            network.reticulum.transport.Transport.requestFromCache(expectedProofPacket.packetHash, link)
+                        }
+                        lastPartSent = now
+                        sleepMs = 1
+                    }
+                }
+            }
+
+            status >= ResourceConstants.ASSEMBLING -> sleepMs = 1
+
+            // The reference never runs the watchdog before ADVERTISED / TRANSFERRING; the
+            // port may start it earlier on the receive side, so wait a tick rather than
+            // treat the state as a timing error.
+            else -> sleepMs = ResourceConstants.WATCHDOG_MAX_SLEEP * 1000
+        }
+
+        if (sleepMs == 0L) log("Warning! Resource watchdog sleep time of 0!")
+        if (sleepMs == null || sleepMs < 0) {
+            log("Timing error ($sleepMs/$status), cancelling resource transfer.")
+            cancel()
+            return 1
+        }
+        return sleepMs
+    }
+
     // ===== Conformance test seams =====
+    // (watchdog time constants, python seconds -> ms)
     // Each is a thin public wrapper over a private member or method. The
     // conformance-bridge is a separate gradle module and cannot see private/
     // internal state; these exist solely so the bridge can read back or drive
@@ -2087,6 +2432,19 @@ class Resource private constructor(
 
     /** private expectedProof — full_hash(data+hash) (Resource.kt:expectedProof). */
     fun expectedProofForTest(): ByteArray? = expectedProof
+
+    /**
+     * Drive the private awaitNextSegment() — builds (or waits, bounded,
+     * for) the next segment of a split transfer exactly as validateProof does.
+     * Null means no segment could be produced (the cancel path), never a hang.
+     */
+    fun awaitNextSegmentForTest(): Resource? = awaitNextSegment()
+
+    /** RESOURCE_ADV packets emitted by this sender (initial + watchdog re-sends). */
+    fun advSendCountForTest(): Int = advSendCount
+
+    /** Drive one re-advertise the way the watchdog's ADVERTISED branch does. */
+    fun resendAdvertisementForTest() = sendAdvertisementPacket()
 
     /** private per-part SDU captured at construction (Resource.py:338). */
     fun sduForTest(): Int = sdu
@@ -2134,6 +2492,25 @@ class Resource private constructor(
     fun hmuRequestsSentForTest(): Int = hmuRequestsSent.get()
     fun hashmapUpdatesReceivedForTest(): Int = hashmapUpdatesReceived.get()
     fun watchdogActiveForTest(): Boolean = watchdogActive
+
+    // Seams for ResourceWatchdogTimingTest: drive one evaluation and set the stamps it reads.
+    @network.reticulum.RnsTestSeam
+    internal fun watchdogPassForTest(now: Long): Long = watchdogPass(now)
+    internal fun retriesLeftForTest(): Int = retriesLeft
+    @network.reticulum.RnsTestSeam
+    internal fun setRetriesLeftForTest(value: Int) { retriesLeft = value }
+    @network.reticulum.RnsTestSeam
+    internal fun setStampsForTest(advSent: Long? = null, lastActivity: Long? = null, lastPartSent: Long? = null) {
+        advSent?.let { this.advSent = it }
+        lastActivity?.let { this.lastActivity = it }
+        lastPartSent?.let { this.lastPartSent = it }
+    }
+    @network.reticulum.RnsTestSeam
+    internal fun setRttForTest(value: Long?) { rtt = value }
+    @network.reticulum.RnsTestSeam
+    internal fun setOutstandingPartsForTest(value: Int) { outstandingParts = value }
+    internal fun timeoutMsForTest(): Long = timeoutMs
+    internal fun partTimeoutFactorForTest(): Int = partTimeoutFactor
     fun startWatchdogForTest() = startWatchdog()
     fun setCancelTransitionHookForTest(hook: (() -> Unit)?) {
         cancelTransitionHookForTest = hook
@@ -2160,7 +2537,7 @@ class Resource private constructor(
      *  adv_sent set) — mirrors the reference priming a sender before request().*/
     fun primeTransferringForTest() {
         status = ResourceConstants.TRANSFERRING
-        advSent = System.currentTimeMillis()
+        advSent = clock()
     }
 
     /** Force the status field (e.g. AWAITING_PROOF for the control proof case). */
@@ -2172,3 +2549,9 @@ class Resource private constructor(
         return "<Resource ${hash.toHexString().take(16)}/${link.linkId.toHexString().take(16)}>"
     }
 }
+
+/** python Resource.PROCESSING_GRACE / RETRY_GRACE_TIME / SENDER_GRACE_TIME / PER_RETRY_DELAY (seconds) in milliseconds. */
+private val PROCESSING_GRACE_MS: Long = (ResourceConstants.PROCESSING_GRACE * 1000).toLong()
+private val RETRY_GRACE_MS: Long = (ResourceConstants.RETRY_GRACE_TIME * 1000).toLong()
+private val SENDER_GRACE_MS: Long = (ResourceConstants.SENDER_GRACE_TIME * 1000).toLong()
+private val PER_RETRY_DELAY_MS: Long = (ResourceConstants.PER_RETRY_DELAY * 1000).toLong()

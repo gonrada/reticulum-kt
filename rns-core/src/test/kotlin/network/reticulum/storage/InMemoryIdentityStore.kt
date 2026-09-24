@@ -24,6 +24,10 @@ class InMemoryIdentityStore : IdentityStore {
 
     override fun knownDestinationCount(): Int = destinations.size
 
+    override fun removeKnownDestination(destHash: ByteArray) {
+        destinations.remove(destHash.toKey())
+    }
+
     override fun upsertRatchet(destHash: ByteArray, ratchet: ByteArray, timestampMs: Long) {
         ratchets[destHash.toKey()] = ratchet.copyOf() to timestampMs
     }

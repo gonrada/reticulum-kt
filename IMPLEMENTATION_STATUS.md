@@ -1,94 +1,140 @@
 # Reticulum-KT Implementation Status
 
-**Last Updated**: 2026-04-24
-**Version**: 0.1.0-SNAPSHOT
+**Last Updated**: 2026-09-23
+**Reference**: Python RNS 1.5.2
 
 ## Executive Summary
 
-The Kotlin implementation of Reticulum is **feature-complete** for the core protocol and fully interoperable with the Python reference implementation. Every interface type Python ships is implemented (TCP, UDP, Local, RNode, Auto, I2P, Pipe) except the three legacy serial-TNC paths (`SerialInterface`, `KISSInterface`, `AX25KISSInterface`) — all covered for typical use by `RNodeInterface` — plus four mobile/JVM-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP, Pipe). The Android module (`rns-android/`) provides foreground service, BLE driver, and power management components.
+The Kotlin implementation of Reticulum is feature-complete for the core protocol and
+interoperable with the Python reference: the full reticulum-conformance suite passes
+against RNS 1.5.2 with the Kotlin bridge in every arm. Every interface type Python ships
+is implemented except `WeaveInterface` and `RNodeMultiInterface` (hardware drivers with
+no device to verify against), plus four mobile/JVM-specific additions (BLE Mesh, Nearby
+Connections, Bluetooth SPP, Pipe). The Android module (`rns-android/`) provides the
+foreground service, BLE driver, storage and power management.
 
-LXMF has been extracted to a separate repository: [LXMF-kt](https://github.com/torlando-tech/LXMF-kt).
+LXMF lives in a separate repository: [LXMF-kt](https://github.com/torlando-tech/LXMF-kt).
 
 ---
 
 ## Core Protocol Completeness
 
-### Fully Implemented (100%)
+### Fully Implemented
 
 #### Transport Layer
-- **Path management**: State machine (ACTIVE → UNRESPONSIVE → STALE)
-- **Receipt management**: Timeout tracking, MAX_RECEIPTS culling
-- **Announce queuing**: Per-interface queues with bandwidth limiting
-- **Tunnel support**: Full synthesis, persistence, path restoration
-- **Packet routing**: Forwarding, deduplication, hashlist management
-- **Link table**: Active link routing for transport nodes
-- **IFAC**: Interface Authentication Code — masking, signature validation, per-interface keys
+- **Inbound processing**: asynchronous, with per-traffic-class queues (data, announce,
+  path request, ingress-limited) and a single drainer, as RNS 1.5.2
+- **Ingress and egress control**: announce and path-request ingress limiting with
+  per-interface `ic_*` tuning, held-announce release, path-request egress control,
+  protocol-violation counters
+- **Path management**: state machine (ACTIVE → UNRESPONSIVE → STALE), expiry by interface
+  mode, path-request gates and discovery timeouts, waiting discovery requests answered on
+  announce arrival, `MODE_INTERNAL` with the `announces_from/to_internal` knobs
+- **Announces**: rebroadcast with the PATHFINDER retransmit machinery, announce cap and
+  announce-rate limiter, replay to late-joining local clients
+- **Receipt management**: timeout tracking, MAX_RECEIPTS culling
+- **Tunnel support**: synthesis, persistence, path restoration, eight-hour lifetime
+- **Packet routing**: forwarding, deduplication, hashlist management, link-MTU signalling
+  clamped per hop
+- **Link table**: active link routing for transport nodes, proof timeout with the
+  outbound interface's term
+- **IFAC**: masking, signature validation, per-interface keys, on every interface type
+  the CLI constructs
+- **Management**: probe and remote-management destinations answering `/path` and
+  `/status`, announced every two hours; blackhole table with expiry and persistence
 
 #### Cryptography
-- **X25519**: Key exchange and encryption
-- **Ed25519**: Signing and verification
-- **HKDF**: Key derivation
-- **AES-128/256**: Packet and link encryption
-- **Ratchet**: Forward secrecy implementation
+- **X25519**, **Ed25519**, **HKDF**, **AES-256-CBC** (BouncyCastle)
+- **Ratchets**: one per destination, persisted, forward secrecy; peer ratchets consulted
+  on encrypt
+- **Crypto warm-up** at start so a fresh JVM's first handshake does not skew its RTT
 
 #### Higher-Level Features
-- **Link establishment**: Full handshake (initiator and receiver)
-- **Resource transfers**: Chunked transfers with compression
-- **Channel messaging**: Reliable ordered delivery with windowed flow control
-- **Buffer**: Stream I/O over channels
+- **Link establishment**: full handshake both ways; the initiator waits
+  first-hop timeout + 6 s per hop, the responder 6 s per hop + keepalive
+- **Link requests and responses**: any msgpack value as request data or response,
+  span-based decoding (no value tree is built from remote bytes), request budget with
+  the reference's DELIVERED/RECEIVING semantics, pending requests failed at link close
+- **Resource transfers**: chunked, BZ2 with a decompression ceiling, segmented above
+  1 MiB and joined on the receive side with bounded, link-scoped accumulators, the
+  reference's four-branch watchdog (advertise retry, rate-derived part timeout, sender
+  wait, proof re-query), metadata, REJECTED distinct from FAILED
+- **Channel messaging**: reliable ordered delivery with windowed flow control, RTT-based
+  retry timing, five tries then teardown
+- **Buffer**: stream I/O over channels, partial writes re-driven
 
 #### Interfaces
-- **TCP**: Client and server with HDLC framing, fixed five-second reconnect matching Python
-- **UDP**: Unicast, broadcast, multicast
-- **Local**: Server/client IPC for sharing Reticulum across apps
-- **RNode (LoRa)**: Full KISS protocol, firmware checking, BLE + serial transport
-- **BLE Mesh**: Dual-role GATT, identity handshake, fragmentation, Android driver
-- **Nearby Connections**: Kotlin-only — Google Nearby Connections (WiFi Direct + BLE), dual-role advertise/discover
-- **Auto**: IPv6 multicast peer discovery, per-peer UDP connections
-- **I2P**: SAM API tunnels with HDLC-framed TCP through localhost, server tunnel + client tunnels to configured peers
-- **Bluetooth SPP**: Bluetooth Classic RFCOMM with HDLC framing, client + server modes, automatic reconnect
-- **Pipe**: HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) — Python-parity port
+- **TCP**: client and server, HDLC framing, fixed five-second reconnect, keepalive on
+  server children, IFAC
+- **Backbone**: NIO selector listener, IFAC with configurable tag size, 1024-client cap,
+  bounded HDLC deframer, coalescing transmit buffer
+- **UDP**: unicast, broadcast, multicast
+- **Local**: shared-instance server and client IPC, bounded deframer, accept loop that
+  survives transient errors
+- **RNode (LoRa)**: KISS protocol, firmware checking, BLE and serial transport,
+  bitrate-derived frame-duration ceiling
+- **KISS** and **AX.25 over KISS**: KISS TNC over any byte stream, frame-duration ceiling,
+  flow control, beacon, IFAC; AX.25 callsign/SSID header
+- **Serial**: HDLC over a serial stream (`SerialInterface`), any `KissSerialPort`
+- **BLE Mesh**: dual-role GATT, identity handshake, fragmentation, Android driver
+- **Bluetooth SPP**: Bluetooth Classic RFCOMM with HDLC framing, client and server
+- **Auto**: IPv6 multicast peer discovery, per-peer UDP connections, adaptive announce
+  interval (see `PYTHON_DEVIATIONS.md`)
+- **I2P**: SAM API tunnels with HDLC-framed TCP, server tunnel and client tunnels
+- **Pipe**: HDLC over arbitrary byte streams
+- **Nearby Connections**: Kotlin-only; present, scheduled for removal
 
 #### Interface Discovery
-- **InterfaceAnnouncer**: Periodic discovery announces with PoW stamps
-- **InterfaceAnnounceHandler**: Incoming discovery processing with self-filtering
-- **InterfaceDiscovery**: Persistence, status tracking (available/unknown/stale), auto-connect
+- **InterfaceAnnouncer**: periodic discovery announces with PoW stamps
+- **InterfaceAnnounceHandler**: incoming discovery processing with self-filtering
+- **InterfaceDiscovery**: persistence, status tracking, auto-connect
 
 #### Android (`rns-android/`)
 - **Foreground Service**: `ReticulumService` with lifecycle management and notification
 - **BLE Driver**: GATT server/client, advertising, scanning (API 26+)
+- **Storage**: Room-backed identity, path, announce, tunnel and discovery stores with
+  transient-lock retry on every write-through path
 - **Power Management**: Doze handler, battery monitor/stats/exemption, network monitor
 
-#### Testing
-- **660+ test methods** across 86 test files, 100% passing with Python implementation
-- **15 in-repo conformance test files** in `python-bridge/conformance/` (65 test methods; Kotlin ↔ Python over pipe interfaces)
-- **22 cross-implementation test files** in [`torlando-tech/reticulum-conformance`](https://github.com/torlando-tech/reticulum-conformance) — wire-level and behavioral parity tests parametrized across `(sender, transport, receiver)` impl triples covering byte-level identity, transport routing, link multi-hop, resource transfer, IFAC interop, path discovery, and announce semantics
-- **Integration tests**: Links, resources, channels, tunnels, IFAC verified
-- **Python interop**: Kotlin ↔ Python communication tested across all protocol features
-
 #### CLI
-- **rnsd-kt**: Complete daemon matching Python `rnsd` behavior
+- **rnsd-kt**: daemon matching Python `rnsd`; config parser with ConfigObj quoting and
+  inline comments; interface factory for TCP client/server, Backbone, Auto, Serial,
+  KISS and AX.25 KISS with IFAC, mode, announce-cap, announce-rate and
+  ingress/egress knobs applied from config
+- **RPC server**: in `rns-core`, the Python `multiprocessing.connection` handshake,
+  msgpack payloads, the full RNS 1.5.2 request set, bound to localhost, key derived
+  from the transport identity
+
+#### Testing
+- **Unit suites**: rns-core, rns-interfaces, rns-cli, rns-android
+- **Interop**: `rns-test` against the Python bridge (`python-bridge/bridge_server.py`,
+  150+ commands)
+- **Conformance**: `conformance-bridge` runs the
+  [reticulum-conformance](https://github.com/torlando-tech/reticulum-conformance)
+  suite; full run 1308 passed, 0 failed, 12 skipped, 1 expected failure against
+  RNS 1.5.2
 
 ### Not Yet Implemented
 
 | Feature | Priority | Description |
 |---------|----------|-------------|
-| Blackhole system | Medium | Identity blacklisting to block bad actors |
-| Remote management | Low | Control destinations for remote `/path` and `/status` queries |
-| RPC server | Low | Multi-process sharing of a single Reticulum instance |
-| CLI utilities (rnstatus, rnpath, rnprobe) | Low | Network diagnostic tools |
-| SerialInterface | Low | Direct serial port (RNode covers most use cases) |
-| KISSInterface | Low | Legacy serial TNC path (RNode covers most use cases) |
-| AX25KISSInterface | Low | AX.25 over KISS — specialized amateur-radio path |
+| `WeaveInterface` | Low | WDCL discovery and handshake to a Weave switch over USB serial; no device to verify against |
+| `RNodeMultiInterface` | Low | Multi-radio RNode firmware with sub-interfaces; no device to verify against |
+| RNode, UDP, I2P, BLE from CLI config | Low | `InterfaceConfigFactory` warns and returns null for these; desktop has no BLE backend, the others are unwired |
+| Bounded resource worker | Medium | Resource assembly and request handling run on the ingest thread; Python uses daemon threads |
+| Shared-medium interface hints, stream `Resource` init, auto-MTU tuning | Medium | Three reference behaviours not yet ported |
+| TCP server client cap | Low | The 64-slot cap is a constructor default with no config key |
+| CLI utilities (rnstatus, rnpath, rnprobe) | Low | Diagnostic tools; the RPC server answers the requests they would make |
 
 ---
 
 ## Android Battery & Performance Notes
 
-The core protocol was originally designed as a JVM library. Running as a background Android service introduces battery and performance considerations:
+The core protocol was designed as a JVM library. Running as a background Android
+service introduces battery and performance considerations:
 
 ### With Transport Routing Enabled
-- Transport job loop wakes every 250ms — significant battery impact
+- Transport job loop wakes every 250 ms
 - Per-link watchdog threads add overhead with multiple active links
 - Blocking I/O threads on TCP/UDP interfaces
 
@@ -101,14 +147,18 @@ Reticulum.start(
 )
 ```
 
-Client-only mode disables routing/forwarding and eliminates the job loop, reducing battery impact by 70-80% while retaining all messaging, link, resource, and channel capabilities.
+Client-only mode disables routing and forwarding and eliminates the job loop while
+retaining all messaging, link, resource and channel capabilities.
 
-### Production Optimization Opportunities
-- Migrate job loop to WorkManager (15min+ intervals) or event-driven architecture
-- Consolidate per-link watchdogs to a single shared timer
+### Optimizations in place
+- Leveled `RnsLog` with lazy message construction on hot paths
+- Adaptive AutoInterface announce interval with Doze awareness
+
+### Remaining opportunities
+- Migrate the job loop to WorkManager or an event-driven design
+- Consolidate per-link watchdogs to a shared timer
 - Migrate blocking I/O to NIO channels or coroutines
-- Reduce `HASHLIST_MAXSIZE` for mobile (currently 1,000,000)
-- Use Android Cipher API for AES hardware acceleration
+- Use the Android Cipher API for AES hardware acceleration
 
 ---
 
@@ -116,51 +166,57 @@ Client-only mode disables routing/forwarding and eliminates the job loop, reduci
 
 | Feature | Python | Kotlin | Notes |
 |---------|--------|--------|-------|
-| Core Transport | ✅ | ✅ | 100% compatible |
-| Path Management | ✅ | ✅ | State machine complete |
-| Tunnels | ✅ | ✅ | Full persistence |
-| Links | ✅ | ✅ | Both directions |
-| Resources | ✅ | ✅ | With compression |
-| Channels | ✅ | ✅ | Reliable delivery |
-| Ratchets | ✅ | ✅ | Forward secrecy |
-| IFAC | ✅ | ✅ | Interface authentication |
-| Interface Discovery | ✅ | ✅ | Announcer, handler, persistence |
-| TCP Interface | ✅ | ✅ | Client and server |
-| UDP Interface | ✅ | ✅ | Unicast, broadcast, multicast |
-| Local Interface | ✅ | ✅ | Shared instance IPC |
+| Core Transport | ✅ | ✅ | async inbound with traffic classes, ingress/egress control |
+| Path Management | ✅ | ✅ | state machine, mode-based expiry, discovery answers |
+| Tunnels | ✅ | ✅ | persistence, eight-hour lifetime |
+| Links | ✅ | ✅ | both directions, request values, request budget semantics |
+| Resources | ✅ | ✅ | compression, segmentation, four-branch watchdog |
+| Channels | ✅ | ✅ | reliable delivery |
+| Ratchets | ✅ | ✅ | forward secrecy, persisted |
+| IFAC | ✅ | ✅ | every CLI-constructed interface |
+| Interface Discovery | ✅ | ✅ | announcer, handler, persistence |
+| Blackhole | ✅ | ✅ | expiry, trusted sources, persistence |
+| Remote management | ✅ | ✅ | `/path` and `/status`, announced |
+| RPC server | ✅ | ✅ | msgpack, full 1.5.2 request set |
+| TCP Interface | ✅ | ✅ | client and server |
+| Backbone Interface | ✅ | ✅ | IFAC, bounded deframer |
+| UDP Interface | ✅ | ✅ | unicast, broadcast, multicast |
+| Local Interface | ✅ | ✅ | shared instance IPC |
 | RNode Interface | ✅ | ✅ | KISS protocol, BLE + serial |
-| BLE Mesh | ❌ | ✅ | Kotlin-only, dual-role GATT |
-| Nearby Connections | ❌ | ✅ | Kotlin-only, Google Nearby Connections (WiFi Direct + BLE) |
+| KISS Interface | ✅ | ✅ | any byte stream, IFAC |
+| AX.25 KISS Interface | ✅ | ✅ | callsign/SSID header |
+| Serial Interface | ✅ | ✅ | HDLC over serial |
 | Auto Interface | ✅ | ✅ | IPv6 multicast discovery |
-| I2P Interface | ✅ | ✅ | SAM API tunnels, server + client |
-| Bluetooth SPP | ❌ | ✅ | Kotlin-only, Bluetooth Classic RFCOMM with HDLC |
-| Pipe Interface | ✅ | ✅ | Python-parity port; HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) |
-| Blackhole | ✅ | ❌ | Identity blacklisting |
-| Remote Mgmt | ✅ | ❌ | Status/path endpoints |
-| Serial Interface | ✅ | ❌ | Legacy direct-serial path; RNode covers most use cases |
-| KISS Interface | ✅ | ❌ | Legacy serial TNC path; RNode covers most use cases |
-| AX.25 KISS Interface | ✅ | ❌ | Legacy AX.25 over KISS; specialized amateur-radio path |
+| I2P Interface | ✅ | ✅ | SAM API tunnels |
+| Pipe Interface | ✅ | ✅ | HDLC over byte streams |
+| BLE Mesh | ❌ | ✅ | Kotlin-only, dual-role GATT |
+| Bluetooth SPP | ❌ | ✅ | Kotlin-only, RFCOMM with HDLC |
+| Nearby Connections | ❌ | ✅ | Kotlin-only, scheduled for removal |
+| Weave Interface | ✅ | ❌ | hardware driver, not started |
+| RNodeMulti Interface | ✅ | ❌ | hardware driver, not started |
 | CLI Utilities | ✅ | Partial | rnsd-kt complete; rnstatus/rnpath/rnprobe not started |
-
-**Result**: Kotlin achieves 100% core protocol compatibility and implements every interface type Python ships except the three legacy serial-TNC paths (`SerialInterface`, `KISSInterface`, `AX25KISSInterface`) — all covered for typical use by `RNodeInterface` — plus four mobile/JVM-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP, Pipe). Remaining gaps are optional features (blackhole, remote management) and a few CLI diagnostic utilities.
 
 ---
 
 ## File Reference
 
 ### Core Implementation
-- `rns-core/src/main/kotlin/network/reticulum/transport/Transport.kt` — Main transport layer
-- `rns-core/src/main/kotlin/network/reticulum/transport/Tables.kt` — Data structures
-- `rns-core/src/main/kotlin/network/reticulum/link/Link.kt` — Link management
-- `rns-core/src/main/kotlin/network/reticulum/packet/` — Packet handling
-- `rns-core/src/main/kotlin/network/reticulum/crypto/` — Cryptography
-- `rns-core/src/main/kotlin/network/reticulum/discovery/` — Interface discovery
+- `rns-core/src/main/kotlin/network/reticulum/transport/Transport.kt` — transport layer
+- `rns-core/src/main/kotlin/network/reticulum/transport/InboundQueues.kt` — traffic-class queues
+- `rns-core/src/main/kotlin/network/reticulum/transport/Tables.kt` — data structures
+- `rns-core/src/main/kotlin/network/reticulum/link/Link.kt` — link management
+- `rns-core/src/main/kotlin/network/reticulum/link/RequestWire.kt` — request/response values
+- `rns-core/src/main/kotlin/network/reticulum/resource/Resource.kt` — resource transfers
+- `rns-core/src/main/kotlin/network/reticulum/packet/` — packet handling
+- `rns-core/src/main/kotlin/network/reticulum/crypto/` — cryptography
+- `rns-core/src/main/kotlin/network/reticulum/discovery/` — interface discovery
+- `rns-core/src/main/kotlin/network/reticulum/rpc/RpcServer.kt` — RPC server
 
 ### Interfaces
-- `rns-interfaces/src/main/kotlin/network/reticulum/interfaces/` — All interface types
+- `rns-interfaces/src/main/kotlin/network/reticulum/interfaces/` — all interface types
 
 ### Android
-- `rns-android/src/main/kotlin/network/reticulum/android/` — Service, BLE driver, power management
+- `rns-android/src/main/kotlin/network/reticulum/android/` — service, BLE driver, storage, power management
 
 ### CLI
-- `rns-cli/src/main/kotlin/network/reticulum/cli/` — rnsd-kt daemon
+- `rns-cli/src/main/kotlin/network/reticulum/cli/` — rnsd-kt daemon, config, interface factory, serial port

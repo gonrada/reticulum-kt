@@ -8,7 +8,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import network.reticulum.common.RnsLog
 import network.reticulum.interfaces.Interface
 import java.io.IOException
 import java.net.*
@@ -78,6 +78,9 @@ class UDPInterface(
 
     override val bitrate: Int = BITRATE_GUESS
     override val hwMtu: Int = HW_MTU
+
+    override val defaultIfacSize: Int
+        get() = DEFAULT_IFAC_SIZE
     override val canReceive: Boolean = bindPort > 0
     override val canSend: Boolean = forwardIp != null && forwardPort > 0
 
@@ -251,10 +254,7 @@ class UDPInterface(
                     buffer.clear()
                     val channel = receiveChannel ?: break
 
-                    // Blocking receive wrapped in IO dispatcher
-                    val sourceAddress = withContext(Dispatchers.IO) {
-                        channel.receive(buffer)
-                    }
+                    val sourceAddress = channel.receive(buffer)
                     if (sourceAddress != null) {
                         buffer.flip()
                         val data = ByteArray(buffer.remaining())
@@ -292,10 +292,7 @@ class UDPInterface(
                 while (isActive && running.get() && !detached.get()) {
                     val mSocket = multicastSocket ?: break
 
-                    // Blocking receive wrapped in IO dispatcher
-                    withContext(Dispatchers.IO) {
-                        mSocket.receive(packet)
-                    }
+                    mSocket.receive(packet)
                     val data = packet.data.copyOf(packet.length)
 
                     // Process the received datagram
@@ -407,10 +404,7 @@ class UDPInterface(
     }
 
     private fun log(message: String) {
-        val timestamp = java.time.LocalDateTime.now().format(
-            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-        )
-        println("[$timestamp] [$name] $message")
+        RnsLog.log(RnsLog.INFO, name, message)
     }
 
     override fun toString(): String {

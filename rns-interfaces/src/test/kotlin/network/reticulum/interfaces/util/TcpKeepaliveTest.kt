@@ -13,9 +13,9 @@ import java.nio.channels.SocketChannel
 import java.util.concurrent.TimeUnit
 
 /**
- * Keepalive tuning mirror of python TCPInterface.py:183-197. The extended options are
- * platform-dependent, so their values are asserted only where the runtime reports them
- * as supported; SO_KEEPALIVE itself must always be set.
+ * Keepalive tuning mirror of python TCPInterface.py:183-197 / BackboneInterface.py:920-922.
+ * The extended options are platform-dependent, so their values are asserted only where
+ * the runtime reports them as supported; SO_KEEPALIVE itself must always be set.
  */
 class TcpKeepaliveTest {
 

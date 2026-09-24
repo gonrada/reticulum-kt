@@ -381,6 +381,13 @@ class Channel(
                         // Invalid sequence - drop it
                         return
                     }
+                } else if (envelope.sequence > currentRx + WINDOW_MAX) {
+                    // Sequence too far ahead to ever become contiguous. Python
+                    // Channel._receive:367-369 rejects these; without the guard a
+                    // link peer could inject arbitrary future 16-bit sequences that
+                    // buffer in rxRing up to the full ~65K sequence space (memory +
+                    // O(n^2) emplace), instead of being bounded to the window.
+                    return
                 }
 
                 // Try to add to RX ring
@@ -544,7 +551,7 @@ class Channel(
         lock.withLock {
             val packetId = outlet.getPacketId(packet)
             val envelope = txRing.find { env ->
-                env.packet?.let { outlet.getPacketId(it) == packetId } ?: false
+                env.packet?.let { packetIdsEqual(outlet.getPacketId(it), packetId) } ?: false
             }
 
             if (envelope != null && op(envelope)) {
@@ -586,6 +593,15 @@ class Channel(
             }
         }
     }
+
+    /**
+     * Compare two outlet packet ids by value. Link's outlet returns the packet
+     * hash as a ByteArray, for which `==` is reference equality — it only matched
+     * before because the same cached array came back for the same Packet
+     * instance. Python compares bytes by value (Channel.py:420).
+     */
+    private fun packetIdsEqual(a: Any, b: Any): Boolean =
+        if (a is ByteArray && b is ByteArray) a.contentEquals(b) else a == b
 
     /**
      * Retry an envelope that timed out.

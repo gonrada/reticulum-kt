@@ -57,19 +57,30 @@ object TransportConstants {
     const val PATH_REQUEST_MI = 20_000L
 
     /**
-     * How long an outstanding path request stays in the path-request table, in
-     * milliseconds (python PATH_REQUEST_GATE_TIMEOUT = 45 s, Transport.py:135). The table
-     * is consulted to exempt an announce from ingress holding, so an entry that never
-     * aged out was a permanent exemption for that destination.
+     * How long a destination stays in the in-flight path request table, in milliseconds
+     * (python PATH_REQUEST_GATE_TIMEOUT = 45 s, Transport.py:135). While a destination is
+     * in-flight, further path requests for it are batched onto the first rather than
+     * queued and processed again. The entry is released early when the request is
+     * answered or the matching announce arrives; this is the ceiling for the rest.
      */
     const val PATH_REQUEST_GATE_TIMEOUT = 45_000L
 
-    /**
-     * Floor applied to an interface's reported bitrate wherever it sizes a wait
-     * (python Reticulum.MINIMUM_BITRATE). A bitrate of 0 otherwise turns the announce
-     * cap into a no-op.
-     */
-    const val MINIMUM_BITRATE = 5
+    // Inbound traffic classes (python Transport.py:111-114). The value is the index of the
+    // queue a packet lands in, and the drainer serves queues in index order, so a lower
+    // value is a higher priority: link and data traffic first, announces second, path
+    // requests third, and anything from a peer under ingress limiting last.
+    const val TC_DATA = 0x00
+    const val TC_ANNOUNCE = 0x01
+    const val TC_PATH_REQUEST = 0x02
+    const val TC_INGRESS_LIMITED = 0x03
+
+    // Inbound queue depth per traffic class (python Transport.py:143-146). A full queue drops
+    // the new packet and never blocks the interface thread. The data queue is the deepest by
+    // design — a storm of any other class can only fill its own queue.
+    const val INBOUND_DA_QUEUE_LENGTH = 1024
+    const val INBOUND_AN_QUEUE_LENGTH = 128
+    const val INBOUND_PR_QUEUE_LENGTH = 128
+    const val INBOUND_IL_QUEUE_LENGTH = 8
 
     /** Reverse table entry timeout in milliseconds (8 minutes). */
     const val REVERSE_TIMEOUT = 8L * 60 * 1000
@@ -87,11 +98,22 @@ object TransportConstants {
     /** Destination table entry timeout (1 week in milliseconds). */
     const val DESTINATION_TIMEOUT = 7L * 24 * 60 * 60 * 1000
 
+    /** Linger time for pathless, never-used known destinations before eviction
+     *  (python Transport.UNUSED_DESTINATION_LINGER = 6*60 s). */
+    const val UNUSED_DESTINATION_LINGER = 6L * 60 * 1000
+
     /** Maximum receipts to track. */
     const val MAX_RECEIPTS = 1024
 
     /** Maximum announce rate timestamps per destination. */
     const val MAX_RATE_TIMESTAMPS = 16
+
+    /**
+     * How long an idle announce-rate entry is kept before being culled. Long enough to
+     * outlast any block it could still be serving; the block itself is also checked, so a
+     * currently-blocked destination is never forgotten early.
+     */
+    const val ANNOUNCE_RATE_ENTRY_TTL = 60L * 60 * 1000
 
     /** Maximum random blobs to persist per destination. */
     const val PERSIST_RANDOM_BLOBS = 32
@@ -104,6 +126,12 @@ object TransportConstants {
 
     /** Job loop interval in milliseconds. */
     const val JOB_INTERVAL = 250L
+
+    /**
+     * Pause after tearing down links on shutdown, so the LINKCLOSE packets reach the
+     * interfaces before the tables are cleared (python Transport.py:3637).
+     */
+    const val LINK_TEARDOWN_DRAIN_MS = 150L
 
     /** Link check interval in milliseconds. */
     const val LINKS_CHECK_INTERVAL = 1000L
@@ -142,11 +170,11 @@ object TransportConstants {
 
     // ===== Announce Queue Constants =====
 
-    /** Maximum number of announces that can be queued per interface. */
-    const val MAX_QUEUED_ANNOUNCES = 16384
+    /** Maximum number of announces that can be queued per interface (python Reticulum.py:111). */
+    const val MAX_QUEUED_ANNOUNCES = 4096
 
-    /** Time in milliseconds after which a queued announce is considered stale (24 hours). */
-    const val QUEUED_ANNOUNCE_LIFE = 24L * 60 * 60 * 1000
+    /** Time in ms after which a queued announce is stale; 3h (python Reticulum.py:112). */
+    const val QUEUED_ANNOUNCE_LIFE = 3L * 60 * 60 * 1000
 
     /** Default announce capacity as percentage of interface bitrate (2%). */
     const val ANNOUNCE_CAP = 0.02

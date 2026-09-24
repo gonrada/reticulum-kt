@@ -14,7 +14,8 @@ import java.nio.file.Files
 /**
  * The temp -> final renames in [Identity.saveKnownDestinations]
  * (`known_destinations.tmp`) and the ratchet persist job (`<hex>.out`) must
- * replace an existing target. `File.renameTo` fails when the target exists on
+ * replace an existing target, as python's `os.replace` does
+ * (RNS/Identity.py:199, 435). `File.renameTo` fails when the target exists on
  * Windows and its result was discarded, so neither file was ever updated after
  * the first write.
  */

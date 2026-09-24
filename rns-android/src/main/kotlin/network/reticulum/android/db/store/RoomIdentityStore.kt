@@ -52,6 +52,11 @@ class RoomIdentityStore(
 
     override fun knownDestinationCount(): Int = knownDestDao.count()
 
+    override fun removeKnownDestination(destHash: ByteArray) {
+        val hash = destHash.copyOf()
+        writeExecutor.submitWriteThroughDurable("removeKnownDestination") { knownDestDao.deleteByHash(hash) }
+    }
+
     // ===== Per-Peer Ratchets =====
 
     override fun upsertRatchet(destHash: ByteArray, ratchet: ByteArray, timestampMs: Long) {

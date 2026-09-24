@@ -129,7 +129,7 @@ object ConfigParser {
      */
     private fun parseValue(value: String): Any {
         // Remove inline comments
-        val cleanValue = stripInlineComment(value).trim()
+        val cleanValue = network.reticulum.config.InterfaceConfig.stripInlineComment(value).trim()
 
         // Boolean values
         if (cleanValue.equals("true", ignoreCase = true) ||
@@ -160,23 +160,6 @@ object ConfigParser {
         } else {
             cleanValue
         }
-    }
-
-    /**
-     * Drop an inline `# comment`, but not a `#` inside a quoted value: python's ConfigObj
-     * treats `#` inside single or double quotes as part of the value, so a passphrase such
-     * as `"pass#word"` must survive intact rather than derive a different IFAC key.
-     */
-    internal fun stripInlineComment(line: String): String {
-        var quote: Char? = null
-        for ((i, c) in line.withIndex()) {
-            when {
-                quote != null -> if (c == quote) quote = null
-                c == '"' || c == '\'' -> quote = c
-                c == '#' -> return line.substring(0, i)
-            }
-        }
-        return line
     }
 
     /**

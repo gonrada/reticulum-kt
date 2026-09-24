@@ -92,6 +92,7 @@ class LinkTableProofTimeoutTest {
             ).also { Transport.deregisterDestination(it) }
         // The path to the destination is learned over the slow interface.
         Transport.inbound(signedAnnounceRaw(remoteIdentity, dest), slowEgress)
+        Transport.awaitInboundIdle()
         assertEquals(1, Transport.hopsTo(dest.hash), "precondition: one-hop path via the slow interface")
 
         // A LINKREQUEST for it arrives on the fast interface, HEADER_2 and naming this
@@ -111,6 +112,7 @@ class LinkTableProofTimeoutTest {
         val raw = lr.pack()
         val before = System.currentTimeMillis()
         Transport.inbound(raw, ingress)
+        Transport.awaitInboundIdle()
         val after = System.currentTimeMillis()
 
         val linkId = Link.linkIdFromLrPacket(Packet.unpack(raw)!!)

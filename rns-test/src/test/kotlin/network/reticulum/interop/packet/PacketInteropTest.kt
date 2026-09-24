@@ -525,8 +525,8 @@ class PacketInteropTest : InteropTestBase() {
     inner class EdgeCases {
 
         @Test
-        @DisplayName("Minimum size packet")
-        fun `minimum size packet`() {
+        @DisplayName("Header-only packet is rejected")
+        fun `header only packet is rejected`() {
             val destHash = ByteArray(16)
             val data = ByteArray(0)
 
@@ -542,9 +542,22 @@ class PacketInteropTest : InteropTestBase() {
                 "Packet should be at least ${RnsConstants.HEADER_MIN_SIZE} bytes"
             }
 
+            // The frame is exactly the header, so its data field is empty. python raises
+            // on that in Packet.unpack (Packet.py:275) and so do we: nothing downstream
+            // can act on a packet carrying no data.
             val unpacked = Packet.unpack(raw)
-            assert(unpacked != null) { "Minimum packet should unpack" }
-            assert(unpacked!!.data.isEmpty()) { "Data should be empty" }
+            assert(unpacked == null) { "A header-only frame must not unpack" }
+
+            // One payload byte more is the smallest frame that does unpack.
+            val smallest = Packet.createRaw(
+                destinationHash = destHash,
+                data = byteArrayOf(0x00),
+                packetType = PacketType.DATA,
+                destinationType = DestinationType.PLAIN
+            ).pack()
+            val ok = Packet.unpack(smallest)
+            assert(ok != null) { "A frame with one data byte must unpack" }
+            assert(ok!!.data.size == 1) { "Data should be the single byte sent" }
         }
 
         @Test

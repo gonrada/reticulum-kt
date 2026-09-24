@@ -7,23 +7,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import network.reticulum.identity.Identity
-import network.reticulum.interfaces.IfacCredentials
-import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
-import network.reticulum.interfaces.framing.HDLC
-import network.reticulum.interfaces.framing.KISS
-import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
-import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * I2P server interface for Reticulum.
@@ -80,13 +70,8 @@ class I2PInterface(
         return mapOf(network.reticulum.discovery.DiscoveryConstants.REACHABLE_ON to b32!!)
     }
 
-    // IFAC credentials
-    private val _ifacCredentials: IfacCredentials? by lazy {
-        IfacUtils.deriveIfacCredentials(ifacNetname, ifacNetkey)
-    }
-    override val ifacSize: Int get() = if (_ifacCredentials != null) 16 else 0
-    override val ifacKey: ByteArray? get() = _ifacCredentials?.key
-    override val ifacIdentity: Identity? get() = _ifacCredentials?.identity
+    // IFAC credentials (16-byte tag) are derived in the Interface base from
+    // ifacNetname/ifacNetkey.
 
     // Server listens on localhost
     override val canReceive: Boolean = true
@@ -172,9 +157,7 @@ class I2PInterface(
         while (!detached.get()) {
             try {
                 val server = serverSocket ?: break
-                val clientSocket = withContext(Dispatchers.IO) {
-                    server.accept()
-                }
+                val clientSocket = server.accept()
 
                 log("Incoming connection from ${clientSocket.remoteSocketAddress}")
                 spawnIncomingPeer(clientSocket)
@@ -257,8 +240,6 @@ class I2PInterface(
             onPacketReceived?.invoke(data, iface)
         }
 
-        // Remove any stale entries first
-        spawnedInterfaces?.removeAll { it === peer }
         spawnedInterfaces?.add(peer)
 
         onPeerConnected?.invoke(peer)

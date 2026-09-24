@@ -1,11 +1,14 @@
 # Python Reference Implementation Deviations
 
-This document tracks intentional behavioral differences between the
+This document summarises intentional behavioral differences between the
 Kotlin (reticulum-kt) implementation and the Python reference (RNS).
 Each entry explains **what** differs, **why**, and the **risk**.
 
-Python is always the ground truth. Deviations documented here are
-temporary workarounds or conscious trade-offs, not design choices.
+Python is always the ground truth. The **authoritative, complete list** of
+deviations, one entry per divergence with the reference line it departs
+from, is [`port-deviations.md`](port-deviations.md); the three entries below
+are the original ones and are kept for their longer rationale. Deviations
+are temporary workarounds or conscious trade-offs, not design choices.
 
 ---
 
@@ -33,6 +36,12 @@ removed. The timing differs (Python: at load; Kotlin: at first use).
 
 **Resolution**: Add a deferred path validation pass after all interfaces
 are registered, matching Python's load-time filtering.
+
+**Status (2026-09)**: the read APIs (`hasPath`, `hopsTo`, `nextHop`) now treat a
+restored entry whose interface is not registered as absent once at least one
+interface has registered, so the reference's invariant ("a usable path
+references a live interface") holds at the point of use without racing
+asynchronous interface registration. See `port-deviations.md`.
 
 ---
 
@@ -110,11 +119,9 @@ if needed.
 
 ## Conformance Test Status
 
-78 of 79 conformance tests pass (only `bz2_compress` differs due to
-library version producing different but equally valid compressed output).
-
-All 4 ratchet lifecycle tests pass, including:
-- Announce with ratchet pack/unpack
-- Ratchet extraction from announce
-- Full lifecycle encrypt/decrypt
-- Cross-implementation encrypt/decrypt
+Against the [reticulum-conformance](https://github.com/torlando-tech/reticulum-conformance)
+suite with RNS 1.5.2 as the reference, the full run on this port is
+1308 passed, 0 failed, 12 skipped, 1 expected failure, with the
+Kotlin bridge in every arm (reference-to-kotlin, kotlin-to-reference,
+kotlin-to-kotlin). The one expected failure is `bz2_compress`: the compression
+library produces different but equally valid output.

@@ -1,5 +1,6 @@
 package network.reticulum.interfaces.auto
 
+import network.reticulum.common.RnsLog
 import network.reticulum.interfaces.Interface
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -73,20 +74,21 @@ class AutoInterfacePeer(
     override fun processOutgoing(data: ByteArray) {
         val socket = outboundSocket
         if (socket == null || !online.value || detached.get()) {
-            log("Cannot send: socket=${socket != null}, online=${online.value}, detached=${detached.get()}")
+            RnsLog.log(RnsLog.DEBUG, name) { "Cannot send: socket=${socket != null}, online=${online.value}, detached=${detached.get()}" }
             return
         }
 
         try {
-            log("Sending ${data.size} bytes to $targetAddress")
+            // Per-packet trace: DEBUG and lazy (python AutoInterface.py logs per-packet
+            // detail at LOG_DEBUG), so the send path does not pay for log I/O.
+            RnsLog.log(RnsLog.DEBUG, name) { "Sending ${data.size} bytes to $targetAddress" }
             val packet = DatagramPacket(data, data.size, targetAddress)
             socket.send(packet)
             txBytes.addAndGet(data.size.toLong())
             parent.txBytes.addAndGet(data.size.toLong())
-            log("Sent successfully")
+            RnsLog.log(RnsLog.DEBUG, name) { "Sent successfully" }
         } catch (e: Exception) {
-            log("Failed to send to $targetAddress: ${e.message}")
-            e.printStackTrace()
+            RnsLog.log(RnsLog.WARNING, name) { "Failed to send to $targetAddress: ${e.javaClass.name}: ${e.message}" }
         }
     }
 
@@ -107,7 +109,7 @@ class AutoInterfacePeer(
     }
 
     private fun log(message: String) {
-        println("[${System.currentTimeMillis()}] [$name] $message")
+        RnsLog.log(RnsLog.INFO, name, message)
     }
 
     override fun toString(): String = "AutoInterfacePeer[$name -> $targetAddress]"

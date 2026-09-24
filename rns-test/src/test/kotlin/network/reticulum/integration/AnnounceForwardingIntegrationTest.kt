@@ -84,6 +84,7 @@ class AnnounceForwardingIntegrationTest {
         // Register a fake external interface
         externalInterface = ExternalTestInterface("External")
         Transport.registerInterface(externalInterface!!.toRef())
+        externalInterface!!.start()
     }
 
     @AfterEach
@@ -283,7 +284,10 @@ class AnnounceForwardingIntegrationTest {
         override val canSend: Boolean = true
 
         override fun start() {
-            // No-op: fake interface, nothing to start
+            // Transport drops an inbound packet whose receiving interface is not
+            // online, so the fake interface has to report itself online the way a
+            // real one does when it opens.
+            setOnline(true)
         }
 
         override fun processOutgoing(data: ByteArray) {

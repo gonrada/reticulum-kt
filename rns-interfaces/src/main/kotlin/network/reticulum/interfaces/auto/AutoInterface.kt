@@ -1,6 +1,8 @@
 package network.reticulum.interfaces.auto
 
 import kotlinx.coroutines.*
+import network.reticulum.common.RnsLog
+import network.reticulum.common.toKey
 import network.reticulum.crypto.Hashes
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.toRef
@@ -50,6 +52,13 @@ class AutoInterface(
     private val peers = ConcurrentHashMap<String, PeerInfo>()
     private val spawnedPeers = ConcurrentHashMap<String, AutoInterfacePeer>()
 
+    // Bound the number of spawned peers. On a no-passphrase LAN the discovery
+    // token is forgeable, so a rogue source could otherwise force unbounded
+    // peer-interface creation (each peer spawns a coroutine + Transport
+    // registration). This is hardening beyond upstream (python's AutoInterface is
+    // unbounded); the cap is generous enough for any real LAN.
+    private val maxPeers = 250
+
     // Adaptive announce interval: fast after changes, progressively slower when stable.
     // Receiving peers' multicast is free (socket.receive blocks without CPU cost).
     // Sending is what costs battery, so we only need to send often enough that
@@ -80,13 +89,8 @@ class AutoInterface(
     // Link-local addresses per interface
     private val linkLocalAddresses = ConcurrentHashMap<String, Inet6Address>()
 
-    // Recent packets for duplicate detection (multi-interface)
-    private data class RecentPacket(
-        val hash: Int,
-        val timestamp: Long,
-    )
-
-    private val recentPackets = ConcurrentHashMap.newKeySet<RecentPacket>()
+    // Multi-interface duplicate suppression, mirroring Python's mif_deque/mif_deque_times.
+    private val mifDedup = MultiInterfaceDedup()
 
     // Coroutine management
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -362,9 +366,7 @@ class AutoInterface(
         while (running.get() && !socket.isClosed) {
             try {
                 val packet = DatagramPacket(buffer, buffer.size)
-                withContext(Dispatchers.IO) {
-                    socket.receive(packet)
-                }
+                socket.receive(packet)
 
                 val receivedHash = packet.data.copyOf(packet.length)
                 val senderAddr = packet.address
@@ -386,13 +388,15 @@ class AutoInterface(
                     continue
                 }
 
-                // Log all non-own packets for debugging
-                log("Received discovery from $senderAddrStr on $ifName")
+                // Per-datagram trace: DEBUG and lazy, so a flood of spoofed link-local
+                // sources cannot turn the receive path into log I/O
+                // (python AutoInterface.py:370 logs the peering packet at LOG_DEBUG).
+                RnsLog.log(RnsLog.DEBUG, name) { "Received discovery from $senderAddrStr on $ifName" }
 
                 // Validate the discovery token
                 val expectedHash = computePeeringHash(senderAddrStr)
                 if (!receivedHash.contentEquals(expectedHash)) {
-                    log("Hash mismatch from $senderAddrStr")
+                    RnsLog.log(RnsLog.DEBUG, name) { "Hash mismatch from $senderAddrStr" }
                     continue
                 }
 
@@ -438,9 +442,7 @@ class AutoInterface(
         while (running.get() && !socket.isClosed) {
             try {
                 val packet = DatagramPacket(buffer, buffer.size)
-                withContext(Dispatchers.IO) {
-                    socket.receive(packet)
-                }
+                socket.receive(packet)
 
                 val data = packet.data.copyOf(packet.length)
                 val senderAddr = packet.address
@@ -454,9 +456,11 @@ class AutoInterface(
                 // Skip our own packets
                 if (isOwnAddress(senderAddrStr)) continue
 
-                // Check for duplicate (multi-interface deduplication)
-                val packetHash = data.contentHashCode()
-                if (isDuplicate(packetHash)) continue
+                // Check for duplicate (multi-interface deduplication). Key on the full hash
+                // like Python (RNS.Identity.full_hash(data)); the previous 32-bit
+                // contentHashCode could collide and silently drop a legitimate packet.
+                val packetHash = Hashes.fullHash(data).toKey()
+                if (mifDedup.isDuplicate(packetHash, System.currentTimeMillis())) continue
 
                 // Find the peer interface for this sender
                 val peer = spawnedPeers[senderAddrStr]
@@ -465,8 +469,9 @@ class AutoInterface(
                     peer.refresh()
                     peer.handleIncomingData(data)
                 } else {
-                    // Unknown peer - might be a new discovery
-                    log("Data from unknown peer: $senderAddrStr")
+                    // Unknown peer - might be a new discovery. DEBUG and lazy: this runs
+                    // once per datagram from any unknown link-local source.
+                    RnsLog.log(RnsLog.DEBUG, name) { "Data from unknown peer: $senderAddrStr" }
                 }
             } catch (e: SocketException) {
                 if (running.get()) {
@@ -481,20 +486,6 @@ class AutoInterface(
         }
 
         log("Data handler stopped for $ifName")
-    }
-
-    /**
-     * Check if packet is duplicate (for multi-interface deduplication).
-     */
-    private fun isDuplicate(packetHash: Int): Boolean {
-        val now = System.currentTimeMillis()
-
-        // Clean old entries
-        recentPackets.removeIf { now - it.timestamp > AutoInterfaceConstants.MULTI_IF_DEQUE_TTL_MS }
-
-        // Check if we've seen this packet
-        val entry = RecentPacket(packetHash, now)
-        return !recentPackets.add(entry)
     }
 
     /**
@@ -691,6 +682,13 @@ class AutoInterface(
     ) {
         val cleanAddr = address.substringBefore('%')
 
+        // Refuse NEW peers once the cap is reached (known peers still refresh
+        // below). Bounds a rogue LAN source from forcing unbounded peer spawns.
+        if (peers.size >= maxPeers && !peers.containsKey(cleanAddr)) {
+            log("Peer limit ($maxPeers) reached; ignoring new peer $cleanAddr")
+            return
+        }
+
         // Atomic check-and-insert to prevent race condition when peer is
         // discovered simultaneously on multiple network interfaces
         val newPeerInfo = PeerInfo(interfaceName)
@@ -734,11 +732,9 @@ class AutoInterface(
         }
         spawnedInterfaces?.add(peer)
 
-        // Wire up to Transport
+        // Wire up to Transport. toRef() installs the default receive callback
+        // (InterfaceAdapter: Transport.inbound(data, peerRef)) since none is set.
         val peerRef = peer.toRef()
-        peer.onPacketReceived = { data, _ ->
-            Transport.inbound(data, peerRef)
-        }
         Transport.registerInterface(peerRef)
         resetAnnounceInterval() // New peer discovered — announce fast so they discover us too
 

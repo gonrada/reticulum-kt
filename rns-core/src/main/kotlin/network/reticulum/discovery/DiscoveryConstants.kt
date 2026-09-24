@@ -33,7 +33,14 @@ object DiscoveryConstants {
     const val FLAG_ENCRYPTED: Byte = 0x02
 
     // PoW parameters
-    const val DEFAULT_STAMP_VALUE = 14
+    /**
+     * Default interface-discovery proof-of-work cost (python Discovery.py:44).
+     *
+     * RNS 1.5.2 raised this from 14 to 16, and it is enforced on both sides: a receiver
+     * running the default `InterfaceAnnounceHandler` requires 16, so a 14-cost stamp is
+     * rejected and the announcing interface is simply never discovered.
+     */
+    const val DEFAULT_STAMP_VALUE = 16
     const val WORKBLOCK_EXPAND_ROUNDS = 20
 
     // Status thresholds (seconds, matching Python)

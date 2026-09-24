@@ -20,9 +20,10 @@ import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * A request still pending when its link closes must conclude: the port fails it
- * (a deliberate deviation; the reference leaves it SENT forever, Link.py:704-730
- * and :1416-1417). Each receipt's failed callback fires exactly once, including one
- * already RECEIVING, and one already FAILED is not reported again.
+ * (a deliberate deviation, `port-deviations.md`; the reference leaves it SENT
+ * forever, Link.py:704-730 and :1416-1417). Each receipt's failed callback fires
+ * exactly once, including one already RECEIVING, and one already FAILED is not
+ * reported again.
  */
 class LinkTeardownPendingRequestsTest {
     @BeforeEach

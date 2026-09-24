@@ -23,10 +23,15 @@ class InterfaceAdapter private constructor(
     override val mode: InterfaceMode get() = iface.modeOverride ?: iface.mode
     // Never forwarded before, so every adapted interface reported the InterfaceRef
     // default of 0. The announce-cap egress spacing is (len*8/bitrate)/announce_cap,
-    // and a zero bitrate made that wait zero: the 2% announce bandwidth cap was a
+    // and a zero bitrate makes that wait zero: the 2% announce bandwidth cap was a
     // silent no-op on every real interface that goes through this adapter.
     override val bitrate: Int get() = iface.bitrate
-    override val announceCap: Double get() = iface.announceCap
+    override val announceCap: Double get() = iface.announceCapOverride ?: iface.announceCap
+    override val announceRateTarget: Int? get() = iface.announceRateTargetOverride ?: iface.announceRateTarget
+    override val announceRateGrace: Int get() = iface.announceRateGraceOverride ?: iface.announceRateGrace
+    override val announceRatePenalty: Int get() = iface.announceRatePenaltyOverride ?: iface.announceRatePenalty
+    override val announcesFromInternal: Boolean get() = iface.announcesFromInternalOverride ?: iface.announcesFromInternal
+    override val announcesToInternal: Boolean? get() = iface.announcesToInternalOverride ?: iface.announcesToInternal
     override val hwMtu: Int get() = iface.hwMtu ?: RnsConstants.MTU
     override val supportsLinkMtuDiscovery: Boolean get() = iface.supportsLinkMtuDiscovery
 
@@ -116,6 +121,17 @@ class InterfaceAdapter private constructor(
 
     override fun recordIncomingAnnounce() = iface.recordIncomingAnnounce()
 
+    override fun shouldIngressLimitPr(): Boolean = iface.shouldIngressLimitPr()
+
+    override fun recordIncomingPathRequest() = iface.recordIncomingPathRequest()
+
+    override fun shouldEgressLimitPr(): Boolean = iface.shouldEgressLimitPr()
+
+    override fun recordOutgoingPathRequest() = iface.recordOutgoingPathRequest()
+
+    override fun protocolViolation(description: String) = iface.protocolViolation(description)
+
+    override val protocolViolations: Long get() = iface.protocolViolationCount.get()
     // Held announce delegation
     override fun holdAnnounce(
         destinationHash: ByteArray,

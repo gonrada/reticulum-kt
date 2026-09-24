@@ -1,7 +1,10 @@
 plugins {
     kotlin("jvm")
     kotlin("plugin.serialization")
-    id("com.github.johnrengelman.shadow") version "8.1.1"
+    // gradleup fork of the shadow plugin: the old com.github.johnrengelman.shadow 8.1.1 throws
+    // "No such property: mode" on Gradle 9 (removed file-copy API). Matches conformance-bridge,
+    // which already uses this version; the ShadowJar task package is unchanged.
+    id("com.gradleup.shadow") version "9.0.0-beta12"
 }
 
 val serializationVersion: String by project
@@ -20,8 +23,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVersion")
 
     // Python pickle for RPC compatibility
-    implementation("net.razorvine:pickle:1.5")
-
+    // Serial ports for SerialInterface / KISSInterface / AX25KISSInterface
+    implementation("com.fazecast:jSerialComm:2.10.4")
     // Testing
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.1")

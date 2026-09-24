@@ -284,6 +284,15 @@ class RawChannelWriter(
     private val closed = AtomicBoolean(false)
     private val mdu = channel.mdu - StreamDataMessage.OVERHEAD
 
+    /**
+     * The chunk size this writer actually uses, derived from the live channel MDU
+     * (python `Buffer.py:230`). Distinct from the class constant
+     * [StreamDataMessage.MAX_DATA_LEN], which assumes the 500-byte baseline link MTU —
+     * with MTU discovery the two differ by orders of magnitude. Exposed for the
+     * conformance bridge.
+     */
+    val writerMduForTest: Int get() = mdu
+
     init {
         // Register stream data message type if not already registered.
         // SMT_STREAM_DATA is system-reserved (0xFF00) and must register with
@@ -302,8 +311,33 @@ class RawChannelWriter(
     override fun write(b: ByteArray, off: Int, len: Int) {
         if (closed.get()) throw IllegalStateException("Stream is closed")
 
-        val data = b.copyOfRange(off, off + len)
-        writeInternal(data)
+        // writeInternal sends at most one chunk and returns the bytes it consumed (0 when
+        // the link is not yet ready). Python relies on io.BufferedWriter re-driving that
+        // partial return until the buffer is drained (Buffer.py:214-247); do the same here.
+        // The previous single call silently dropped everything past the first chunk.
+        var pos = off
+        val end = off + len
+        while (pos < end) {
+            if (closed.get()) throw IllegalStateException("Stream is closed")
+            val n = writeInternal(b.copyOfRange(pos, minOf(end, pos + MAX_CHUNK_LEN)))
+            if (n > 0) {
+                pos += n
+            } else {
+                // Zero means the channel refused the chunk (ME_LINK_NOT_READY). That is
+                // transient while the link can still recover — a full send window, or a
+                // link not yet ACTIVE — so keep retrying, as the reference's
+                // io.BufferedWriter does when the raw writer returns 0 (Buffer.py:264-267).
+                // It is terminal once the outlet is gone: every later send raises the same
+                // exception, so retrying would spin until the process ends instead of
+                // reporting the failure. No wall-clock deadline here on purpose; a slow
+                // link legitimately blocks for a long time.
+                val outlet = channel.outlet
+                if (!outlet.isUsable || outlet.isClosed) {
+                    throw IOException("Cannot write stream $streamId: the link is closed")
+                }
+                Thread.sleep(10) // link not ready but recoverable: yield briefly, then retry
+            }
+        }
     }
 
     private fun writeInternal(bytes: ByteArray): Int {
@@ -328,7 +362,10 @@ class RawChannelWriter(
                 val compressedChunk = compressBZ2(limitedBytes.copyOf(chunkSegmentLength))
                 val compressedLength = compressedChunk.size
 
-                if (compressedLength < StreamDataMessage.MAX_DATA_LEN &&
+                // Chunk on the writer's LIVE mdu (python Buffer.py:246,256), not the class
+                // constant: with link MTU discovery the two differ by orders of magnitude,
+                // and chunking at 423 on a 16 KiB link is one message where 38 fit.
+                if (compressedLength < mdu &&
                     compressedLength < chunkSegmentLength) {
                     compSuccess = true
                     chunk = compressedChunk
@@ -341,7 +378,7 @@ class RawChannelWriter(
 
             // If compression didn't help, send uncompressed
             if (!compSuccess) {
-                chunk = limitedBytes.copyOf(minOf(StreamDataMessage.MAX_DATA_LEN, limitedBytes.size))
+                chunk = limitedBytes.copyOf(minOf(mdu, limitedBytes.size))
                 processedLength = chunk.size
             }
 
@@ -387,17 +424,45 @@ class RawChannelWriter(
                 val linkRtt = channel.outlet.rtt ?: 5000L
                 val timeout = System.currentTimeMillis() + (linkRtt * 10)
 
-                // Wait for channel to be ready
+                // Wait for channel to be ready. The bounded wait only makes sense while
+                // the link can still become ready; once the outlet is gone the channel
+                // never reports ready again and this would burn the whole rtt*10 window
+                // (up to 50s on the null-rtt default) on a link that is already closed.
+                // Same terminal condition write() uses — but unlike write() this does not
+                // report the failure: callers close in a finally block, so a close on a
+                // dead link completes quietly. The EOF marker below is swallowed by
+                // writeInternal's ME_LINK_NOT_READY branch.
                 while (System.currentTimeMillis() < timeout && !channel.isReadyToSend()) {
+                    val outlet = channel.outlet
+                    if (!outlet.isUsable || outlet.isClosed) break
                     Thread.sleep(50)
                 }
             } catch (e: Exception) {
                 // Ignore
             }
 
-            // Send EOF marker
+            // Send the EOF marker. Callers close in a finally block, so this must not
+            // raise whatever the link has done — but it must not be silent either: a
+            // reader waiting on a stream that never gets its EOF has nothing to go on.
+            // A link that has already closed cannot carry the marker and is not worth
+            // reporting; anything else is a real failure to send and is logged.
             eofSent.set(true)
-            writeInternal(ByteArray(0))
+            val outlet = channel.outlet
+            val liveLink = outlet.isUsable && !outlet.isClosed
+            // The wait above has already ended one of three ways: the channel is ready,
+            // the link closed, or the window never drained. In that last case the send
+            // below is refused and writeInternal reports nothing, which is the quiet way
+            // the marker goes missing on a link that was still alive to carry it.
+            if (liveLink && !channel.isReadyToSend()) {
+                println("RawChannelWriter($streamId) could not send its EOF marker: the channel never became ready")
+            }
+            try {
+                writeInternal(ByteArray(0))
+            } catch (e: Exception) {
+                if (liveLink) {
+                    println("RawChannelWriter($streamId) could not send its EOF marker on a live link: ${e.message}")
+                }
+            }
         }
     }
 

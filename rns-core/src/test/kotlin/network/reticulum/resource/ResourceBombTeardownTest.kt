@@ -22,12 +22,12 @@ import kotlin.random.Random
  * Python's `Resource.cancel` on a CORRUPT resource rejects the advertisement
  * (RESOURCE_RCL) and calls `link.teardown()` (Resource.py:1096-1099); the port's
  * cancel() is a no-op once status >= COMPLETE, so a peer could previously feed
- * an unbounded sequence of maximum-size inflations over one link. The hash-mismatch
+ * an unbounded sequence of 64 MiB inflations over one link. The hash-mismatch
  * CORRUPT path is unchanged: python does not tear down there (Resource.py:728).
  *
  * Sender and receiver are built on the same in-process link (its Token is
  * symmetric), the receiver is fed the sender's parts directly, and assemble()
- * is driven synchronously with the watchdog suppressed, the same shape as the
+ * is driven synchronously with the watchdog suppressed — the same shape as the
  * conformance bridge's corrupt-assembled injector.
  */
 class ResourceBombTeardownTest {
@@ -99,7 +99,7 @@ class ResourceBombTeardownTest {
         val (sender, receiver) = buildPair(link, Random(5).nextBytes(20_000))
 
         // Corrupt one part in flight: the resource-level Token authentication fails
-        // in assemble and the transfer is CORRUPT, but python does not tear the
+        // in assemble and the transfer is CORRUPT — but python does not tear the
         // link down on this path (Resource.py:715-728), and neither may the port.
         val j = receiver.parts.size / 2
         receiver.setPartForTest(j, Random(6).nextBytes(sender.parts[j]!!.size))

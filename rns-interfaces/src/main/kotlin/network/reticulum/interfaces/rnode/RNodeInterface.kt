@@ -9,7 +9,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.KISS
 import java.io.ByteArrayOutputStream
@@ -76,6 +75,12 @@ class RNodeInterface(
     }
 
     override val hwMtu: Int = 508
+
+    // The tag is 8 bytes on this medium; see Interface.defaultIfacSize for why a
+    // mismatch partitions rather than degrades.
+    override val defaultIfacSize: Int
+        get() = DEFAULT_IFAC_SIZE
+
 
     // Discovery support
     override val supportsDiscovery: Boolean = true
@@ -213,7 +218,7 @@ class RNodeInterface(
 
             if (displayImageData != null) {
                 try {
-                    displayImage(displayImageData!!)
+                    displayImage(displayImageData)
                     if (framebufferEnableDelayMs > 0) {
                         delay(framebufferEnableDelayMs)
                     }
@@ -256,10 +261,7 @@ class RNodeInterface(
 
     /** Write a single line to the RNode framebuffer. */
     private fun writeFramebuffer(line: Int, lineData: ByteArray) {
-        val data = byteArrayOf(line.toByte()) + lineData
-        val escaped = KISS.escape(data)
-        val cmd = byteArrayOf(KISS.FEND, KISS.CMD_FB_WRITE) + escaped + byteArrayOf(KISS.FEND)
-        writeRaw(cmd)
+        writeRaw(KISS.frame(byteArrayOf(line.toByte()) + lineData, KISS.CMD_FB_WRITE))
     }
 
     // -- KISS command helpers (matching Python's detect/setFrequency/etc.) --
@@ -294,22 +296,20 @@ class RNodeInterface(
     }
 
     private fun sendFrequency() {
-        val data = ByteArray(4)
-        data[0] = (frequency shr 24).toByte()
-        data[1] = (frequency shr 16 and 0xFF).toByte()
-        data[2] = (frequency shr 8 and 0xFF).toByte()
-        data[3] = (frequency and 0xFF).toByte()
-        sendKissCommand(KISS.CMD_FREQUENCY, data)
+        sendKissCommand(KISS.CMD_FREQUENCY, u32BigEndian(frequency))
     }
 
     private fun sendBandwidth() {
-        val data = ByteArray(4)
-        data[0] = (bandwidth shr 24).toByte()
-        data[1] = (bandwidth shr 16 and 0xFF).toByte()
-        data[2] = (bandwidth shr 8 and 0xFF).toByte()
-        data[3] = (bandwidth and 0xFF).toByte()
-        sendKissCommand(KISS.CMD_BANDWIDTH, data)
+        sendKissCommand(KISS.CMD_BANDWIDTH, u32BigEndian(bandwidth))
     }
+
+    /** Low 32 bits of [value] as 4 big-endian bytes (RNode CMD_FREQUENCY/CMD_BANDWIDTH payload). */
+    private fun u32BigEndian(value: Long): ByteArray = byteArrayOf(
+        (value shr 24).toByte(),
+        (value shr 16).toByte(),
+        (value shr 8).toByte(),
+        value.toByte(),
+    )
 
     private fun sendTxPower() {
         sendKissCommand(KISS.CMD_TXPOWER, byteArrayOf(txPower.toByte()))
@@ -328,13 +328,7 @@ class RNodeInterface(
     }
 
     private fun sendKissCommand(command: Byte, data: ByteArray) {
-        val escaped = KISS.escape(data)
-        val frame = ByteArray(escaped.size + 3)
-        frame[0] = KISS.FEND
-        frame[1] = command
-        System.arraycopy(escaped, 0, frame, 2, escaped.size)
-        frame[frame.size - 1] = KISS.FEND
-        writeRaw(frame)
+        writeRaw(KISS.frame(data, command))
     }
 
     private fun writeRaw(data: ByteArray) {
@@ -432,9 +426,7 @@ class RNodeInterface(
             while (ioScope.isActive && !detached.get()) {
                 val bytesRead =
                     try {
-                        withContext(Dispatchers.IO) {
-                            inputStream.read(buf)
-                        }
+                        inputStream.read(buf)
                     } catch (_: java.net.SocketTimeoutException) {
                         val timeSinceLast = System.currentTimeMillis() - lastReadMs
                         if (dataBuffer.size() > 0 && timeSinceLast > READ_TIMEOUT_MS) {
@@ -779,12 +771,8 @@ class RNodeInterface(
     }
 
     private fun transmit(data: ByteArray) {
-        val escaped = KISS.escape(data)
-        val frame = ByteArray(escaped.size + 3)
-        frame[0] = KISS.FEND
-        frame[1] = KISS.CMD_DATA
-        System.arraycopy(escaped, 0, frame, 2, escaped.size)
-        frame[frame.size - 1] = KISS.FEND
+        // [FEND][CMD_DATA][escaped data][FEND] (python RNodeInterface.py:722-723)
+        val frame = KISS.frame(data, KISS.CMD_DATA)
 
         try {
             outputStream.write(frame)

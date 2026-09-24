@@ -6,15 +6,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import network.reticulum.identity.Identity
-import network.reticulum.interfaces.IfacCredentials
-import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.backoff.ExponentialBackoff
 import network.reticulum.interfaces.framing.HDLC
@@ -69,14 +67,14 @@ class SppInterface(
         /** SDP service name for Reticulum SPP connections. */
         const val SERVICE_NAME = "Reticulum SPP"
 
-        /** IFAC tag length in bytes on serial media (python SerialInterface.py:53). */
-        const val DEFAULT_IFAC_SIZE = 8
-
         /**
          * Hardware MTU matching Python SerialInterface.HW_MTU.
          * Serial links don't negotiate MTU — this is a fixed upper bound.
          */
         const val HW_MTU = 564
+
+        /** IFAC tag length in bytes for serial media (python SerialInterface.py:53). */
+        const val DEFAULT_IFAC_SIZE = 8
 
         /**
          * Estimated bitrate for Bluetooth 2.0 SPP.
@@ -87,6 +85,9 @@ class SppInterface(
 
         /** Read buffer size for the read loop. */
         private const val READ_BUFFER_SIZE = 4096
+
+        /** Bounded outbound queue depth; a full queue drops the newest frame. */
+        private const val OUTBOUND_CAPACITY = 64
 
         /** Enable verbose debug logging via -Dreticulum.spp.debug=true */
         private val DEBUG = System.getProperty("reticulum.spp.debug", "false").toBoolean()
@@ -102,24 +103,12 @@ class SppInterface(
         network.reticulum.discovery.DiscoveryConstants.REACHABLE_ON to targetAddress,
     )
 
-    // IFAC credentials
-    private val _ifacCredentials: IfacCredentials? by lazy {
-        IfacUtils.deriveIfacCredentials(ifacNetname, ifacNetkey)
-    }
-
-    /**
-     * IFAC tag length for serial media. The reference's serial-class interfaces use an
-     * 8-byte tag; a 16-byte tag fails verification against every peer sharing the
-     * network name and key.
-     */
-    override val ifacSize: Int
-        get() = if (_ifacCredentials != null) DEFAULT_IFAC_SIZE else 0
-
-    override val ifacKey: ByteArray?
-        get() = _ifacCredentials?.key
-
-    override val ifacIdentity: Identity?
-        get() = _ifacCredentials?.identity
+    // IFAC credentials are derived in the Interface base from ifacNetname/ifacNetkey.
+    // The tag is 8 bytes: this interface advertises itself as a SerialInterface and
+    // python SerialInterface.py:53 sets DEFAULT_IFAC_SIZE = 8 for serial media, so a
+    // 16-byte tag would fail IFAC verification against every python serial peer.
+    override val defaultIfacSize: Int
+        get() = DEFAULT_IFAC_SIZE
 
     /** Remote device name, set when connection is established. */
     @Volatile var remoteDeviceName: String? = null
@@ -163,6 +152,7 @@ class SppInterface(
     }
     private var readJob: Job? = null
     private var connectJob: Job? = null
+    private var writeJob: Job? = null
 
     private fun createScope(parent: CoroutineScope?): CoroutineScope {
         return if (parent != null) {
@@ -172,10 +162,18 @@ class SppInterface(
         }
     }
 
+    // Decoupled outbound: processOutgoing only enqueues; a writer coroutine does
+    // the (potentially slow) stream write, so a stalled peer never blocks the
+    // Transport caller. A full queue drops the newest frame rather than blocking.
+    private val outbound = Channel<ByteArray>(OUTBOUND_CAPACITY)
+
     // HDLC deframer — identical to TCPClientInterface
-    // A peer that never sends a closing FLAG must not grow the deframer without limit:
-    // one MTU of payload escapes to at most twice its size.
-    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = 2 * hwMtu + 16) { data ->
+    // Bound the deframer buffer so a peer that never sends a closing FLAG
+    // cannot grow it without limit; 2*HW_MTU covers a fully-escaped max frame.
+    private val hdlcDeframer = HDLC.createDeframer(
+        maxFrameBytes = 2 * HW_MTU + 16,
+        payloadLimit = { HW_MTU + ifacSize },
+    ) { data ->
         val frameNum = framesReceived.incrementAndGet()
         if (DEBUG) {
             val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
@@ -186,6 +184,7 @@ class SppInterface(
     }
 
     override fun start() {
+        writeJob = ioScope.launch { writerLoop() }
         connectJob = ioScope.launch {
             if (!connect(initial = true)) {
                 reconnect()
@@ -277,13 +276,10 @@ class SppInterface(
 
             try {
                 while (isActive && online.value && !detached.get()) {
-                    val bytesRead = withContext(Dispatchers.IO) {
-                        stream.read(buffer)
-                    }
+                    val bytesRead = stream.read(buffer)
 
                     if (bytesRead > 0) {
-                        val data = buffer.copyOf(bytesRead)
-                        hdlcDeframer.process(data)
+                        hdlcDeframer.process(buffer, 0, bytesRead)
                     } else if (bytesRead == -1) {
                         // Connection closed by remote
                         if (DEBUG) {
@@ -318,37 +314,44 @@ class SppInterface(
         if (!online.value || detached.get()) {
             throw IllegalStateException("Interface is not online")
         }
+        // Enqueue only; the writer coroutine performs the actual stream write so
+        // a stalled peer never blocks the Transport caller.
+        if (!outbound.trySend(data).isSuccess) {
+            log("Outbound queue full, dropping frame (${data.size} bytes)")
+        }
+    }
 
-        val stream = outputStream ?: throw IllegalStateException("Output stream is null")
+    /** Drains the outbound queue, writing each frame to the current stream. */
+    private suspend fun writerLoop() {
+        for (data in outbound) {
+            writeOne(data)
+        }
+    }
 
+    private suspend fun writeOne(data: ByteArray) {
+        val stream = outputStream ?: run {
+            if (DEBUG) debugLog("Dropping outbound frame; no active connection")
+            return
+        }
         try {
-            // Serialize writes with a mutex (same pattern as RNodeInterface txLock)
-            // We use runBlocking here because processOutgoing is called synchronously
-            // from Transport, matching the TCPClientInterface pattern
-            kotlinx.coroutines.runBlocking {
-                txLock.withLock {
-                    val framedData = HDLC.frame(data)
+            txLock.withLock {
+                val framedData = HDLC.frame(data)
+                stream.write(framedData)
+                stream.flush()
 
-                    withContext(Dispatchers.IO) {
-                        stream.write(framedData)
-                        stream.flush()
-                    }
-
-                    val frameNum = framesSent.incrementAndGet()
-                    if (DEBUG) {
-                        val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
-                        val suffix = if (data.size > 16) "..." else ""
-                        debugLog("SENT frame #$frameNum: ${data.size} bytes (framed: ${framedData.size}), data=[$hexPreview$suffix]")
-                    }
-
-                    txBytes.addAndGet(framedData.size.toLong())
-                    parentInterface?.txBytes?.addAndGet(framedData.size.toLong())
+                val frameNum = framesSent.incrementAndGet()
+                if (DEBUG) {
+                    val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
+                    val suffix = if (data.size > 16) "..." else ""
+                    debugLog("SENT frame #$frameNum: ${data.size} bytes (framed: ${framedData.size}), data=[$hexPreview$suffix]")
                 }
+
+                txBytes.addAndGet(framedData.size.toLong())
+                parentInterface?.txBytes?.addAndGet(framedData.size.toLong())
             }
         } catch (e: IOException) {
             log("Write error: ${e.message}")
-            teardown()
-            throw e
+            teardown() // reconnect; the caller was never blocked on this write
         }
     }
 
@@ -371,6 +374,8 @@ class SppInterface(
         super.detach()
         readJob?.cancel()
         connectJob?.cancel()
+        writeJob?.cancel()
+        outbound.close()
         if (serverMode) {
             driver.cancelAccept()
         }

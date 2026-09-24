@@ -95,14 +95,22 @@ object HDLC {
      *   discarded and the deframer resyncs on the next FLAG. Defaults to
      *   unbounded so existing callers are unchanged; stream interfaces should
      *   pass a bound derived from their HW_MTU.
+     * @param payloadLimit the largest DEFRAMED frame that will be delivered, which the
+     *   reference computes as `HW_MTU + ifac_size` (`TCPInterface.check_frame_len`,
+     *   TCPInterface.py:337-340). Evaluated per frame because an interface's IFAC size is
+     *   not known until its credentials are derived. This is a different rule from
+     *   [maxFrameBytes]: that one bounds the still-escaped accumulation buffer so an
+     *   unterminated frame cannot exhaust memory, while this one validates a frame that
+     *   did arrive complete. Defaults to unbounded.
      * @param onFrame Callback invoked with each complete deframed packet
      * @return Deframer instance
      */
     fun createDeframer(
         maxFrameBytes: Int = Int.MAX_VALUE,
+        payloadLimit: () -> Int = { Int.MAX_VALUE },
         onFrame: (ByteArray) -> Unit,
     ): Deframer {
-        return Deframer(onFrame, maxFrameBytes)
+        return Deframer(onFrame, maxFrameBytes, payloadLimit)
     }
 
     /**
@@ -116,6 +124,7 @@ object HDLC {
     class Deframer(
         private val onFrame: (ByteArray) -> Unit,
         private val maxFrameBytes: Int = Int.MAX_VALUE,
+        private val payloadLimit: () -> Int = { Int.MAX_VALUE },
     ) {
         private var buffer = ByteArrayOutputStream()
         private var inFrame = false
@@ -137,31 +146,46 @@ object HDLC {
          * @param data Incoming byte data
          */
         fun process(data: ByteArray) {
-            for (byte in data) {
-                if (byte == FLAG) {
-                    if (inFrame && !overflowed && buffer.size() > 0) {
-                        // End of frame
-                        val frameData = buffer.toByteArray()
-                        val unescaped = unescape(frameData)
-                        // Python RNS: Only accept frames larger than HEADER_MINSIZE (19 bytes)
-                        // Rejects malformed/tiny frames that can't contain a valid packet
-                        if (unescaped.size > network.reticulum.common.RnsConstants.HEADER_MIN_SIZE) {
-                            onFrame(unescaped)
-                        }
+            for (byte in data) processByte(byte)
+        }
+
+        /**
+         * Process [len] bytes of [data] starting at [off] — lets a read loop hand its
+         * reusable read buffer straight to the deframer without a per-read copyOf().
+         */
+        fun process(data: ByteArray, off: Int, len: Int) {
+            for (i in off until off + len) processByte(data[i])
+        }
+
+        private fun processByte(byte: Byte) {
+            if (byte == FLAG) {
+                if (inFrame && !overflowed && buffer.size() > 0) {
+                    // End of frame
+                    val frameData = buffer.toByteArray()
+                    val unescaped = unescape(frameData)
+                    // python TCPInterface.check_frame_len (TCPInterface.py:337-340): a frame
+                    // at or below HEADER_MINSIZE cannot hold a valid packet, and one above
+                    // HW_MTU + ifac_size is larger than this medium can legitimately carry.
+                    // The upper bound arrived in RNS 1.5.2; without it we would accept and
+                    // parse oversize frames that every conformant peer drops.
+                    if (unescaped.size > network.reticulum.common.RnsConstants.HEADER_MIN_SIZE &&
+                        unescaped.size <= payloadLimit()
+                    ) {
+                        onFrame(unescaped)
                     }
-                    // Start of new frame (or just a flag)
-                    inFrame = true
-                    overflowed = false
+                }
+                // Start of new frame (or just a flag)
+                inFrame = true
+                overflowed = false
+                recycleBuffer()
+            } else if (inFrame) {
+                if (overflowed) return
+                if (buffer.size() < maxFrameBytes) {
+                    buffer.write(byte.toInt())
+                } else {
+                    // Bound hit without a closing FLAG: discard and resync.
+                    overflowed = true
                     recycleBuffer()
-                } else if (inFrame) {
-                    if (overflowed) continue
-                    if (buffer.size() < maxFrameBytes) {
-                        buffer.write(byte.toInt())
-                    } else {
-                        // Bound hit without a closing FLAG: discard and resync.
-                        overflowed = true
-                        recycleBuffer()
-                    }
                 }
             }
         }

@@ -199,7 +199,17 @@ class BouncyCastleProvider : CryptoProvider {
         // HKDF implementation matching Python's RNS/Cryptography/HKDF.py
         // python: `if length == None or length < 1: raise ValueError(...)` (HKDF.py:41-42)
         require(length >= 1) { "Invalid output key length" }
-        val actualSalt = salt ?: ByteArray(32) // Default to 32 zero bytes
+        // NO empty-IKM guard, deliberately. python HKDF.py:44-45 reads
+        //   if derive_from == None or derive_from == "": raise ValueError(...)
+        // and `b"" == ""` is False in python, so that guard fires only for None —
+        // empty *bytes* are accepted and derive a real key. Verified against 1.3.1
+        // and 1.5.2: hkdf(derive_from=b"") returns a key, hkdf(derive_from=None)
+        // raises. Kotlin has no null ByteArray here, so the None case cannot arise
+        // and there is nothing to port. An earlier `require(ikm.isNotEmpty())`
+        // transcribed the guard literally and diverged from the reference.
+        // python HKDF.py:47-48 substitutes a zero salt when salt is None OR empty;
+        // a non-null empty salt must be treated the same as null (not used verbatim).
+        val actualSalt = if (salt == null || salt.isEmpty()) ByteArray(32) else salt
         val actualInfo = info ?: ByteArray(0)
 
         // Extract phase: PRK = HMAC-SHA256(salt, IKM)

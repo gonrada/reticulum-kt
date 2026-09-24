@@ -9,21 +9,18 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import network.reticulum.Reticulum
-import network.reticulum.identity.Identity
-import network.reticulum.interfaces.IfacCredentials
-import network.reticulum.interfaces.IfacUtils
+import network.reticulum.common.RnsLog
 import network.reticulum.interfaces.Interface
+import network.reticulum.interfaces.framing.DeframerFeed
 import network.reticulum.interfaces.framing.HDLC
-import network.reticulum.interfaces.framing.KISS
+import network.reticulum.interfaces.framing.streamDeframer
+import network.reticulum.interfaces.framing.streamFramer
 import network.reticulum.interfaces.util.TcpKeepalive
 import java.io.IOException
 import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.nio.ByteBuffer
-import java.nio.channels.SocketChannel
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -100,23 +97,15 @@ class TCPClientInterface(
         network.reticulum.discovery.DiscoveryConstants.PORT to targetPort,
     )
 
-    // IFAC credentials - derived lazily from network name/passphrase
-    private val _ifacCredentials: IfacCredentials? by lazy {
-        IfacUtils.deriveIfacCredentials(ifacNetname, ifacNetkey)
-    }
+    // IFAC credentials are derived in the Interface base from ifacNetname/ifacNetkey;
+    // only the tag size is interface-specific.
+    // python Reticulum.py:719-723: configured ifac_size (bits) >=
+    // IFAC_MIN_SIZE*8 (==8) divides by 8; else floors to DEFAULT_IFAC_SIZE.
+    override val defaultIfacSize: Int
+        get() = DEFAULT_IFAC_SIZE
 
-    override val ifacSize: Int
-        get() = if (_ifacCredentials != null) {
-            // python Reticulum.py:719-723: configured ifac_size (bits) >=
-            // IFAC_MIN_SIZE*8 (==8) divides by 8; else floors to DEFAULT_IFAC_SIZE.
-            ifacSizeBits?.takeIf { it >= 8 }?.div(8) ?: DEFAULT_IFAC_SIZE
-        } else 0
-
-    override val ifacKey: ByteArray?
-        get() = _ifacCredentials?.key
-
-    override val ifacIdentity: Identity?
-        get() = _ifacCredentials?.identity
+    override val configuredIfacSizeBits: Int?
+        get() = ifacSizeBits
 
     private enum class ReconnectState {
         IDLE,
@@ -189,26 +178,17 @@ class TCPClientInterface(
         }
     }
 
-    // A peer that never sends a closing FLAG must not grow the deframer without limit:
-    // one MTU of payload escapes to at most twice its size.
-    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = 2 * hwMtu + 16) { data ->
+    // Framer and deframer are selected once from useKissFraming; the deframer bounds
+    // (KISS decode cap at HW_MTU, HDLC escaped-buffer cap 2*HW_MTU+16) derive from hwMtu.
+    private val framer: (ByteArray) -> ByteArray = streamFramer(useKissFraming)
+    private val deframer: DeframerFeed =
+        streamDeframer(useKissFraming, hwMtu, ifacSize = { ifacSize }) { data ->
         val frameNum = framesReceived.incrementAndGet()
         if (DEBUG) {
+            val tag = if (useKissFraming) " (KISS)" else ""
             val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
             val suffix = if (data.size > 16) "..." else ""
-            debugLog("RECV frame #$frameNum: ${data.size} bytes, data=[$hexPreview$suffix]")
-        }
-        processIncoming(data)
-    }
-
-    // Cap decoded KISS frames at this interface's HW_MTU, matching python's
-    // `len(data_buffer) < self.HW_MTU` read-loop gate (TCPInterface.py:370).
-    private val kissDeframer = KISS.createDeframer(hwMtu) { _, data ->
-        val frameNum = framesReceived.incrementAndGet()
-        if (DEBUG) {
-            val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
-            val suffix = if (data.size > 16) "..." else ""
-            debugLog("RECV frame #$frameNum (KISS): ${data.size} bytes, data=[$hexPreview$suffix]")
+            debugLog("RECV frame #$frameNum$tag: ${data.size} bytes, data=[$hexPreview$suffix]")
         }
         processIncoming(data)
     }
@@ -403,18 +383,13 @@ class TCPClientInterface(
                         break
                     }
 
-                    // Blocking read wrapped in IO dispatcher
-                    val bytesRead = withContext(Dispatchers.IO) {
-                        inputStream.read(buffer)
-                    }
+                    // readJob runs on `ioScope`, already bound to Dispatchers.IO; read
+                    // directly rather than re-dispatching to the same dispatcher per read
+                    // (a no-op thread hop). Same rationale as upstream PR #75.
+                    val bytesRead = inputStream.read(buffer)
 
                     if (bytesRead > 0) {
-                        val data = buffer.copyOf(bytesRead)
-                        if (useKissFraming) {
-                            kissDeframer.process(data)
-                        } else {
-                            hdlcDeframer.process(data)
-                        }
+                        deframer(buffer, 0, bytesRead)
                     } else if (bytesRead == -1) {
                         // Connection closed
                         if (DEBUG) {
@@ -487,11 +462,7 @@ class TCPClientInterface(
         // even when a write is contended.
         writeLock.lockInterruptibly()
         try {
-            val framedData = if (useKissFraming) {
-                KISS.frame(data)
-            } else {
-                HDLC.frame(data)
-            }
+            val framedData = framer(data)
 
             // Get output stream once for atomic write+flush
             val outputStream = sock.getOutputStream()
@@ -605,10 +576,7 @@ class TCPClientInterface(
     }
 
     private fun log(message: String) {
-        val timestamp = java.time.LocalDateTime.now().format(
-            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-        )
-        println("[$timestamp] [$name] $message")
+        RnsLog.log(RnsLog.INFO, name, message)
     }
 
     private fun debugLog(message: String) {

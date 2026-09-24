@@ -90,6 +90,7 @@ class AnnounceFrameSizeTest {
         assertTrue(raw.size <= RnsConstants.MTU, "control announce must fit the MTU (${raw.size})")
 
         Transport.inbound(raw, iface)
+        Transport.awaitInboundIdle()
 
         assertTrue(Transport.hasPath(dest.hash), "a valid sub-MTU announce must create a path")
     }
@@ -105,6 +106,7 @@ class AnnounceFrameSizeTest {
         assertNotNull(packet, "oversized announce must still parse (the drop is a Transport policy)")
 
         Transport.inbound(raw, iface)
+        Transport.awaitInboundIdle()
 
         assertFalse(Transport.hasPath(dest.hash), "oversized announce must not create a path")
         assertFalse(

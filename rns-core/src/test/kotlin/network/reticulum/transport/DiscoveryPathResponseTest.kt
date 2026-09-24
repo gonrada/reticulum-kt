@@ -99,6 +99,7 @@ class DiscoveryPathResponseTest {
         assertTrue(Transport.hasPendingPathRequestForTest(dest.hash))
 
         Transport.inbound(signedAnnounceRaw(identity, dest), source)
+        Transport.awaitInboundIdle()
 
         assertTrue(Transport.hasPath(dest.hash), "the announce must have been processed")
         assertFalse(Transport.hasPendingPathRequestForTest(dest.hash), "the waiting entry is popped")
@@ -117,6 +118,7 @@ class DiscoveryPathResponseTest {
         val dest = foreignDestination(identity)
 
         Transport.inbound(signedAnnounceRaw(identity, dest), source)
+        Transport.awaitInboundIdle()
 
         assertTrue(Transport.hasPath(dest.hash))
         assertTrue(requester.sent.none { Packet.unpack(it)?.context == PacketContext.PATH_RESPONSE })

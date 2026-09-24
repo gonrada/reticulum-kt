@@ -54,9 +54,17 @@ class PipeInterface(
     override val bitrate: Int = bitrateEstimate
     override val hwMtu: Int = HW_MTU
 
-    // A peer that never sends a closing FLAG must not grow the deframer without limit:
-    // one MTU of payload escapes to at most twice its size.
-    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = 2 * hwMtu + 16) { data ->
+    // The tag is 8 bytes on this medium; see Interface.defaultIfacSize for why a
+    // mismatch partitions rather than degrades.
+    override val defaultIfacSize: Int
+        get() = DEFAULT_IFAC_SIZE
+
+    // Bound the deframer buffer so a peer that never sends a closing FLAG
+    // cannot grow it without limit; 2*HW_MTU covers a fully-escaped max frame.
+    private val hdlcDeframer = HDLC.createDeframer(
+        maxFrameBytes = 2 * HW_MTU + 16,
+        payloadLimit = { HW_MTU + ifacSize },
+    ) { data ->
         processIncoming(data)
     }
 
@@ -93,7 +101,7 @@ class PipeInterface(
             while (online.value && !detached.get()) {
                 val bytesRead = inputStream.read(buffer)
                 if (bytesRead == -1) break
-                hdlcDeframer.process(buffer.copyOf(bytesRead))
+                hdlcDeframer.process(buffer, 0, bytesRead)
             }
         } catch (_: IOException) {
             // Stream closed — expected on shutdown

@@ -15,11 +15,11 @@ import kotlin.concurrent.thread
  * measurement is the larger by construction (it is `max(measured, remote)`), so an
  * initiator that measures just under the floor and a responder just over it end up
  * with different keepalives, and the responder's reply throttle then skips the
- * initiator's first, on-time keepalive — by design, and identically in the reference.
- * Two cold JVMs measure ~23 ms for their first handshake on loopback and sit exactly
- * on that boundary; a warmed JVM measures a few milliseconds and is nowhere near it.
- * The reference never needs this: CPython has no warm-up cost. Kotlin-only; changes
- * no protocol behaviour.
+ * initiator's first, on-time keepalive — by design, and identically in the reference. Two
+ * cold JVMs measured ~23 ms for their first handshake on loopback and sat exactly on that
+ * boundary, failing the conformance keepalive test one run in five. A warmed JVM measures
+ * a few milliseconds and is nowhere near it. The reference never needs this: CPython has
+ * no warm-up cost. Kotlin-only; changes no protocol behaviour (see port-deviations.md).
  *
  * Cost: one keypair and a handful of operations, ~50-150 ms once, off the caller's thread.
  */
@@ -54,7 +54,11 @@ object CryptoWarmup {
             completed = true
         } catch (t: Throwable) {
             // Warm-up is best-effort; a real handshake will simply pay the cost instead.
-            println("[CryptoWarmup] crypto warm-up failed: ${t.javaClass.simpleName}: ${t.message}")
+            network.reticulum.common.RnsLog.log(
+                network.reticulum.common.RnsLog.DEBUG,
+                "CryptoWarmup",
+                "crypto warm-up failed: ${t.javaClass.simpleName}: ${t.message}",
+            )
         }
     }
 }

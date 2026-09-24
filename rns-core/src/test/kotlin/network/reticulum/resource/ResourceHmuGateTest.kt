@@ -19,7 +19,7 @@ import java.io.ByteArrayOutputStream
 import kotlin.random.Random
 
 /**
- * RESOURCE_HMU handling must mirror python's guards:
+ * RESOURCE_HMU handling must mirror python's guards —
  *  - an HMU is applied only while `waiting_for_hmu` (Resource.py:489-490);
  *  - an HMU carrying no hashes cancels the transfer (Resource.py:506-508);
  *  - a negative segment index is rejected (python would silently write at the

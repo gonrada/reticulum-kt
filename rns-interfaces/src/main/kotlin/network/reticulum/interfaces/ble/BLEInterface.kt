@@ -458,30 +458,6 @@ class BLEInterface(
         }
     }
 
-    // ---- Identity Direction Sorting ----
-
-    /**
-     * Determine if we should initiate (as central) or wait (as peripheral).
-     * Lower identity hash acts as central (initiator).
-     *
-     * Uses identity hash instead of MAC because Android cannot reliably
-     * provide the local BLE MAC address (returns 02:00:00:00:00:00).
-     *
-     * Note: This is used for deduplication logic, not initial connection decisions.
-     * Initial connections are made optimistically; sorting happens after handshake.
-     */
-    @Suppress("unused") // Reserved for Phase 22 dedup enhancements
-    private fun shouldInitiateConnection(peerIdentity: ByteArray): Boolean {
-        for (i in transportIdentity.indices) {
-            val local = transportIdentity[i].toInt() and 0xFF
-            val remote = peerIdentity[i].toInt() and 0xFF
-            if (local < remote) return true   // We are lower -> we initiate
-            if (local > remote) return false  // They are lower -> they initiate
-        }
-        // Equal identity hashes (astronomically unlikely) -- don't connect
-        return false
-    }
-
     // ---- Peer Lifecycle ----
 
     /**

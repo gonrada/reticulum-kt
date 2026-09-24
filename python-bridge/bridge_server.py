@@ -4439,8 +4439,16 @@ def cmd_rns_register_request_handler(params):
     path = params.get('path', '/test/echo')
     static_response = params.get('response_data', None)
     large_size = params.get('large_response_size', None)
+    # random_response_size: an incompressible payload of exactly this many bytes,
+    # generated once here and identified by its SHA-256 in the reply. The
+    # large_response_size pattern bz2-compresses to almost nothing, which makes
+    # it useless for a test that needs real bytes on the wire (slow-link E2E).
+    random_size = params.get('random_response_size', None)
+    random_payload = os.urandom(int(random_size)) if random_size is not None else None
 
     def response_generator(path, data, request_id, link_id, remote_identity, requested_at):
+        if random_payload is not None:
+            return random_payload
         if large_size is not None:
             # Return a deterministic payload of the requested size
             return bytes(range(256)) * (large_size // 256 + 1)
@@ -4455,7 +4463,12 @@ def cmd_rns_register_request_handler(params):
         allow=RNS.Destination.ALLOW_ALL
     )
 
-    return {'registered': True}
+    result = {'registered': True}
+    if random_payload is not None:
+        import hashlib
+        result['response_sha256'] = hashlib.sha256(random_payload).hexdigest()
+        result['response_size'] = len(random_payload)
+    return result
 
 
 def cmd_rns_link_request(params):

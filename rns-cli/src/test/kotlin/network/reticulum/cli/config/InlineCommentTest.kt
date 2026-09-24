@@ -17,15 +17,15 @@ class InlineCommentTest {
 
     @Test
     fun `an unquoted hash opens a comment`() {
-        assertEquals("passphrase = secret ", ConfigParser.stripInlineComment("passphrase = secret # the comment"))
-        assertEquals("", ConfigParser.stripInlineComment("# whole line"))
+        assertEquals("passphrase = secret ", network.reticulum.config.InterfaceConfig.stripInlineComment("passphrase = secret # the comment"))
+        assertEquals("", network.reticulum.config.InterfaceConfig.stripInlineComment("# whole line"))
     }
 
     @Test
     fun `a hash inside quotes is part of the value`() {
-        assertEquals("passphrase = \"pass#word\"", ConfigParser.stripInlineComment("passphrase = \"pass#word\""))
-        assertEquals("passphrase = 'pass#word' ", ConfigParser.stripInlineComment("passphrase = 'pass#word' # trailing"))
-        assertEquals("name = \"it's # here\"", ConfigParser.stripInlineComment("name = \"it's # here\""))
+        assertEquals("passphrase = \"pass#word\"", network.reticulum.config.InterfaceConfig.stripInlineComment("passphrase = \"pass#word\""))
+        assertEquals("passphrase = 'pass#word' ", network.reticulum.config.InterfaceConfig.stripInlineComment("passphrase = 'pass#word' # trailing"))
+        assertEquals("name = \"it's # here\"", network.reticulum.config.InterfaceConfig.stripInlineComment("name = \"it's # here\""))
     }
 
     @Test

@@ -133,7 +133,7 @@ To restore the python invariant ("the flag is true iff we're a shared-instance c
 
 **Re-evaluation:** if `rns-core` and `rns-interfaces` are ever consolidated into a single module — or if `rns-core` is taught to reference interface types directly via a stable abstract base — the factory setter / registrar machinery becomes unnecessary and `Reticulum.__init__`-equivalent direct construction (matching python exactly) becomes viable. Until then, every new caller that uses shared-instance mode needs the setter pair, and `clearPendingFactories()` should be called from any test scaffold that re-enters `Reticulum.start()` with different topology assumptions.
 
-### H1→H2 master-side mutation removed — `rns-core/.../Transport.kt::processInbound`
+### H1→H2 master-side mutation removed — `rns-core/.../Transport.kt::processInboundItem` (was `processInbound` before the async-inbound split)
 
 **Python reference:** `RNS/Transport.py:1488-1489` only — python's master-side shared-instance handling sets `packet.transport_id` (the field) on inbound packets that target a local client (`if packet.transport_id == None and for_local_client`), and never mutates `packet.raw`. Python has no equivalent for the "packet FROM a local client TO a remote destination with no `transport_id`" case because python clients always pack `HEADER_2` outbound with the master's identity as `transport_id` (`RNS/Transport.py:1097-1108`), so the master always sees `packet.transport_id != None` and routes normally.
 
@@ -177,7 +177,7 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 
 **Category:** new feature (mobile power optimization). **Rule caveat:** as written above, reason 2 requires that kotlin-only behavior "not change semantics of any code path that does exist in python" — this deviation *does* change the announce cadence of a python-existing path. It landed 2026-04-05 without an entry here; documented retroactively 2026-06-11. Owner should confirm the justification stands (process rule 3), especially given the hazard below.
 
-**Date:** code 2026-04-05 (`9b0d21a` adaptive interval, `59db315` Doze throttle); entry 2026-06-11.
+**Date:** code 2026-04-05 (adaptive interval, then the Doze throttle); entry 2026-06-11.
 
 **Tracking:** columba `docs/battery-optimization-opportunities.md` item 1 (announce-loop wakeup mechanics) and its parity note.
 
@@ -189,7 +189,7 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 
 ### remember() malformed-key gate raises IllegalArgumentException, not TypeError — `rns-core/.../identity/Identity.kt::remember`
 
-**Python reference:** `RNS/Identity.py:100-101` (1.1.3) / `:102-103` (1.3.1) — `remember()` raises `TypeError` when `len(public_key) != Identity.KEYSIZE//8` (64 bytes), so a corrupt announce can never plant an unusable key.
+**Python reference:** `RNS/Identity.py:100-101` (1.1.3) / `:102-103` (1.3.1) / `:102-103` (1.5.2, the version this port now targets) — `remember()` raises `TypeError` when `len(public_key) != Identity.KEYSIZE//8` (64 bytes), so a corrupt announce can never plant an unusable key.
 
 **Category:** language/runtime forced (exception-type idiom only; the gate condition and placement mirror python exactly).
 
@@ -199,11 +199,11 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 
 **Description:** kotlin's `remember()` previously had NO length gate (silent divergence — any key size was stored). The gate is now added to match python. Python raises `TypeError`; kotlin throws `IllegalArgumentException`, the JVM-idiomatic equivalent for an invalid argument (kotlin reserves its `TypeCastException`-family for actual cast failures, so `TypeError` has no faithful counterpart). Callers that need python parity should treat `IllegalArgumentException` from `remember()` as python's `TypeError`.
 
-**Re-evaluation:** none needed — permanent idiom mapping. NOTE (pre-existing, undocumented divergence spotted during this change, NOT introduced by it): python 1.3.1's `remember()` additionally takes `known_destinations_lock`, stores 5-element entries, and on an already-known destination UPDATES timestamp/packet_hash/public_key/app_data in place (`Identity.py:105-117`); kotlin unconditionally overwrites with a fresh `IdentityData` and has no 5th element. Functionally close but not identical (the 1.3.1 5th element survives updates). Needs its own entry or a port fix when the `remember-update-refreshes-existing-entry` conformance behavior gets exercised.
+**Re-evaluation:** none needed — permanent idiom mapping. NOTE (pre-existing, undocumented divergence spotted during this change, NOT introduced by it): python's `remember()` additionally takes `known_destinations_lock`, stores 5-element entries, and on an already-known destination UPDATES timestamp/packet_hash/public_key/app_data in place. This was recorded against 1.3.1 (`Identity.py:105-117`) and is unchanged in 1.5.2, the version this port now targets: `Identity.py:105` takes the lock, `:107` stores `[time.time(), packet_hash, public_key, app_data, 0]` for an unknown destination, and `:109-113` updates elements 0–3 of an existing entry in place, leaving element 4 untouched. Kotlin still diverges: it unconditionally overwrites with a fresh `IdentityData` and has no 5th element, so the 5th element that survives an update in python has no counterpart. Functionally close but not identical. Needs its own entry or a port fix when the `remember-update-refreshes-existing-entry` conformance behavior gets exercised.
 
 ### optimiseMtu as companion function, not instance mutator — `rns-interfaces/.../Interface.kt::Companion.optimiseMtu`
 
-**Python reference:** `RNS/Interfaces/Interface.py:140-163` (1.1.3) / `:198-221` (1.3.1) — `optimise_mtu(self)` mutates `self.HW_MTU` from a bitrate tier table, gated on `self.AUTOCONFIGURE_MTU`.
+**Python reference:** `RNS/Interfaces/Interface.py:140-163` (1.1.3) / `:198-221` (1.3.1) / `:250-264` (1.5.2, the version this port now targets) — `optimise_mtu(self)` mutates `self.HW_MTU` from a bitrate tier table, gated on `self.AUTOCONFIGURE_MTU`.
 
 **Category:** language/runtime forced.
 
@@ -233,7 +233,7 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 
 ### Blanket: python TypeError/ValueError argument guards → kotlin IllegalArgumentException — port-wide
 
-**Python reference:** recurring pattern — e.g. `Destination.py:128` (`hash`: "Invalid material supplied..."), `:365-366` (`set_proof_strategy`: "Unsupported proof strategy"), `Identity.py:101-102` (`remember`).
+**Python reference:** recurring pattern — e.g. `Destination.py:128` (`hash`: "Invalid material supplied..."), `:365-366` (`set_proof_strategy`: "Unsupported proof strategy"), `Identity.py:102-103` (`remember`). Line numbers are 1.5.2's.
 
 **Category:** language/runtime forced (exception-type idiom only).
 
@@ -315,17 +315,17 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 
 **Description:** kotlin's `autoconnect` had no Yggdrasil guard, so a discovered `BackboneInterface` reachable on a 200::/7 address (which IS in `AUTOCONNECT_TYPES`) would invoke the connect factory. The guard `if (info.reachableOn != null && DiscoveryUtil.isYggIpv6(info.reachableOn)) return` is now applied after the type/limit/dedup checks and before the factory invoke, mirroring python. `endpointHashForTest`/`autoconnectForTest` are public test seams over the existing inline endpoint-hash computation and the private `autoconnect`.
 
-### _clean_ratchets removes "not in use" ratchets (RNS 1.3.1 forward-port) — `rns-core/.../identity/Identity.kt::cleanRatchetsFromDisk`
+### _clean_ratchets removes "not in use" ratchets (parity with 1.5.2; entered as an RNS 1.3.1 forward-port) — `rns-core/.../identity/Identity.kt::cleanRatchetsFromDisk`
 
-**Python reference:** installed RNS **1.3.1** `RNS/Identity.py::_clean_ratchets` — `destination_hash = bytes.fromhex(filename); if not destination_hash in RNS.Identity.known_destinations: unknown = True`; the unlink condition is `if expired or corrupted or unknown`. The pinned `../Reticulum` checkout is **1.1.9** and its `_clean_ratchets` unlinks on `expired or corrupted` only — it has no `unknown` branch.
+**Python reference:** `RNS/Identity.py:446-482` (`_clean_ratchets`) in RNS **1.5.2**, the version this port now targets — `destination_hash = bytes.fromhex(filename)` at `:469`, `if not destination_hash in RNS.Identity.known_destinations: unknown = True; not_known += 1` / `else: unknown = False` at `:470-471`, and the unlink condition `if expired or corrupted or unknown:` at `:473-475`. History: the "not in use" branch first appeared in RNS 1.3.1, and when this entry was written the pinned `../Reticulum` checkout was **1.1.9**, whose `_clean_ratchets` unlinked on `expired or corrupted` only and had no `unknown` branch. That checkout is now 1.5.2 and does have the branch.
 
-**Category:** version-skew forward-port (conformance target is 1.3.1; the pinned source-of-truth checkout lags at 1.1.9).
+**Category:** parity with the reference — the port matches RNS 1.5.2. It was entered as a version-skew forward-port, when the conformance target was 1.3.1 and the pinned source-of-truth checkout lagged at 1.1.9; the target and the checkout are both 1.5.2 now, and the branch the port carried forward is present in it.
 
 **Date:** 2026-06-13.
 
-**Tracking:** conformance `test_identity_received_ratchet_persistence` (assertion `cleaned_removed`, "not-in-use branch, Identity.py:484-489").
+**Tracking:** conformance `test_identity_received_ratchet_persistence` (assertion `cleaned_removed`, "not-in-use branch, Identity.py:484-489" — those are 1.3.1 line numbers; the same branch is at `RNS/Identity.py:469-475` in 1.5.2).
 
-**Description:** kotlin's `cleanRatchetsFromDisk` previously deleted only expired/corrupted ratchet files. RNS 1.3.1 additionally treats a ratchet file whose hex filename decodes to a destination hash absent from `known_destinations` as "not in use" and unlinks it. The branch is `val unknown = runCatching { !knownDestinations.containsKey(file.name.hexToByteArray().toKey()) }.getOrDefault(false)`, OR'd into the existing delete condition. The hex decode is wrapped in `runCatching` so a non-hex filename is skipped (treated as known/not-unknown), mirroring python's per-file `try/except` which leaves an unparseable filename in place rather than crashing the sweep.
+**Description:** kotlin's `cleanRatchetsFromDisk` previously deleted only expired/corrupted ratchet files. RNS 1.3.1 additionally treats a ratchet file whose hex filename decodes to a destination hash absent from `known_destinations` as "not in use" and unlinks it, and RNS 1.5.2 still does (`RNS/Identity.py:469-475`), so the branch the port took forward is now plain parity with the reference rather than a forward-port ahead of it. The branch is `val unknown = runCatching { !knownDestinations.containsKey(file.name.hexToByteArray().toKey()) }.getOrDefault(false)`, OR'd into the existing delete condition. The hex decode is wrapped in `runCatching` so a non-hex filename is skipped (treated as known/not-unknown), mirroring python's per-file `try/except` which leaves an unparseable filename in place rather than crashing the sweep.
 
 ### Resource.advertise spin-wait status guards + `@Volatile status`; lock deliberately NOT added — `rns-core/.../resource/Resource.kt::advertise`, `doAdvertise`, `status`
 
@@ -342,3 +342,185 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 A residual narrow TOCTOU remains between `doAdvertise()`'s guard and the subsequent `link.registerOutgoingResource(this)`: a `cancel()` interleaved there can be overwritten by the trailing `status = ADVERTISED`. **This race is present in upstream python verbatim** (python has neither the pre-guard nor any lock, so its window is strictly wider). A `synchronized`/check-after-register-and-rollback fix would introduce atomicity python does not have — i.e. a behavioral divergence — so per the honesty rule it is **deliberately not added**. Matching python's concurrency semantics (down to its bugs) is the correct posture for the conformance port; the upstream fix belongs in RNS first.
 
 **Re-evaluation:** if upstream RNS adds a lock/guard around `__advertise_job`'s register+status-advance (closing the race in python), port that exact structure here and drop the "deliberately not added" note. Until then, do not unilaterally diverge.
+
+### Path-request frequency floors the sample span at 1 ms — `rns-interfaces/.../Interface.kt::incomingPrFrequency`
+
+**Python reference:** `RNS/Interfaces/Interface.py:366-374` (`incoming_pr_frequency`): `span = time.time() - oldest; if span <= 0: return 0; return n / span`.
+
+**Category:** language/runtime forced
+
+**Date:** 2026-09-18
+
+**Tracking:** async-inbound port (RNS 1.5.2 `preprocess_inbound` / `InboundQueues`).
+
+**Description:** python's `time.time()` is sub-microsecond, so a burst of path requests never produces a zero span and the `span <= 0` guard is dead in practice. kotlin samples `System.currentTimeMillis()`, and a real burst — several requests inside one millisecond tick — produced `span == 0`, which the literal port returned as **0 Hz**: the fastest possible burst read as no traffic and never tripped `shouldIngressLimitPr`. The span is floored at 1 ms (`maxOf(1L, elapsed)`), so such a burst reads as very fast, which is what it is. The announce-side `frequencyOf` is unaffected — it uses a mean-spacing form and was not changed here.
+
+**Re-evaluation:** if the sample deques move to `System.nanoTime()` the floor becomes unnecessary and the literal `<= 0` guard can return.
+
+### A failed response resource fails its RECEIVING request — `rns-core/.../link/Link.kt::responseResourceConcluded`
+
+**Python reference:** `RNS/Link.py:933-937` (`response_resource_concluded`, failure branch) calls `pending_request.request_timed_out(None)`, and `request_timed_out` (`Link.py:1416-1417`) acts only when `status == DELIVERED`. A receipt whose response resource has started arriving is `RECEIVING` (`response_resource_progress`, `Link.py:1439`), so in the reference a response resource that fails leaves the request pending in `RECEIVING` for the life of the link and never fires `failed_callback`.
+
+**Category:** language/runtime forced (a behavioural gap in the reference that the port does not reproduce; kept as the only path that fails a receiving request)
+
+**Date:** 2026-09-22
+
+**Tracking:** field report: a live file download over a high-latency link was failed by the request budget while the transfer was healthy; `SlowLinkE2ETest` reproduces it.
+
+**Description:** kotlin's `responseResourceConcluded` calls `requestFailed()` on the matching pending request when the resource concludes with any status but `COMPLETE`, whatever the receipt's status. That is the one place a `RECEIVING` request can fail. The watchdog's `checkRequestTimeouts` matches the reference: it skips `RECEIVING` receipts, because once the response is arriving as a resource the request budget (`rtt * traffic_timeout_factor + RESPONSE_MAX_GRACE_TIME * 1.125`) no longer applies in python and the resource watchdog owns the transfer. Before that the budget was applied to every pending receipt, so a download longer than about twenty seconds on a Tor link (RTT 1.4 s) was failed and its resource torn down as a consequence. `LinkRequestTimeoutTest` pins both halves.
+
+The same asymmetry covers a packet-sized request that is never answered: the reference's `request_timed_out` requires `DELIVERED`, and a packet-sized request never reaches that state (only `request_resource_concluded` sets it, `Link.py:1390`), so such a request stays `SENT` in `pending_requests` for the life of the link and `failed_callback` never fires. The port's `checkRequestTimeouts` fails a `SENT` receipt once its budget has elapsed.
+
+**Re-evaluation:** if the reference makes `request_timed_out` (or the failure branch of `response_resource_concluded`) act on `RECEIVING`, this entry becomes a plain parity statement and can be removed.
+
+### Pending requests fail when the link closes — `rns-core/.../link/Link.kt::teardownInternal`
+
+**Python reference:** `RNS/Link.py:704-730` (`link_closed`) cancels the link's resources and shuts the channel; `pending_requests` is untouched. A packet-sized request in flight stays `SENT` forever, because `request_timed_out` (`Link.py:1416-1417`) acts only on `DELIVERED`.
+
+**Category:** language/runtime forced (a behavioural gap in the reference that the port does not reproduce)
+
+**Date:** 2026-09-22
+
+**Tracking:** the timer inventory against the reference (pending requests at link close); `LinkTeardownPendingRequestsTest`.
+
+**Description:** `teardownInternal` fails every receipt still in `pendingRequests` after the resources are cancelled, so `failed_callback` fires once for each request the link took down with it. `RequestReceipt.requestFailed` is idempotent (a FAILED or READY receipt is left alone), so a request already failed through its response resource is not reported twice.
+
+**Re-evaluation:** if the reference's `link_closed` starts failing pending requests, this entry becomes a parity statement and can be removed.
+
+### Inbound queue seams: `useInboundQueue`, `awaitInboundIdle`, `inboundQueueSnapshot` — `rns-core/.../Transport.kt`
+
+**Python reference:** `RNS/Transport.py:141` (`USE_INBOUND_QUEUE`), `:1891-1911` (`preprocess_inbound` hand-off, `inbound_job`). No python equivalent for the other two.
+
+**Category:** new feature
+
+**Date:** 2026-09-18
+
+**Tracking:** async-inbound port; conformance bridge `inject_external` / `build_masked`.
+
+**Description:** `useInboundQueue` mirrors the reference's `USE_INBOUND_QUEUE` flag exactly (default true; false runs preprocess+process inline on the caller's thread under the jobs lock). `awaitInboundIdle(timeoutMillis)` and `inboundQueueSnapshot()` are kotlin-only: the first blocks until every packet accepted by `inbound()` has been fully processed, the second reports queue heights and drop counts. They exist because `inbound()` no longer has an observable effect when it returns; the reference bridge copes by polling `Transport.has_path` with a timeout (`_await_path`), and unit tests there sleep. The seams give the same synchronization exactly instead of approximately. Neither changes any python-path semantics: `awaitInboundIdle` only reads a counter that the queue path maintains, and `inboundQueueSnapshot` is read-only.
+
+**Re-evaluation:** none needed; retire `awaitInboundIdle` only if every caller (bridge, unit tests) moves to event-driven observation.
+
+### Split transfers keep the payload in memory instead of a tempfile — `rns-core/.../resource/Resource.kt::initializeForSending`, `buildNextSegment`, `prepareNextSegment`
+
+**Python reference:** `RNS/Resource.py:275-322, 765-805`. A payload above `MAX_EFFICIENT_SIZE` is spilled to a `tempfile.TemporaryFile`; each segment seeks to its range and reads it; the file is closed on the final segment's proof or on cancel.
+
+**Category:** language/runtime forced (a memory-management strategy of the reference, not protocol behaviour)
+
+**Date:** 2026-09-23 (upstream's own completion of split transfers is tempfile-backed and was not taken)
+
+**Tracking:** `ResourceSegmentationTest`, `ResourceSenderRecoveryTest`.
+
+**Description:** the port keeps one reference to the caller's byte array as the transfer's `segmentSource`; every segment slices its range from it (`buildNextSegment`), the next segment is prepared in the background at advertise time, and `validateProof` waits for it with a bound and cancels if it never appears. The wire behaviour is the reference's to the byte (segment sizes, `first_read_size = MAX_EFFICIENT_SIZE - metadata block`, `original_hash` chained from the root, `has_metadata` on continuations); the reference's own tests for the split path pass against it. The tempfile exists to keep the payload off the Python heap; on the JVM the caller already holds the array, so a spill would add a whole-payload disk write per transfer, a read per segment and a temp-file lifecycle that leaks on a crash, for memory the caller has not released. On Android that is flash writes into app storage on every large send. The metadata-budget guard (a metadata block that leaves the first segment no room throws `IllegalArgumentException`, where the reference's negative read raises `ValueError`) is kept.
+
+**Re-evaluation:** if a consumer needs to send payloads it cannot hold in memory, a file-backed `segmentSource` (the retained `inputFile` path) is the place to add it; the segment arithmetic is shared.
+
+### Receive-side split transfers are bounded and link-scoped — `rns-core/.../resource/Resource.kt::assemble`, `Link.segmentAccumulators`, `ResourceConstants.SEGMENT_ACCUMULATOR_*`
+
+**Python reference:** `RNS/Resource.py:200, 721-757` (each completed segment is appended to a file under `storagepath` keyed by the original hash; unlinked on the last segment), `RNS/Reticulum.py:157, 1239-1245` (`RESOURCE_CACHE = 24 h` sweep of stale files).
+
+**Category:** language/runtime forced
+
+**Date:** 2026-09-18
+
+**Tracking:** the unbounded receive-side segment accumulator (High) and its link scoping.
+
+**Description:** python spills segments to disk, so an unfinished split transfer costs free disk space until the daily sweep. This port reassembles in memory, and the literal equivalent — a process-wide map keyed by the sender-supplied original hash — retained heap for the life of the process: ~64 MiB per ~15 packets from any peer holding a link on a resource-accepting destination, with no ceiling. Four departures, none expressible as disk semantics on a JVM heap: (1) the accumulation is owned by the `Link` and released on teardown; (2) it expires after `SEGMENT_ACCUMULATOR_MAX_IDLE_MS` (24 h, python's sweep interval); (3) a transfer may not exceed `MAX_ACCUMULATED_TRANSFER_SIZE` (128 MiB) nor a link's total `MAX_ACCUMULATED_LINK_SIZE` (256 MiB) — over either, the transfer is marked CORRUPT and the link rejected and torn down, as the decompression-bomb path already does; (4) segments must arrive with a monotonic `i` and a constant `l` per transfer, which the reference sender guarantees and python does not check. Also, the app-visible `resource_concluded` callback fires only on the final segment (python `Resource.py:738-751`); the link-level bookkeeping still runs per segment.
+
+**Re-evaluation:** if the receive side ever spills to a temp file under `storagePath` as python does, (2)–(3) can revert to python's disk-bounded behaviour; (1) and (4) should stay.
+
+### Test seams require opt-in — `rns-core/.../RnsTestSeam.kt`, the `*ForTest` members and taps it annotates
+
+**Python reference:** none; the reference has no test-only members in its published API.
+
+**Category:** new feature
+
+**Date:** 2026-09-18
+
+**Tracking:** test seams reachable from application code (Medium).
+
+**Description:** the conformance bridge is a separate Gradle module and cannot see `internal` members, so the seams it drives — forge a path-table entry, disable proof validation, lift the decompression bound, inject a ratchet, tap the inbound path, and so on — are public in the published `rns-core`. `@RnsTestSeam` is a `@RequiresOptIn(level = ERROR)` marker on the ones that weaken a security property when application code calls them. Every module in this build passes `-opt-in=network.reticulum.RnsTestSeam` (root `build.gradle.kts`), so nothing changes here; a consumer of the published artifact gets a compile error at the call site unless it opts in explicitly. No python code path is affected. The read-only `*ForTest` getters are not annotated.
+
+**Re-evaluation:** the stronger form is `internal` plus `-Xfriend-paths` for the bridge, or moving the bridge into a `testFixtures` source set; either retires the marker.
+
+### Crypto warm-up at Transport.start — `rns-core/.../crypto/CryptoWarmup.kt`, called from `Transport.start`
+
+**Python reference:** none. CPython has no JIT and no class-loading cost on the first use of a primitive.
+
+**Category:** language/runtime forced
+
+**Date:** 2026-09-19
+
+**Tracking:** keepalive-reply throttle follow-up; conformance `test_initiator_keepalive_holds_active_link`.
+
+**Description:** each end of a link derives its keepalive from its own RTT measurement (`Link.__update_keepalive`, floored at KEEPALIVE_MIN below ~24 ms), and the responder's measurement is `max(measured, remote)`, so it is never the smaller. An initiator just under the floor and a responder just over it therefore run different keepalives, and the responder's reply throttle skips the initiator's first keepalive — the reference does exactly this too. Two cold JVMs measure ~23 ms on loopback for their first handshake, purely from class loading and JIT of Ed25519, X25519, HKDF and AES, and sit on that boundary; a warmed JVM measures a few milliseconds. `CryptoWarmup.runAsync()` exercises those primitives once on a daemon thread when Transport starts. No protocol behaviour changes; only the first handshake's latency does.
+
+**Re-evaluation:** if the port ever moves to a runtime with no warm-up cost (native image, or a provider that is not JIT-sensitive), this can go.
+
+### AX.25 callsigns are checked for character set, not only length — `rns-interfaces/.../kiss/Ax25.kt::validateCallsign`
+
+**Python reference:** `AX25KISSInterface.py:136-137` raises only when the callsign is shorter than 3 or longer than 6 characters.
+
+**Category:** stricter than the reference, deliberately
+
+**Description:** an AX.25 address field carries each callsign character shifted left by one bit, so a
+character outside A-Z and 0-9 encodes to a byte that no receiver parses as the intended callsign.
+The reference accepts such a callsign and transmits a malformed address; this port rejects it at
+construction with a message naming the offending value, because the failure is otherwise silent and
+shows up only as a peer that never answers. The length rule is the reference's.
+
+**Re-evaluation:** if the reference ever validates the character set itself, this entry goes and the
+check becomes parity.
+
+### KISS flow-control gate: bounded queue, and a timeout not gated on an idle read — `rns-interfaces/.../kiss/KissInterface.kt::processOutgoing`, `readLoopBody`, `OUTBOUND_QUEUE_CAPACITY`
+
+**Python reference:** `KISSInterface.py:254-290` (`process_outgoing`, `queue`, `process_queue` —
+`self.packet_queue` is a plain list, appended to at `:282` with no cap) and
+`KISSInterface.py:331, 340-344` (the flow-control timeout is checked inside the `else:` of `if
+self.serial.in_waiting:`, i.e. only when there was nothing to read).
+
+**Category:** stricter than the reference, deliberately
+
+**Date:** 2026-09-24
+
+**Description:** two changes to the same gate, both hardening rather than protocol behaviour.
+
+*Bound.* Frames handed down while `interface_ready` is false are queued. The reference queue is
+unbounded, so a gate that never reopens — a TNC that does not implement `CMD_READY`, or one whose
+READY is lost — grows it for as long as Transport keeps producing. This port caps it at
+`OUTBOUND_QUEUE_CAPACITY` frames and drops the newest past the cap, matching how the inbound path
+already drops rather than blocks. Below the cap the behaviour is byte-for-byte the reference's:
+same FIFO, same one-frame-per-unlock release in `process_queue`.
+
+*Timeout.* The reference's flow-control timeout is a safety valve for hardware that missed READY,
+but it is evaluated only on an idle read, so a peer that keeps bytes in the receive buffer keeps the
+valve from ever being reached and the gate stays shut for as long as it talks. This port evaluates
+it once per read-loop iteration regardless of whether the iteration read anything. The condition is
+a strict superset of the reference's — it still fires on an idle line, at the same
+`flow_control_timeout` — and it cannot release faster than one frame per timeout, because the
+release re-locks the gate and restamps the lock time exactly as the reference does.
+
+**Re-evaluation:** if the reference bounds `packet_queue` or moves its timeout check out of the
+`in_waiting` else-branch, drop this entry and take the reference's own cap and placement.
+
+### A buffered stream write fails on a closed link instead of blocking — `rns-core/.../channel/Buffer.kt::RawChannelWriter.write`, `ChannelOutlet.isClosed`
+
+**Python reference:** `Buffer.py:232-267` — `RawChannelWriter.write` sends one chunk and returns 0
+when the channel refuses it (`ME_LINK_NOT_READY`), leaving `io.BufferedWriter` to re-drive the
+partial write (`Buffer.py:346`). `Channel.py:495-504` raises that condition whenever
+`is_ready_to_send()` is false, which `Channel.py:399-411` reports both terminally and transiently.
+
+**Category:** stricter than the reference, deliberately
+
+**Description:** a write to a stream whose link has closed can never complete. The reference does
+not detect that: `io.BufferedWriter` re-drives a zero return in a tight loop for as long as the
+process lives, so an application writing to a dead link hangs there. This port keeps the retry, so
+a busy link still blocks as it should, but fails with an IOException once the link reports CLOSED,
+which turns an indefinite hang into an error the caller can act on. The distinction needs a signal
+the reference does not have: its `is_usable` returns True unconditionally (`Channel.py:579`, with
+its own note that it should track link status), so a new `isClosed` on the outlet carries it, and
+the link's outlet answers it from the link's own state. Channel readiness is untouched and still
+matches the reference.
+
+**Re-evaluation:** if the reference ever makes `is_usable` track link status, `isClosed` becomes
+its mirror and this entry narrows to the writer's failure behaviour alone.

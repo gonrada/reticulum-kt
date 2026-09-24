@@ -7,15 +7,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import network.reticulum.common.RnsLog
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.net.SocketException
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.channels.SocketChannel
@@ -83,7 +81,12 @@ class LocalClientInterface : Interface {
 
     private var socket: Socket? = null
 
-    private val writing = AtomicBoolean(false)
+    // Serializes concurrent writes to the socket. Was an AtomicBoolean check-then-set with a
+    // 10ms Thread.sleep busy-spin — racy (two threads can pass the check before either sets
+    // the flag, interleaving HDLC frame bytes on the socket) and slow (10ms floor per
+    // contended turn). A ReentrantLock gives real mutual exclusion and wakes immediately.
+    // Same fix as TCPClientInterface.
+    private val writeLock = java.util.concurrent.locks.ReentrantLock()
     private val reconnecting = AtomicBoolean(false)
     private val neverConnected = AtomicBoolean(true)
     private val isSharedInstanceClient = AtomicBoolean(false)
@@ -94,7 +97,7 @@ class LocalClientInterface : Interface {
 
     // Bounded like python LocalInterface.py:79-80 (ReceiveBuffer(mtu=HW_MTU,
     // max_frame_len=HW_MTU)), whose util/HDLC.py:81-83 discards an unterminated run
-    // longer than 2*HW_MTU. An unbounded deframer let any local process grow this
+    // longer than 2*HW_MTU. An unbounded deframer let any local client grow this
     // buffer without limit by never sending a closing FLAG.
     private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = MAX_FRAME_BYTES) { data ->
         processIncoming(data)
@@ -311,15 +314,15 @@ class LocalClientInterface : Interface {
         try {
             while (online.value && !detached.get()) {
                 val sock = socket ?: break
-                // Blocking read wrapped in IO dispatcher
-                val bytesRead = withContext(Dispatchers.IO) {
-                    sock.getInputStream().read(buffer)
-                }
+                // The enclosing coroutine is launched on `ioScope`, already bound to
+                // Dispatchers.IO; read directly rather than re-dispatching to the same
+                // dispatcher every iteration (a no-op thread hop). Matches python's direct
+                // `LocalInterface.py:302 self.socket.recv(4096)`. See upstream PR #75.
+                val bytesRead = sock.getInputStream().read(buffer)
 
                 if (bytesRead > 0) {
-                    val data = buffer.copyOf(bytesRead)
-                    log("Received $bytesRead bytes")
-                    hdlcDeframer.process(data)
+                    logDebug { "Received $bytesRead bytes" }
+                    hdlcDeframer.process(buffer, 0, bytesRead)
                 } else if (bytesRead == -1) {
                     // Connection closed
                     log("Connection closed by remote (read returned -1)")
@@ -365,15 +368,12 @@ class LocalClientInterface : Interface {
             throw IllegalStateException("Interface is not online")
         }
 
-        while (writing.get()) {
-            Thread.sleep(10)
-        }
-
+        // lockInterruptibly() keeps the old busy-spin's InterruptedException path, so a
+        // stop()-style teardown can still interrupt a contended writer (see TCPClientInterface).
+        writeLock.lockInterruptibly()
         try {
-            writing.set(true)
-
             val framedData = HDLC.frame(data)
-            log("Sending ${framedData.size} bytes (${data.size} unframed)")
+            logDebug { "Sending ${framedData.size} bytes (${data.size} unframed)" }
 
             socket?.getOutputStream()?.write(framedData)
             socket?.getOutputStream()?.flush()
@@ -396,7 +396,7 @@ class LocalClientInterface : Interface {
 
             throw e
         } finally {
-            writing.set(false)
+            writeLock.unlock()
         }
     }
 
@@ -434,10 +434,12 @@ class LocalClientInterface : Interface {
     fun isReconnecting(): Boolean = reconnecting.get()
 
     private fun log(message: String) {
-        val timestamp = java.time.LocalDateTime.now().format(
-            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-        )
-        println("[$timestamp] [$name] $message")
+        RnsLog.log(RnsLog.INFO, name, message)
+    }
+
+    /** Lazy DEBUG log for per-frame hot paths — the message is built only when enabled. */
+    private inline fun logDebug(message: () -> String) {
+        RnsLog.log(RnsLog.DEBUG, name, message)
     }
 
     override fun toString(): String {

@@ -1,7 +1,7 @@
 package network.reticulum.cli.config
 
+import network.reticulum.interfaces.backbone.BackboneInterface
 import network.reticulum.interfaces.tcp.TCPClientInterface
-import network.reticulum.interfaces.tcp.TCPServerInterface
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
@@ -31,6 +31,39 @@ class InterfaceConfigFactoryTest {
 
         val iface = InterfaceConfigFactory.createTcpClient(config) as TCPClientInterface
         assertEquals(7, iface.configuredMaxReconnectAttempts())
+    }
+
+    @Test
+    fun `Backbone interface is created from config`() {
+        val config = InterfaceConfig(
+            name = "TestBackbone",
+            type = "BackboneInterface",
+            options = mapOf(
+                "listen_ip" to "127.0.0.1",
+                "listen_port" to 0,
+            ),
+        )
+        val iface = InterfaceConfigFactory.createBackbone(config) as BackboneInterface
+        assertEquals("TestBackbone", iface.name)
+    }
+
+    @Test
+    fun `Backbone type dispatches through createInterface`() {
+        val config = InterfaceConfig(
+            name = "DispatchBackbone",
+            type = "BackboneInterface",
+            options = mapOf("listen_ip" to "127.0.0.1", "listen_port" to 0),
+        )
+        assertNotNull(
+            InterfaceConfigFactory.createInterface(config),
+            "BackboneInterface config should produce an interface ref",
+        )
+    }
+
+    @Test
+    fun `Backbone requires listen_port`() {
+        val config = InterfaceConfig(name = "NoPort", type = "BackboneInterface", options = emptyMap())
+        assertNull(InterfaceConfigFactory.createBackbone(config))
     }
 
     @Test
@@ -180,53 +213,95 @@ class InterfaceConfigFactoryTest {
     }
 
     @Test
-    fun `TCP server receives IFAC credentials from config`() {
+    fun `SerialInterface is created from its python config keys without opening the port`() {
+        val config = InterfaceConfig(
+            name = "Wire",
+            type = "SerialInterface",
+            options = mapOf("port" to "/dev/ttyNONE0", "speed" to 115200, "databits" to 8, "parity" to "N", "stopbits" to 1),
+        )
+        assertEquals(InterfaceType.SERIAL, InterfaceType.fromConfigName(config.type))
+        val iface = InterfaceConfigFactory.createSerial(config) as network.reticulum.interfaces.serial.SerialInterface
+        assertEquals("Wire", iface.name)
+        assertEquals(115200, iface.bitrate)
+        assertEquals(564, iface.hwMtu)
+        assertNull(InterfaceConfigFactory.createSerial(InterfaceConfig(name = "NoPort", type = "SerialInterface", options = emptyMap())))
+    }
+
+    @Test
+    fun `KISS and AX25KISS interfaces are created from their python config keys`() {
+        val kiss = InterfaceConfig(
+            name = "Tnc",
+            type = "KISSInterface",
+            options = mapOf("port" to "/dev/ttyNONE1", "speed" to 9600, "preamble" to 150, "flow_control" to true, "id_interval" to 600, "id_callsign" to "N0CALL"),
+        )
+        val iface = InterfaceConfigFactory.createKiss(kiss, ax25 = false) as network.reticulum.interfaces.kiss.KissInterface
+        assertEquals("Tnc", iface.name)
+        assertEquals(9600, iface.bitrate)
+
+        val ax25 = InterfaceConfig(
+            name = "Packet",
+            type = "AX25KISSInterface",
+            options = mapOf("port" to "/dev/ttyNONE2", "callsign" to "N0CALL", "ssid" to 3),
+        )
+        assertNotNull(InterfaceConfigFactory.createKiss(ax25, ax25 = true))
+        val noCall = InterfaceConfig(name = "NoCall", type = "AX25KISSInterface", options = mapOf("port" to "/dev/ttyNONE2"))
+        assertNull(InterfaceConfigFactory.createKiss(noCall, ax25 = true), "python raises without a callsign")
+    }
+
+    @Test
+    fun `TCP server and backbone receive IFAC credentials from config`() {
         val server = InterfaceConfig(
             name = "Srv",
             type = "TCPServerInterface",
             options = mapOf("listen_ip" to "127.0.0.1", "listen_port" to 0, "network_name" to "family", "passphrase" to "familypass123test"),
         )
-        val tcp = InterfaceConfigFactory.createTcpServer(server) as TCPServerInterface
+        val tcp = InterfaceConfigFactory.createTcpServer(server) as network.reticulum.interfaces.tcp.TCPServerInterface
         assertEquals("family", tcp.ifacNetname)
         assertEquals(16, tcp.ifacSize)
         assertNotNull(tcp.ifacIdentity)
+        val backbone = InterfaceConfig(
+            name = "Bb",
+            type = "BackboneInterface",
+            options = mapOf("listen_ip" to "127.0.0.1", "listen_port" to 0, "network_name" to "family", "passphrase" to "familypass123test"),
+        )
+        val bb = InterfaceConfigFactory.createBackbone(backbone) as BackboneInterface
+        assertEquals("family", bb.ifacNetname)
+    }
+
+    @Test
+    fun `common knobs from config are applied to the interface`() {
+        val config = InterfaceConfig(
+            name = "Knobs",
+            type = "TCPClientInterface",
+            options = mapOf(
+                "target_host" to "127.0.0.1", "target_port" to 4242,
+                "interface_mode" to "roaming", "announce_cap" to 5,
+                "announce_rate_target" to 600, "announce_rate_grace" to 2,
+                "announces_to_internal" to true, "ingress_control" to false,
+            ),
+        )
+        val iface = InterfaceConfigFactory.createTcpClient(config) as TCPClientInterface
+        InterfaceConfigFactory.applyCommonKnobs(iface, config)
+        val ref = network.reticulum.interfaces.InterfaceAdapter.getOrCreate(iface)
+        assertEquals(network.reticulum.common.InterfaceMode.ROAMING, ref.mode)
+        assertEquals(0.05, ref.announceCap, 1e-9)
+        assertEquals(600, ref.announceRateTarget)
+        assertEquals(2, ref.announceRateGrace)
+        assertEquals(0, ref.announceRatePenalty, "penalty defaults to 0 once a target is set")
+        assertEquals(true, ref.announcesToInternal)
+        assertEquals(false, iface.ingressControlEnabled())
+
+        val plain = InterfaceConfig(name = "Plain", type = "TCPClientInterface", options = mapOf("target_host" to "127.0.0.1", "target_port" to 4242))
+        val untouched = InterfaceConfigFactory.createTcpClient(plain) as TCPClientInterface
+        InterfaceConfigFactory.applyCommonKnobs(untouched, plain)
+        val plainRef = network.reticulum.interfaces.InterfaceAdapter.getOrCreate(untouched)
+        assertNull(plainRef.announceRateTarget)
+        assertEquals(true, untouched.ingressControlEnabled())
     }
 
     private fun TCPClientInterface.configuredMaxReconnectAttempts(): Int? {
         val field = TCPClientInterface::class.java.getDeclaredField("maxReconnectAttempts")
         field.isAccessible = true
         return field.get(this) as Int?
-    }
-
-    @Test
-    fun `TCP client applies ingress-control knobs from config`() {
-        val config = InterfaceConfig(
-            name = "Knobs",
-            type = "TCPClientInterface",
-            options = mapOf(
-                "target_host" to "127.0.0.1",
-                "target_port" to 4242,
-                "ingress_control" to true,
-                "ic_new_time" to 900,
-                "ic_burst_freq_new" to 2.5,
-                "ic_burst_freq" to 7.5,
-                "ic_burst_hold" to 30,
-                "ic_burst_penalty" to 45,
-                "ic_held_release_interval" to 20,
-                "ic_max_held_announces" to 128,
-            ),
-        )
-
-        val iface = InterfaceConfigFactory.createTcpClient(config) as TCPClientInterface
-
-        // The reference reads these keys in seconds; the interface holds milliseconds.
-        assertEquals(true, iface.ingressControlEnabled())
-        assertEquals(900_000L, iface.icNewTimeMs)
-        assertEquals(2.5, iface.icBurstFreqNew)
-        assertEquals(7.5, iface.icBurstFreq)
-        assertEquals(30_000L, iface.icBurstHoldMs)
-        assertEquals(45_000L, iface.icBurstPenaltyMs)
-        assertEquals(20_000L, iface.icHeldReleaseIntervalMs)
-        assertEquals(128, iface.icMaxHeldAnnounces)
     }
 }

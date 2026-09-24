@@ -34,12 +34,53 @@ object RequestPolicy {
 }
 
 /**
+ * What a request handler returns, and with it how the response travels.
+ *
+ * The distinction is observable on the wire, not a convenience. A [Bytes] response is
+ * msgpack-wrapped as `[request_id, response]` and sent as a RESPONSE packet when it fits
+ * the MDU; a [File] response is always a Resource and carries its metadata in the
+ * resource's own metadata block, which the requester reads before any content arrives
+ * (python `Link.handle_request`, `Link.py:835-846`).
+ *
+ * That is why a file response can be acted on early — a receiver can size a buffer, check
+ * a filename or reject a transfer from the metadata alone, without waiting for the body.
+ * Packing the same fields into the response bytes would make them unreadable until the
+ * whole transfer completed.
+ */
+sealed interface RequestResponse {
+    /** An ordinary response: msgpack-wrapped, a packet when it fits, a Resource when not. */
+    class Bytes(val data: ByteArray) : RequestResponse
+
+    /**
+     * A file response: always a Resource, with [metadata] carried in the resource's
+     * metadata block rather than in the content.
+     */
+    class File(val content: ByteArray, val metadata: ByteArray? = null) : RequestResponse
+
+    /**
+     * A response carried as a msgpack value rather than a bin: a List, Map, Int, Long,
+     * Boolean, String, Double or null, nested freely, with ByteArray elements as bins.
+     *
+     * This is the form a python requester expects from handlers that return
+     * structured values — an LXMF propagation node answers `/offer` with `False`,
+     * `True` or a list of transient ids and `/get` with a list of messages or an
+     * integer error code, and python's `umsgpack.unpackb(...)[1]` hands those back as
+     * native types. A [Bytes] response would arrive there as `bytes` and be rejected.
+     * Packet-or-Resource sizing is the same as [Bytes].
+     */
+    class Value(val value: Any?) : RequestResponse
+}
+
+/**
  * Request handler configuration.
  *
  * @property path The request path (for reference)
- * @property responseGenerator Function to generate response:
- *   (path: String, data: ByteArray?, requestId: ByteArray, linkId: ByteArray,
- *    remoteIdentity: Identity?, requestedAt: Long) -> ByteArray?
+ * @property responseGenerator Function to generate the response. Receives
+ *   (path, data, requestId, linkId, remoteIdentity, requestedAt) and returns a
+ *   [RequestResponse], or null to answer nothing at all. `data` is the request's
+ *   data element: a msgpack bin or str arrives as its raw bytes, nil as null, and
+ *   any other value (a python peer sending a list, for instance) as the msgpack
+ *   encoding of that value, for the handler to decode.
  * @property allow Access control policy (ALLOW_NONE, ALLOW_ALL, ALLOW_LIST)
  * @property allowedList List of allowed identity hashes (only used if allow == ALLOW_LIST)
  * @property autoCompress Whether to automatically compress large responses
@@ -53,7 +94,7 @@ data class RequestHandler(
         linkId: ByteArray,
         remoteIdentity: Identity?,
         requestedAt: Long
-    ) -> ByteArray?,
+    ) -> RequestResponse?,
     val allow: Int,
     val allowedList: List<ByteArray>?,
     val autoCompress: Boolean
@@ -91,7 +132,7 @@ class Destination private constructor(
      * The full human-readable destination name.
      * Format: "app_name.aspect1.aspect2....[identity_hexhash]"
      */
-    val name: String = buildName(appName, aspects, identity)
+    val name: String = expandName(identity, appName, *aspects.toTypedArray())
 
     /**
      * The name hash (first 10 bytes of SHA-256 of name without identity).
@@ -112,21 +153,6 @@ class Destination private constructor(
      * Whether this destination accepts incoming link requests.
      */
     var acceptLinkRequests: Boolean = true
-
-    /**
-     * python Destination.max_request_size: null means unlimited. Applied by Link to the
-     * packed size of a packet request and to the advertised size of a request resource,
-     * so an application can refuse oversized requests before they are received.
-     */
-    @Volatile
-    var maxRequestSize: Int? = null
-        private set
-
-    /** python Destination.set_max_request_size (Destination.py:369). */
-    fun setMaxRequestSize(size: Int) {
-        require(size >= 0) { "Maximum request size cannot be negative" }
-        maxRequestSize = size
-    }
 
     /**
      * Callback for incoming packets. Set this to receive packets.
@@ -242,6 +268,33 @@ class Destination private constructor(
 
     /** Number of registered request handlers (python: len(dest.request_handlers)). */
     fun requestHandlerCount(): Int = requestHandlers.size
+
+    /**
+     * Snapshot of the registered request handlers as (path hash, handler) pairs — python's
+     * `dest.request_handlers` dict, which is keyed the same way.
+     *
+     * Each handler is returned as the live object, so a caller comparing
+     * `handler.allowedList` by reference against the ACL it was bound to gets the same
+     * answer the reference does.
+     */
+    fun requestHandlerEntries(): List<Pair<ByteArray, RequestHandler>> =
+        requestHandlers.map { it.key.bytes to it.value }
+
+    /**
+     * Maximum accepted inbound request size in bytes (python
+     * Destination.max_request_size). null = unlimited. When set, the Link layer
+     * rejects a request resource whose advertised size exceeds it, restoring the
+     * application's DoS control over oversized requests.
+     */
+    @Volatile
+    var maxRequestSize: Int? = null
+        private set
+
+    /** python Destination.set_max_request_size (Destination.py:369). */
+    fun setMaxRequestSize(size: Int) {
+        require(size >= 0) { "Maximum request size cannot be negative" }
+        maxRequestSize = size
+    }
 
     /** Number of cached path-response entries (python: len(dest.path_responses)). */
     fun pathResponseCount(): Int = pathResponses.size
@@ -593,13 +646,13 @@ class Destination private constructor(
                             // header cannot ask for gigabytes.
                             if (len < 0 || len > fileData.size) throw java.io.IOException("Ratchet file signature length $len exceeds the file")
                             signature = ByteArray(len)
-                            outerUnpacker.readPayload(signature!!)
+                            outerUnpacker.readPayload(signature)
                         }
                         "ratchets" -> {
                             val len = outerUnpacker.unpackBinaryHeader()
                             if (len < 0 || len > fileData.size) throw java.io.IOException("Ratchet file payload length $len exceeds the file")
                             packedRatchets = ByteArray(len)
-                            outerUnpacker.readPayload(packedRatchets!!)
+                            outerUnpacker.readPayload(packedRatchets)
                         }
                         else -> outerUnpacker.skipValue()
                     }
@@ -636,10 +689,10 @@ class Destination private constructor(
                     loadAttempt()
                 } catch (e: Exception) {
                     // Retry once after 500ms (matches Python I/O conflict handling)
-                    println("First ratchet reload attempt for $this failed. Retrying in 500ms.")
+                    if (DEBUG) println("First ratchet reload attempt for $this failed. Retrying in 500ms.")
                     Thread.sleep(500)
                     loadAttempt()
-                    println("Ratchet reload retry succeeded")
+                    if (DEBUG) println("Ratchet reload retry succeeded")
                 }
                 return true
             } catch (e: Exception) {
@@ -678,7 +731,7 @@ class Destination private constructor(
         ratchetKey = ratchetPublic
 
         // Compute ratchetId (first 10 bytes of full hash)
-        ratchetId = Hashes.fullHash(ratchetPublic).copyOf(RATCHET_ID_SIZE)
+        ratchetId = Identity.ratchetIdFor(ratchetPublic)
     }
 
     /**
@@ -762,11 +815,43 @@ class Destination private constructor(
         allow: Int = RequestPolicy.ALLOW_NONE,
         allowedList: List<ByteArray>? = null,
         autoCompress: Boolean = true
+    ): Boolean = registerResponseHandler(
+        path = path,
+        responseGenerator = { p, d, rid, lid, rid2, at ->
+            responseGenerator(p, d, rid, lid, rid2, at)?.let { RequestResponse.Bytes(it) }
+        },
+        allow = allow,
+        allowedList = allowedList,
+        autoCompress = autoCompress,
+    )
+
+    /**
+     * Register a request handler whose generator chooses how the response travels.
+     *
+     * Returning [RequestResponse.File] sends the response as a Resource carrying its own
+     * metadata block, which is the only way to put fields in front of the content rather
+     * than inside it. See [RequestResponse].
+     */
+    fun registerResponseHandler(
+        path: String,
+        responseGenerator: (
+            path: String,
+            data: ByteArray?,
+            requestId: ByteArray,
+            linkId: ByteArray,
+            remoteIdentity: Identity?,
+            requestedAt: Long
+        ) -> RequestResponse?,
+        allow: Int = RequestPolicy.ALLOW_NONE,
+        allowedList: List<ByteArray>? = null,
+        autoCompress: Boolean = true
     ): Boolean {
         require(path.isNotEmpty()) { "Invalid path specified" }
-        require(allow in listOf(RequestPolicy.ALLOW_NONE, RequestPolicy.ALLOW_ALL, RequestPolicy.ALLOW_LIST)) {
-            "Invalid request policy"
-        }
+        require(
+            allow == RequestPolicy.ALLOW_NONE ||
+                allow == RequestPolicy.ALLOW_ALL ||
+                allow == RequestPolicy.ALLOW_LIST
+        ) { "Invalid request policy" }
 
         val pathHash = Hashes.truncatedHash(path.toByteArray(Charsets.UTF_8))
         val handler = RequestHandler(
@@ -803,6 +888,10 @@ class Destination private constructor(
     }
 
     companion object {
+        // Off by default: these logs name destinations/tags and ratchet state.
+        // Opt in with -Dreticulum.destination.debug=true.
+        private val DEBUG = System.getProperty("reticulum.destination.debug", "false").toBoolean()
+
         /**
          * Ratchet key size in bytes (32 bytes for X25519).
          */
@@ -852,9 +941,7 @@ class Destination private constructor(
         /**
          * Get a ratchet ID (10-byte truncated hash of public key).
          */
-        fun getRatchetId(ratchetPublicKey: ByteArray): ByteArray {
-            return Hashes.fullHash(ratchetPublicKey).copyOf(RnsConstants.NAME_HASH_BYTES)
-        }
+        fun getRatchetId(ratchetPublicKey: ByteArray): ByteArray = Identity.ratchetIdFor(ratchetPublicKey)
 
         /**
          * Get the stored ratchet for a destination by hash.
@@ -936,13 +1023,16 @@ class Destination private constructor(
                 aspects = effectiveAspects
             )
 
-            // Auto-register inbound destinations with Transport (matches Python Destination.py:196)
-            if (direction == DestinationDirection.IN) {
-                try {
-                    Transport.registerDestination(destination)
-                } catch (_: Exception) {
-                    // Transport may not be started yet (e.g. unit tests)
-                }
+            // Auto-register the destination with Transport for ALL directions,
+            // matching python Destination.__init__ which calls
+            // Transport.register_destination(self) unconditionally (Destination.py:196).
+            // Previously only IN was registered; registration dedups by hash and
+            // local delivery still requires the private key, so registering an OUT
+            // (remote-owned) destination cannot cause misdelivery.
+            try {
+                Transport.registerDestination(destination)
+            } catch (_: Exception) {
+                // Transport may not be started yet (e.g. unit tests)
             }
 
             return destination
@@ -975,40 +1065,14 @@ class Destination private constructor(
          * Compute the name hash (first 10 bytes of SHA-256).
          *
          * python's name expansion validates components on EVERY path that
-         * builds a name (expand_name, Destination.py:102-106), so the dotted
-         * guards live here where all kotlin name/hash derivations converge.
+         * builds a name (expand_name, Destination.py:102-106); [expandName]
+         * carries those dotted guards and every kotlin name/hash derivation
+         * goes through it.
          */
         fun computeNameHash(appName: String, aspects: List<String>): ByteArray {
-            require(!appName.contains('.')) { "Dots can't be used in app names" }
-            aspects.forEach { require(!it.contains('.')) { "Dots can't be used in aspects" } }
-            val name = buildNameWithoutIdentity(appName, aspects)
+            val name = expandName(null, appName, *aspects.toTypedArray())
             return Hashes.fullHash(name.toByteArray(Charsets.UTF_8))
                 .copyOf(RnsConstants.NAME_HASH_BYTES)
-        }
-
-        /**
-         * Build the name string without identity.
-         */
-        private fun buildNameWithoutIdentity(appName: String, aspects: List<String>): String {
-            val sb = StringBuilder(appName)
-            aspects.forEach { aspect ->
-                sb.append('.').append(aspect)
-            }
-            return sb.toString()
-        }
-
-        /**
-         * Build the full name string including identity hex hash if present.
-         */
-        private fun buildName(appName: String, aspects: List<String>, identity: Identity?): String {
-            val sb = StringBuilder(appName)
-            aspects.forEach { aspect ->
-                sb.append('.').append(aspect)
-            }
-            if (identity != null) {
-                sb.append('.').append(identity.hexHash)
-            }
-            return sb.toString()
         }
 
         /**
@@ -1017,12 +1081,9 @@ class Destination private constructor(
          * @return Pair of (appName, aspects list)
          */
         fun parseFullName(fullName: String): Pair<String, List<String>> {
+            // split never returns an empty list, so parts[0] always exists.
             val parts = fullName.split('.')
-            return if (parts.isEmpty()) {
-                Pair("", emptyList())
-            } else {
-                Pair(parts[0], parts.drop(1))
-            }
+            return Pair(parts[0], parts.drop(1))
         }
 
         // ===== Static Utility Methods =====
@@ -1070,20 +1131,8 @@ class Destination private constructor(
          * @return The 16-byte destination hash
          * @throws IllegalArgumentException if app name or aspects contain dots
          */
-        fun hash(identity: Identity?, appName: String, vararg aspects: String): ByteArray {
-            // Compute name hash (without identity)
-            val nameHash = computeNameHash(appName, aspects.toList())
-
-            // Combine with identity hash if present
-            val hashMaterial = if (identity != null) {
-                nameHash + identity.hash
-            } else {
-                nameHash
-            }
-
-            // Return truncated hash (16 bytes)
-            return Hashes.truncatedHash(hashMaterial)
-        }
+        fun hash(identity: Identity?, appName: String, vararg aspects: String): ByteArray =
+            hash(identity?.hash, appName, *aspects)
 
         /**
          * python Destination.hash also accepts the raw 16-byte identity hash
@@ -1094,9 +1143,7 @@ class Destination private constructor(
             if (identityHash != null && identityHash.size != RnsConstants.TRUNCATED_HASH_BYTES) {
                 throw IllegalArgumentException("Invalid material supplied for destination hash calculation")
             }
-            val nameHash = computeNameHash(appName, aspects.toList())
-            val hashMaterial = if (identityHash != null) nameHash + identityHash else nameHash
-            return Hashes.truncatedHash(hashMaterial)
+            return computeHash(computeNameHash(appName, aspects.toList()), identityHash)
         }
 
         /**
@@ -1169,14 +1216,12 @@ class Destination private constructor(
                 )
 
                 // Check for a ratchet public key for this destination: the in-process
-                // announce cache first, then the persisted peer-ratchet store (which
-                // reads ratchets/<hash> with its expiry). Without the fallback, every
-                // send after a restart used the static identity key until the peer's
-                // next announce was heard.
+                // announce cache first, then the persisted store (python
+                // Destination.py:607 -> Identity.get_ratchet, Identity.py:485-508,
+                // which reads ratchets/<hash> with the 30-day expiry). Without the
+                // fallback, every send after a restart used the static identity key
+                // until the peer's next announce was heard.
                 val ratchet = getRatchetForDestination(hash) ?: Identity.getRatchet(hash)
-
-                // Debug logging
-                println("[Destination] encrypt() for ${hash.toHexString()}: ratchet=${if (ratchet != null) "present (${ratchet.size} bytes)" else "null"}")
 
                 // If a ratchet is available, store its ID for tracking
                 if (ratchet != null) {
@@ -1208,11 +1253,11 @@ class Destination private constructor(
      * For SINGLE destinations, tries ratchet private keys first (if available),
      * then falls back to the identity private key (unless enforceRatchets is true).
      *
-     * The decryption process:
-     * 1. If this destination has ratchet private keys, try each one in order (newest first)
-     * 2. If a ratchet successfully decrypts, store its ID in latestRatchetId
-     * 3. If all ratchets fail and enforceRatchets is false, try the base identity key
-     * 4. If enforceRatchets is true and no ratchet works, return null
+     * The ratchet trial itself lives in [Identity.decrypt] (ratchets in order,
+     * first success wins, static-key fallback unless enforceRatchets); this
+     * destination is the ratchet-id receiver, so latestRatchetId becomes the
+     * winning ratchet's id, or null when the static key was used or decryption
+     * failed (Destination.py:636,644,654; Identity.py:886-900).
      *
      * @param ciphertext The encrypted data to decrypt
      * @return The decrypted plaintext, or null if decryption fails
@@ -1228,8 +1273,13 @@ class Destination private constructor(
                 )
 
                 if (ratchets.isNotEmpty()) {
-                    // Try decryption with current in-memory ratchets
-                    var plaintext = tryDecryptWithRatchets(id, ciphertext)
+                    // Try decryption with current in-memory ratchets; python
+                    // swallows any raise here (Destination.py:635-638).
+                    var plaintext = try {
+                        decryptWithIdentity(id, ciphertext, ratchets.toList())
+                    } catch (_: Exception) {
+                        null
+                    }
 
                     // If failed and we have persistent ratchet storage (file OR store),
                     // reload and retry (matches Python: reload from disk on failure).
@@ -1238,26 +1288,21 @@ class Destination private constructor(
                             network.reticulum.transport.Transport.destinationRatchetStore != null)
                     ) {
                         try {
-                            println("Decryption with ratchets failed on $this, reloading ratchets from storage and retrying")
+                            if (DEBUG) println("Decryption with ratchets failed on $this, reloading ratchets from storage and retrying")
                             reloadRatchets()
-                            plaintext = tryDecryptWithRatchets(id, ciphertext)
+                            plaintext = decryptWithIdentity(id, ciphertext, ratchets.toList())
                             if (plaintext != null) {
-                                println("Decryption succeeded after ratchet reload")
+                                if (DEBUG) println("Decryption succeeded after ratchet reload")
                             }
                         } catch (e: Exception) {
-                            println("Decryption still failing after ratchet reload: ${e.message}")
+                            if (DEBUG) println("Decryption still failing after ratchet reload: ${e.message}")
                         }
                     }
 
                     plaintext
                 } else {
                     // No ratchets available, use base identity decryption
-                    val plaintext = id.decrypt(ciphertext, null, enforceRatchets)
-                    // Clear ratchet ID since we used base key
-                    if (plaintext != null) {
-                        latestRatchetId = null
-                    }
-                    plaintext
+                    decryptWithIdentity(id, ciphertext, null)
                 }
             }
 
@@ -1285,44 +1330,17 @@ class Destination private constructor(
     }
 
     /**
-     * Try decrypting with the current in-memory ratchets list.
-     * Tests each ratchet individually and tracks which one succeeded.
-     * Falls back to base identity key if enforcement is off.
-     *
-     * @return Decrypted plaintext, or null if all attempts failed
+     * One [Identity.decrypt] call with the given ratchet list and this
+     * destination as ratchet_id_receiver, exactly as python passes
+     * `ratchet_id_receiver=self` (Destination.py:636,644,654). The receiver's
+     * result is copied into [latestRatchetId] whatever the outcome: the
+     * winning ratchet's id, or null for a static-key decrypt or a failure.
      */
-    private fun tryDecryptWithRatchets(id: Identity, ciphertext: ByteArray): ByteArray? {
-        val crypto = defaultCryptoProvider()
-
-        // Try each ratchet in order (newest first)
-        for (ratchet in ratchets) {
-            try {
-                val plaintext = id.decrypt(ciphertext, listOf(ratchet), enforceRatchets = true)
-                if (plaintext != null) {
-                    // Success! Compute and store the ratchet ID
-                    val ratchetPublic = crypto.x25519PublicFromPrivate(ratchet)
-                    latestRatchetId = Hashes.fullHash(ratchetPublic).copyOf(RATCHET_ID_SIZE)
-                    return plaintext
-                }
-            } catch (_: Exception) {
-                // Try next ratchet
-            }
-        }
-
-        // If ratchets didn't work and enforcement is off, try base key
-        if (!enforceRatchets) {
-            try {
-                val plaintext = id.decrypt(ciphertext, null, enforceRatchets = false)
-                if (plaintext != null) {
-                    latestRatchetId = null
-                    return plaintext
-                }
-            } catch (_: Exception) {
-                // Decryption failed
-            }
-        }
-
-        return null
+    private fun decryptWithIdentity(id: Identity, ciphertext: ByteArray, ratchetList: List<ByteArray>?): ByteArray? {
+        val receiver = Identity.RatchetIdReceiver()
+        val plaintext = id.decrypt(ciphertext, ratchetList, enforceRatchets, receiver)
+        latestRatchetId = receiver.latestRatchetId
+        return plaintext
     }
 
     /**
@@ -1407,7 +1425,7 @@ class Destination private constructor(
         // python raises TypeError("Unsupported proof strategy")
         // (Destination.py:365-366); a silent false-return would let a caller
         // believe an invalid strategy took effect.
-        if (strategy !in listOf(PROVE_NONE, PROVE_APP, PROVE_ALL)) {
+        if (strategy != PROVE_NONE && strategy != PROVE_APP && strategy != PROVE_ALL) {
             throw IllegalArgumentException("Unsupported proof strategy")
         }
         proofStrategy = strategy
@@ -1556,11 +1574,8 @@ class Destination private constructor(
      */
     private fun cleanStalePathResponses() {
         val now = network.reticulum.common.WallClock.nowMs()
-        val staleKeys = pathResponses.entries
-            .filter { now - it.value.first > PR_TAG_WINDOW }
-            .map { it.key }
-            .toList()
-        staleKeys.forEach { pathResponses.remove(it) }
+        // Same eviction rule as Destination.py:260-267.
+        pathResponses.entries.removeIf { now - it.value.first > PR_TAG_WINDOW }
     }
 
     /**
@@ -1659,7 +1674,7 @@ class Destination private constructor(
             val cachedData = getCachedPathResponse(tag)
             if (cachedData != null) {
                 // Use cached announce data for multi-path support
-                println("Using cached announce data for path response with tag ${tag.toHexString()}")
+                if (DEBUG) println("Using cached announce data for path response with tag ${tag.toHexString()}")
                 announceData = cachedData
                 // Determine hasRatchet from cached data - if ratchets are enabled, assume it has one
                 hasRatchet = ratchetsEnabled && ratchets.isNotEmpty()

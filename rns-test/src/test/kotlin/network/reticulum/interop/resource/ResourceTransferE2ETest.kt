@@ -301,22 +301,15 @@ class ResourceTransferE2ETest : RnsLiveTestBase() {
 
         link.setResourceStrategy(Link.ACCEPT_ALL)
 
-        // The receiver's split path: each segment arrives as its own incoming
-        // Resource (initializeFromAdvertisement builds it from the advertisement),
-        // and assemble() reassembles that segment's parts. The Kotlin->Python
-        // test covers the SENDER split path (temp-file spill + per-segment
-        // preparation); this covers the RECEIVER side (per-segment initialize +
-        // assemble).
-        //
-        // Note: the Kotlin receiver delivers each segment to the application as a
-        // SEPARATE Resource - it does not stitch segments into one payload
-        // (the pre-existing, separately-xfail'd "no segment-append" gap). We
-        // therefore collect every segment in order and concatenate here, which
-        // still exercises the per-segment receiver path and proves each segment's
-        // content is correct.
-        val segments = HashMap<Int, ByteArray>()
-        var totalSegmentsSeen = 0
-        var maxSegmentIndex = 0
+        // The receiver's split path: each segment arrives as its own advertisement and
+        // is assembled from its own parts, and the receiver joins the segments before
+        // the application sees them. As in python (Resource.py:275-322), the transfer
+        // concludes ONCE, carrying the whole payload; an application never sees a
+        // partial segment. The Kotlin->Python test covers the sender split path; this
+        // covers the receiver side.
+        var joined: ByteArray? = null
+        var segmentsAdvertised = 0
+        var conclusions = 0
         val allArrived = CountDownLatch(1)
 
         link.callbacks.resourceConcluded = { resourceObj ->
@@ -324,12 +317,10 @@ class ResourceTransferE2ETest : RnsLiveTestBase() {
             if (res != null) {
                 val data = res.data
                 if (data != null) {
-                    segments[res.segmentIndex] = data
-                    totalSegmentsSeen = res.totalSegments
-                    maxSegmentIndex = maxOf(maxSegmentIndex, res.segmentIndex)
-                    if (maxSegmentIndex == totalSegmentsSeen) {
-                        allArrived.countDown()
-                    }
+                    conclusions += 1
+                    joined = data
+                    segmentsAdvertised = res.totalSegments
+                    allArrived.countDown()
                 }
             }
         }
@@ -343,19 +334,19 @@ class ResourceTransferE2ETest : RnsLiveTestBase() {
         assertTrue(sendResult.getBoolean("sent"), "Python resource send should succeed")
 
         val received = allArrived.await(120, TimeUnit.SECONDS)
-        assertTrue(received, "Kotlin should receive all split segments within 120 seconds")
+        assertTrue(received, "Kotlin should receive the whole split transfer within 120 seconds")
 
-        assertEquals(2, totalSegmentsSeen, "payload above MAX_EFFICIENT_SIZE must be a 2-segment split")
-        assertEquals(2, segments.size, "both segments should have been received and assembled")
+        assertEquals(2, segmentsAdvertised, "payload above MAX_EFFICIENT_SIZE must be a 2-segment split")
+        assertEquals(1, conclusions, "a split transfer concludes once, with the joined payload")
 
-        // Reassemble by segment order and verify byte-exactness.
-        val reassembled = segments.entries.sortedBy { it.key }.flatMap { it.value.toList() }.toByteArray()
-        assertEquals(testData.size, reassembled.size, "reassembled size should match the payload")
+        val payload = joined
+        assertNotNull(payload, "the concluded transfer should carry the payload")
+        assertEquals(testData.size, payload!!.size, "joined size should match the payload")
         assertTrue(
-            reassembled.contentEquals(testData),
-            "concatenated split segments should match the payload (${testData.size} bytes)"
+            payload.contentEquals(testData),
+            "the joined payload should match what was sent (${testData.size} bytes)"
         )
-        println("  [Test] Python -> Kotlin split resource transfer verified! (${testData.size} bytes, ${segments.size} segments)")
+        println("  [Test] Python -> Kotlin split resource transfer verified! (${testData.size} bytes, joined)")
 
         link.teardown()
     }

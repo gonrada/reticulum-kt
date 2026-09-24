@@ -131,8 +131,8 @@ class ResourceAdvertisementUnpackTest {
     fun `unpack rejects a bin32 length the buffer cannot back without allocating`() {
         // Python's umsgpack does fp.read(n) and raises InsufficientDataException
         // without allocating; the port must return null the same way. If the
-        // guard is missing this test does not fail cleanly - it tries to
-        // allocate ~2 GiB - which is precisely the defect.
+        // guard is missing this test does not fail cleanly — it tries to
+        // allocate ~2 GiB — which is precisely the defect.
         for (key in listOf("h", "r", "o", "m", "q")) {
             val packet = packAdvWithOversizedBin(key, Int.MAX_VALUE, ByteArray(16))
             assertTrue(packet.size < 200, "test packet must be tiny, was ${packet.size}")

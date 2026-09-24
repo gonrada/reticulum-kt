@@ -9,6 +9,7 @@ import network.reticulum.cli.logging.Logger
 import network.reticulum.cli.logging.LogLevel
 import network.reticulum.interfaces.local.LocalServerInterface
 import network.reticulum.interfaces.toRef
+import network.reticulum.rpc.RpcServer
 import network.reticulum.transport.Transport
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -233,8 +234,7 @@ class DaemonRunner(
             // Compute full hash of private key (SHA-256)
             val digest = java.security.MessageDigest.getInstance("SHA-256")
             val rpcKey = digest.digest(privateKey)
-
-            rpcServer = RpcServer(port, rpcKey)
+            rpcServer = RpcServer(port, rpcKey, log = { Logger.debug(it) })
             rpcServer!!.start()
 
             Logger.notice("Started RPC server on TCP port $port")

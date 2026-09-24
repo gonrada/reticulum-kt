@@ -193,5 +193,19 @@ enum class InterfaceMode {
     ACCESS_POINT,   // WiFi-like access point
     ROAMING,        // Mobile roaming interface
     BOUNDARY,       // Network boundary
-    GATEWAY         // Gateway between networks
+    GATEWAY,        // Gateway between networks
+
+    /**
+     * An interface facing infrastructure you own rather than the wider mesh
+     * (python `MODE_INTERNAL = 0x07`, `Interface.py:51`, new in RNS 1.5.2).
+     *
+     * The mode is a label; the containment is done by two opt-in knobs on the
+     * interfaces either side of it — see [network.reticulum.interfaces.Interface
+     * .announcesFromInternal] and `announcesToInternal`. Declaring an interface
+     * internal on its own changes only one thing: announces for non-local
+     * destinations arriving from a BOUNDARY interface are not carried onto it.
+     *
+     * MUST stay last in this enum: the wire value is `ordinal + 1`.
+     */
+    INTERNAL
 }

@@ -19,10 +19,6 @@ import org.junit.jupiter.api.Test
  * python Resource.py:264-265 raises on metadata over METADATA_MAX_SIZE. Dropping it
  * silently sent a transfer whose receiver could not interpret the data; the sender must
  * hear about it instead.
- *
- * The accepted case stays under the first-segment budget: a metadata block that fills
- * MAX_EFFICIENT_SIZE is refused separately by the split path (the reference reads a
- * negative size there), which ResourceSplitMetadataBudgetGuardTest pins.
  */
 class ResourceMetadataLimitTest {
     @BeforeEach
@@ -60,11 +56,15 @@ class ResourceMetadataLimitTest {
     }
 
     @Test
-    fun `metadata within the limit is accepted`() {
+    fun `metadata that fits the first segment is accepted`() {
+        // METADATA_MAX_SIZE (16 MiB) is the reference's hard cap, but any metadata block
+        // at or above MAX_EFFICIENT_SIZE leaves the first segment no room and the
+        // reference's negative first read raises (Resource.py:303); the port throws the
+        // same way (ResourceSplitMetadataBudgetGuardTest). Half a megabyte fits.
         val resource = Resource.create(
             data = ByteArray(64) { 1 },
             link = makeLink(),
-            metadata = ByteArray(64 * 1024) { 0x2A },
+            metadata = ByteArray(512 * 1024) { 0x2A },
             advertise = false,
             autoCompress = false,
         )

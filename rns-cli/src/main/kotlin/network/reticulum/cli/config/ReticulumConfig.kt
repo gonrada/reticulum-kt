@@ -89,28 +89,24 @@ data class InterfaceConfig(
     private fun ifacCredential(vararg keys: String): String? =
         keys.mapNotNull { options[it]?.toString() }.lastOrNull { it.isNotEmpty() }
 
+    // Serial / KISS options (python SerialInterface.py:66-71, KISSInterface.py:85-97,
+    // AX25KISSInterface.py:92-105). Speeds and counts arrive as ints, ports as strings.
+    val serialPort: String? get() = options["port"]?.toString()?.takeIf { it.isNotEmpty() }
+    val serialSpeed: Int get() = (options["speed"] as? Number)?.toInt() ?: 9600
+    val serialDataBits: Int get() = (options["databits"] as? Number)?.toInt() ?: 8
+    val serialParity: String get() = options["parity"]?.toString() ?: "N"
+    val serialStopBits: Int get() = (options["stopbits"] as? Number)?.toInt() ?: 1
+    val kissPreamble: Int? get() = (options["preamble"] as? Number)?.toInt()
+    val kissTxTail: Int? get() = (options["txtail"] as? Number)?.toInt()
+    val kissPersistence: Int? get() = (options["persistence"] as? Number)?.toInt()
+    val kissSlotTime: Int? get() = (options["slottime"] as? Number)?.toInt()
+    val kissFlowControl: Boolean get() = options["flow_control"] as? Boolean ?: false
+    val kissIdInterval: Int? get() = (options["id_interval"] as? Number)?.toInt()
+    val kissIdCallsign: String? get() = options["id_callsign"]?.toString()
+    val ax25Callsign: String get() = options["callsign"]?.toString() ?: ""
+    val ax25Ssid: Int get() = (options["ssid"] as? Number)?.toInt() ?: -1
+
     // AutoInterface options
-    // Announce ingress-control knobs (python Reticulum.py: ingress_control, ic_*). Times
-    // are seconds in the file; the interface fields take milliseconds.
-    val ingressControl: Boolean? get() = when (val v = options["ingress_control"]) {
-        is Boolean -> v
-        is String -> v.trim().lowercase() in setOf("yes", "true", "on", "1")
-        else -> null
-    }
-    val icNewTimeSeconds: Double? get() = optDouble("ic_new_time")
-    val icBurstFreqNew: Double? get() = optDouble("ic_burst_freq_new")
-    val icBurstFreq: Double? get() = optDouble("ic_burst_freq")
-    val icBurstHoldSeconds: Double? get() = optDouble("ic_burst_hold")
-    val icBurstPenaltySeconds: Double? get() = optDouble("ic_burst_penalty")
-    val icHeldReleaseIntervalSeconds: Double? get() = optDouble("ic_held_release_interval")
-    val icMaxHeldAnnounces: Int? get() = optDouble("ic_max_held_announces")?.toInt()
-
-    private fun optDouble(key: String): Double? = when (val v = options[key]) {
-        is Number -> v.toDouble()
-        is String -> v.trim().toDoubleOrNull()
-        else -> null
-    }
-
     val groupId: String? get() = options["group_id"] as? String
     val discoveryPort: Int? get() = (options["discovery_port"] as? Number)?.toInt()
     val dataPort: Int? get() = (options["data_port"] as? Number)?.toInt()
@@ -181,8 +177,10 @@ enum class InterfaceType(val configName: String) {
     RNODE("RNodeInterface"),
     KISS("KISSInterface"),
     AX25_KISS("AX25KISSInterface"),
+    SERIAL("SerialInterface"),
     I2P("I2PInterface"),
     BLE("BLEInterface"),
+    BACKBONE("BackboneInterface"),
     UNKNOWN("Unknown");
 
     companion object {

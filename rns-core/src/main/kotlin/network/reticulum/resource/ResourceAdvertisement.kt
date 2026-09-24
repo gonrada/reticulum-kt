@@ -123,17 +123,15 @@ class ResourceAdvertisement private constructor() {
                 // degenerate adv with hash=ByteArray(0) and started a transfer.
                 val seenKeys = HashSet<String>()
 
-                repeat(mapSize) {
+                for (entry in 0 until mapSize) {
                     val key = unpacker.unpackString()
                     if (key in REQUIRED_KEYS) seenKeys.add(key)
                     when (key) {
                         "t" -> adv.transferSize = unpacker.unpackInt()
                         "d" -> adv.dataSize = unpacker.unpackInt()
                         "n" -> adv.numParts = unpacker.unpackInt()
-                        // Every bin field goes through readBinary, which checks the
-                        // declared length against the buffer before anything is
-                        // allocated. Fixed-size fields: h and o are full hashes, r is
-                        // RANDOM_HASH_SIZE bytes (Resource.py:1340-1342 packs
+                        // Fixed-size fields: h/o are full hashes, r is
+                        // RANDOM_HASH_SIZE bytes (Resource.py:1340-1342, packing
                         // resource.hash / random_hash / original_hash).
                         "h" -> adv.hash = readBinary(unpacker, data.size, exact = ResourceConstants.RESOURCE_HASH_LEN)
                             ?: return null
@@ -141,7 +139,7 @@ class ResourceAdvertisement private constructor() {
                             ?: return null
                         "o" -> adv.originalHash = readBinary(unpacker, data.size, exact = ResourceConstants.RESOURCE_HASH_LEN)
                             ?: return null
-                        // The hashmap slice carries at most HASHMAP_MAX_LEN entries
+                        // The hashmap slice is at most HASHMAP_MAX_LEN entries
                         // (Resource.py:1347, pack's segment slicing).
                         "m" -> adv.hashmap = readBinary(unpacker, data.size, max = HASHMAP_MAX_LEN * ResourceConstants.MAPHASH_LEN)
                             ?: return null
@@ -152,8 +150,8 @@ class ResourceAdvertisement private constructor() {
                             if (unpacker.tryUnpackNil()) {
                                 adv.requestId = null
                             } else {
-                                // A request id is a truncated hash; allow up to a
-                                // full hash but never more.
+                                // A request id is a truncated hash (16 bytes); allow
+                                // up to a full hash but never more.
                                 adv.requestId = readBinary(unpacker, data.size, max = ResourceConstants.RESOURCE_HASH_LEN)
                                     ?: return null
                             }
@@ -169,16 +167,16 @@ class ResourceAdvertisement private constructor() {
                     return null
                 }
 
-                // Reject an implausible transfer size before it reaches the
+                // Reject an implausible transfer size BEFORE it reaches the
                 // part-count allocation in Resource.initializeFromAdvertisement
-                // (arrayOfNulls of ceil(size / sdu), twice). Mirrors python
+                // (`arrayOfNulls(ceil(size/sdu))`, twice). Mirrors python
                 // `ResourceAdvertisement.unpack` (Resource.py:1363), which raises
-                // ValueError on t > MAX_EFFICIENT_SIZE*3, caught by Resource.accept
-                // and treated as a dropped advertisement. Without this a peer could
-                // advertise a size near Int.MAX_VALUE and force tens of megabytes
-                // of array allocation per advertisement. The negative guard also
-                // rejects a msgpack-signed size that would otherwise reach
-                // arrayOfNulls(negative).
+                // ValueError on `t > MAX_EFFICIENT_SIZE*3` — caught by
+                // Resource.accept and treated as a dropped advertisement. Without
+                // this a peer could advertise t≈2.1e9 and force ~75 MB of array
+                // allocation per advertisement (memory-exhaustion DoS). The
+                // negative guard also rejects a msgpack-signed size that would
+                // otherwise reach `arrayOfNulls(negative)`.
                 if (adv.transferSize < 0 ||
                     adv.transferSize > ResourceConstants.MAX_EFFICIENT_SIZE * 3
                 ) {
@@ -201,10 +199,10 @@ class ResourceAdvertisement private constructor() {
 
         /**
          * Read one msgpack bin value, refusing to allocate for a declared length
-         * that the input cannot back. msgpack-core's `readPayload(n)` allocates
-         * `new byte[n]` before reading, so a 5-byte bin32 header claiming up to
-         * 2^31-1 bytes inside a ~430-byte packet forced a multi-hundred-megabyte
-         * allocation, or an OutOfMemoryError that no `catch (Exception)` sees.
+         * that the input cannot back. msgpack-core's `readPayload(n)` does
+         * `new byte[n]` BEFORE reading, so a 5-byte bin32 header claiming up to
+         * 2^31-1 bytes inside a ~430-byte packet forced a multi-hundred-MB
+         * allocation (or an OutOfMemoryError that no `catch (Exception)` sees).
          * Python's umsgpack reads `fp.read(n)` and raises InsufficientDataException
          * without allocating; this is the equivalent.
          *

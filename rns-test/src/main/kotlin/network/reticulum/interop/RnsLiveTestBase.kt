@@ -50,6 +50,14 @@ abstract class RnsLiveTestBase : InteropTestBase() {
     protected open val appName: String = "testapp"
     protected open val aspects: Array<String> = arrayOf("link", "test")
 
+    /**
+     * Shape the Kotlin-to-Python link (see [ShapedTcpRelay]). Null, the default, is a
+     * plain loopback connection; a subclass overrides this to run its cases over a
+     * slow link with a real RTT and a bounded byte rate.
+     */
+    protected open val linkShaping: LinkShaping? = null
+    protected var shapedRelay: ShapedTcpRelay? = null
+
     // TCP port for testing
     protected val tcpPort: Int = 15242 + (System.currentTimeMillis() % 1000).toInt()
 
@@ -84,11 +92,18 @@ abstract class RnsLiveTestBase : InteropTestBase() {
         println("  [Setup] Kotlin Reticulum started")
 
         // 4. Create TCP client interface to Python
-        println("  [Setup] Creating TCP client to Python on 127.0.0.1:$tcpPort...")
+        val connectPort =
+            linkShaping?.let { shaping ->
+                val relay = ShapedTcpRelay("127.0.0.1", tcpPort, shaping).also { it.start() }
+                shapedRelay = relay
+                println("  [Setup] Shaped relay on 127.0.0.1:${relay.port} -> $tcpPort: one-way ${shaping.oneWayDelayMs} ms, ${shaping.bitrateBps} bit/s")
+                relay.port
+            } ?: tcpPort
+        println("  [Setup] Creating TCP client to Python on 127.0.0.1:$connectPort...")
         kotlinTcpClient = TCPClientInterface(
             name = "E2E Test Client",
             targetHost = "127.0.0.1",
-            targetPort = tcpPort
+            targetPort = connectPort
         )
 
         // 5. Register interface with Transport
@@ -130,7 +145,7 @@ abstract class RnsLiveTestBase : InteropTestBase() {
 
         // Wait for announce propagation
         println("  [Setup] Waiting for network to stabilize...")
-        Thread.sleep(2000)
+        Thread.sleep(if (linkShaping != null) 5000 else 2000)
 
         println("  [Setup] RNS live test infrastructure ready")
     }
@@ -139,6 +154,7 @@ abstract class RnsLiveTestBase : InteropTestBase() {
     fun teardownLiveRns() {
         println("  [Teardown] Stopping TCP client...")
         kotlinTcpClient?.detach()
+        shapedRelay?.close()
 
         println("  [Teardown] Stopping Kotlin Reticulum...")
         Reticulum.stop()

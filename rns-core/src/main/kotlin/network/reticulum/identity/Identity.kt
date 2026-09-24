@@ -10,6 +10,7 @@ import network.reticulum.crypto.Hashes
 import network.reticulum.crypto.Token
 import network.reticulum.crypto.defaultCryptoProvider
 import org.msgpack.core.MessagePack
+import org.msgpack.core.MessageUnpacker
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.AtomicMoveNotSupportedException
@@ -74,7 +75,21 @@ class Identity private constructor(
         val timestamp: Long,
         val packetHash: ByteArray,
         val publicKey: ByteArray,
-        val appData: ByteArray?
+        val appData: ByteArray?,
+        /**
+         * When this destination's identity was last USED, which is what decides how long
+         * it is worth keeping (python `known_destinations[...][4]`, `Identity.py:107`).
+         *
+         * Three meanings in one field, matching the reference:
+         *   0   never used — forgotten once its announce ages past UNUSED_DESTINATION_LINGER
+         *  >0   last-use time — kept until DESTINATION_TIMEOUT * 1.25 past that
+         *  -1   retained — never evicted, whatever its age
+         *
+         * Without it every entry looks never-used, so an identity a running application is
+         * actively talking to is evicted on the same schedule as one that merely announced
+         * once and was never touched.
+         */
+        val lastUsed: Long = 0L,
     ) {
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
@@ -82,16 +97,21 @@ class Identity private constructor(
             return timestamp == other.timestamp &&
                 packetHash.contentEquals(other.packetHash) &&
                 publicKey.contentEquals(other.publicKey) &&
-                (appData?.contentEquals(other.appData ?: byteArrayOf()) ?: (other.appData == null))
+                appData.contentEquals(other.appData) &&
+                lastUsed == other.lastUsed
         }
 
         override fun hashCode(): Int {
             var result = timestamp.hashCode()
             result = 31 * result + packetHash.contentHashCode()
             result = 31 * result + publicKey.contentHashCode()
-            result = 31 * result + (appData?.contentHashCode() ?: 0)
+            result = 31 * result + appData.contentHashCode()
+            result = 31 * result + lastUsed.hashCode()
             return result
         }
+
+        /** Marked never to be evicted (python `last_use == -1`). */
+        val retained: Boolean get() = lastUsed < 0
     }
 
     companion object {
@@ -108,11 +128,12 @@ class Identity private constructor(
         /**
          * Storage for ratchets: destination_hash -> the current (ratchet, timestamp).
          *
-         * Invariant: each list holds at most ONE entry. The reference keeps exactly
-         * one ratchet per destination and a new ratchet replaces the old one;
-         * accumulating them here let any announcer grow this map by one entry per
-         * announce for RATCHET_EXPIRY. The list type is kept so the existing
-         * callers and locking are unchanged.
+         * Invariant: each list holds at most ONE entry. Python keeps exactly one
+         * ratchet per destination (`known_ratchets[destination_hash] = ratchet`,
+         * Identity.py:419) and a new ratchet replaces the old one; accumulating
+         * them here let any announcer grow this map by one entry per announce for
+         * RATCHET_EXPIRY. The list type is kept so the existing callers and
+         * locking are unchanged.
          */
         private val destinationRatchets = ConcurrentHashMap<ByteArrayKey, MutableList<RatchetEntry>>()
 
@@ -297,10 +318,16 @@ class Identity private constructor(
          * @param hash The destination hash to look up
          * @return The Identity, or null if not found
          */
-        fun recall(hash: ByteArray): Identity? {
+        @JvmOverloads
+        fun recall(hash: ByteArray, noUse: Boolean = false): Identity? {
             // Check known destinations cache first
             val data = knownDestinations[hash.toKey()]
             if (data != null) {
+                // A successful recall IS the use (python Identity.py:135). Callers that
+                // are only inspecting the table — the announce-retransmit job checking
+                // whether a path still resolves, say — pass noUse so a housekeeping read
+                // does not look like an application reaching for the destination.
+                if (!noUse) markDestinationUsed(hash)
                 return try {
                     fromPublicKey(data.publicKey)
                 } catch (e: Exception) {
@@ -423,6 +450,155 @@ class Identity private constructor(
         fun knownDestinationCount(): Int = knownDestinations.size
 
         /**
+         * Evict stale known destinations to bound the in-memory identity caches
+         * (parity with python Identity.clean_known_destinations, Identity.py:284-349).
+         *
+         * A remote can mint fresh identities cheaply and their announces propagate
+         * multi-hop, so without eviction [knownDestinations], [identityHashIndex]
+         * and [destinationRatchets] grow monotonically per validated announce —
+         * unbounded memory growth on a long-running node on a busy network.
+         *
+         * All three of python's arms are ported (Identity.py:322-339): an entry with an
+         * active path is kept; a retained entry (`lastUsed == -1`, set by
+         * [retainDestinationData]) is kept whatever its age; an entry that was ever
+         * used (`lastUsed > 0`) is evicted `DESTINATION_TIMEOUT * 1.25` after its LAST
+         * USE; and an entry that only ever announced is evicted
+         * [network.reticulum.transport.TransportConstants.UNUSED_DESTINATION_LINGER]
+         * after its announce. An application that must keep quiet correspondents
+         * (calling [remember] + [retainDestinationData] for each saved contact at
+         * startup) relies on the retained sentinel and on this method honouring it.
+         *
+         * @param hasPath predicate: does Transport currently have a path to this
+         *   destination hash? Entries with a path are always retained.
+         * @param now current time in millis (injectable for tests).
+         * @return the number of destinations evicted.
+         */
+        fun cleanKnownDestinations(
+            hasPath: (ByteArray) -> Boolean,
+            now: Long = System.currentTimeMillis(),
+        ): Int {
+            val linger = network.reticulum.transport.TransportConstants.UNUSED_DESTINATION_LINGER
+            val usedTimeout =
+                (network.reticulum.transport.TransportConstants.DESTINATION_TIMEOUT * 1.25).toLong()
+            var removed = 0
+            for ((key, data) in knownDestinations) {
+                val destHash = key.bytes
+                if (data.retained) continue
+                if (hasPath(destHash)) continue
+                // Two different clocks, and which one applies depends on whether anything
+                // ever used this identity (python Identity.py:329-331). An identity that
+                // only ever announced is forgotten once the announce goes stale; one that
+                // was used is kept from its LAST USE, so an idle but live correspondent is
+                // not dropped simply because it has not re-announced recently.
+                val stale = if (data.lastUsed > 0) {
+                    now - data.lastUsed > usedTimeout
+                } else {
+                    now - data.timestamp > linger
+                }
+                if (!stale) continue
+                knownDestinations.remove(key)
+                identityHashIndex.remove(Hashes.truncatedHash(data.publicKey).toKey())
+                destinationRatchets.remove(key)
+                identityStore?.removeKnownDestination(destHash)
+                removed++
+            }
+            return removed
+        }
+
+        /**
+         * Mark a destination's identity as used now (python
+         * `Reticulum._used_destination_data`, `Identity.py:241-248`).
+         *
+         * A retained entry is left alone — retention is a standing instruction to keep the
+         * entry, and overwriting its marker with a timestamp would put it back on the
+         * eviction clock.
+         *
+         * @return true if the entry existed and was marked.
+         */
+        fun markDestinationUsed(destHash: ByteArray): Boolean {
+            val key = destHash.toKey()
+            val data = knownDestinations[key] ?: return false
+            if (data.retained) return false
+            val updated = data.copy(lastUsed = System.currentTimeMillis())
+            knownDestinations[key] = updated
+            // python's marker is memory-only until the next save (Identity.py:242-247); a
+            // write-through here cost one database write per transported LRPROOF on a
+            // transport node. The marker is flushed by the known-destinations job.
+            dirtyUsedMarkers.add(key)
+            return true
+        }
+
+        private val dirtyUsedMarkers: MutableSet<ByteArrayKey> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+        /** Write the use markers accumulated since the last flush to the identity store, if there is one. */
+        fun flushUsedMarkers() {
+            val store = identityStore ?: run { dirtyUsedMarkers.clear(); return }
+            val keys = dirtyUsedMarkers.toList()
+            dirtyUsedMarkers.removeAll(keys.toSet())
+            for (key in keys) {
+                val data = knownDestinations[key] ?: continue
+                try {
+                    store.upsertKnownDestination(key.bytes, data)
+                } catch (e: Exception) {
+                    dirtyUsedMarkers.add(key)
+                }
+            }
+        }
+        /**
+         * Pin a destination's identity so it is never evicted (python
+         * `_retain_destination_data`, `Identity.py:250-256`).
+         */
+        fun retainDestinationData(destHash: ByteArray): Boolean {
+            val key = destHash.toKey()
+            val data = knownDestinations[key] ?: return false
+            val updated = data.copy(lastUsed = -1L)
+            knownDestinations[key] = updated
+            identityStore?.upsertKnownDestination(destHash, updated)
+            return true
+        }
+
+        /**
+         * Release a retained destination back onto the normal eviction clock, as though it
+         * had just been used (python `_unretain_destination_data`, `Identity.py:258-264`).
+         */
+        fun unretainDestinationData(destHash: ByteArray): Boolean {
+            val key = destHash.toKey()
+            val data = knownDestinations[key] ?: return false
+            val updated = data.copy(lastUsed = System.currentTimeMillis())
+            knownDestinations[key] = updated
+            identityStore?.upsertKnownDestination(destHash, updated)
+            return true
+        }
+
+        /**
+         * Mark a known destination as used now, unless it is retained (python
+         * `Identity._used_destination_data`, Identity.py:242-249). False when unknown or retained.
+         */
+        fun usedDestinationData(destHash: ByteArray): Boolean {
+            val key = destHash.toKey()
+            val data = knownDestinations[key] ?: return false
+            if (data.lastUsed < 0) return false
+            val updated = data.copy(lastUsed = System.currentTimeMillis())
+            knownDestinations[key] = updated
+            // Memory-only until the next flush, as python (Identity.py:242-247).
+            dirtyUsedMarkers.add(key)
+            return true
+        }
+
+        /**
+         * Retain every known destination belonging to an identity (python
+         * `Identity._retain_identity`, Identity.py:270-283). True when at least one was retained.
+         */
+        fun retainIdentity(identityHash: ByteArray): Boolean {
+            var retained = false
+            for ((key, data) in knownDestinations.entries.toList()) {
+                if (Hashes.truncatedHash(data.publicKey).contentEquals(identityHash)) {
+                    if (retainDestinationData(key.bytes)) retained = true
+                }
+            }
+            return retained
+        }
+        /**
          * Validate an announce packet and extract the announced identity.
          *
          * This method verifies the signature of an announce packet and, if valid,
@@ -511,7 +687,7 @@ class Identity private constructor(
                 // Build signed data: destination_hash + public_key + name_hash + random_hash + ratchet + app_data
                 // (app_data is b"" here in every no-trailing-bytes case, matching python's
                 // pre-override value at Identity.py:529.)
-                val signedData = destinationHash + publicKey + nameHash + randomHash + ratchet + (appData ?: byteArrayOf())
+                val signedData = destinationHash + publicKey + nameHash + randomHash + ratchet + appData
 
                 // python Identity.py:531-532 — ONLY the ratchetless no-app_data layout
                 // (data length == keysize+name_hash+10+sig_len, the threshold WITHOUT the
@@ -580,6 +756,41 @@ class Identity private constructor(
         }
 
         /**
+         * Unpack one `known_destinations` map entry positioned at its key:
+         * `bin(dest_hash) -> [int timestamp, bin packet_hash, bin public_key, bin|nil app_data]`
+         * (python Identity.save_known_destinations, Identity.py:446-508). Consumes
+         * exactly the entry's bytes; any msgpack error propagates to the caller.
+         */
+        private fun unpackKnownDestinationEntry(unpacker: MessageUnpacker): Pair<ByteArrayKey, IdentityData> {
+            val destHash = ByteArray(unpacker.unpackBinaryHeader())
+            unpacker.readPayload(destHash)
+
+            val fieldCount = unpacker.unpackArrayHeader()
+            val timestamp = unpacker.unpackLong()
+
+            val packetHash = ByteArray(unpacker.unpackBinaryHeader())
+            unpacker.readPayload(packetHash)
+
+            val publicKey = ByteArray(unpacker.unpackBinaryHeader())
+            unpacker.readPayload(publicKey)
+
+            val appData = if (unpacker.tryUnpackNil()) {
+                null
+            } else {
+                val data = ByteArray(unpacker.unpackBinaryHeader())
+                unpacker.readPayload(data)
+                data
+            }
+
+            // A file written before the last-used marker existed has four fields; read
+            // it as never-used rather than rejecting it, exactly as the reference upgrades
+            // short entries in place (Identity.py:226-228).
+            val lastUsed = if (fieldCount >= 5) unpacker.unpackLong() else 0L
+
+            return destHash.toKey() to IdentityData(timestamp, packetHash, publicKey, appData, lastUsed)
+        }
+
+        /**
          * Save known destinations to disk.
          * Serializes the known destinations map to msgpack format.
          * Thread-safe with a lock to prevent concurrent saves.
@@ -614,55 +825,25 @@ class Identity private constructor(
                 val destFile = java.io.File(storagePath, "known_destinations")
 
                 // Load existing data from disk to merge
-                val storageKnownDestinations = mutableMapOf<ByteArray, List<Any?>>()
+                val storageKnownDestinations = mutableMapOf<ByteArrayKey, IdentityData>()
                 if (destFile.exists()) {
                     try {
-                        val packer = org.msgpack.core.MessagePack.newDefaultUnpacker(destFile.readBytes())
-                        val mapSize = packer.unpackMapHeader()
+                        val unpacker = MessagePack.newDefaultUnpacker(destFile.readBytes())
+                        val mapSize = unpacker.unpackMapHeader()
                         repeat(mapSize) {
-                            val keyLen = packer.unpackBinaryHeader()
-                            val key = ByteArray(keyLen)
-                            packer.readPayload(key)
-
-                            packer.unpackArrayHeader() // Skip array size, we know the format
-                            val timestamp = packer.unpackLong()
-
-                            val packetHashLen = packer.unpackBinaryHeader()
-                            val packetHash = ByteArray(packetHashLen)
-                            packer.readPayload(packetHash)
-
-                            val publicKeyLen = packer.unpackBinaryHeader()
-                            val publicKey = ByteArray(publicKeyLen)
-                            packer.readPayload(publicKey)
-
-                            val appData = if (packer.tryUnpackNil()) {
-                                null
-                            } else {
-                                val appDataLen = packer.unpackBinaryHeader()
-                                val data = ByteArray(appDataLen)
-                                packer.readPayload(data)
-                                data
-                            }
-
-                            storageKnownDestinations[key] = listOf(timestamp, packetHash, publicKey, appData)
+                            val (key, data) = unpackKnownDestinationEntry(unpacker)
+                            storageKnownDestinations[key] = data
                         }
-                        packer.close()
+                        unpacker.close()
                     } catch (e: Exception) {
                         // Ignore errors loading existing data
                     }
                 }
 
                 // Merge storage data with in-memory data (prefer in-memory)
-                for ((destHash, value) in storageKnownDestinations) {
-                    val key = destHash.toKey()
+                for ((key, data) in storageKnownDestinations) {
                     if (!knownDestinations.containsKey(key)) {
-                        // Convert list format to IdentityData
-                        val timestamp = value[0] as Long
-                        val packetHash = value[1] as ByteArray
-                        val publicKey = value[2] as ByteArray
-                        val appData = value[3] as ByteArray?
-
-                        knownDestinations[key] = IdentityData(timestamp, packetHash, publicKey, appData)
+                        knownDestinations[key] = data
                     }
                 }
 
@@ -678,8 +859,11 @@ class Identity private constructor(
                     packer.packBinaryHeader(key.bytes.size)
                     packer.writePayload(key.bytes)
 
-                    // Pack value as array: [timestamp, packet_hash, public_key, app_data]
-                    packer.packArrayHeader(4)
+                    // [timestamp, packet_hash, public_key, app_data, last_used]
+                    // (python Identity.py:107). The last-used marker is part of the
+                    // on-disk format, so a peer or a later version reading this file
+                    // must find all five fields.
+                    packer.packArrayHeader(5)
                     packer.packLong(data.timestamp)
                     packer.packBinaryHeader(data.packetHash.size)
                     packer.writePayload(data.packetHash)
@@ -692,10 +876,11 @@ class Identity private constructor(
                         packer.packBinaryHeader(data.appData.size)
                         packer.writePayload(data.appData)
                     }
+                    packer.packLong(data.lastUsed)
                 }
                 packer.close()
 
-                // Write to file atomically (temp file, then replace)
+                // Write to file atomically (python os.replace, Identity.py:199)
                 val tempFile = java.io.File(storagePath, "known_destinations.tmp")
                 tempFile.writeBytes(buffer.toByteArray())
                 replaceFile(tempFile, destFile)
@@ -749,52 +934,18 @@ class Identity private constructor(
                 var loadedCount = 0
                 repeat(mapSize) {
                     try {
-                        val keyLen = packer.unpackBinaryHeader()
-                        val destHash = ByteArray(keyLen)
-                        packer.readPayload(destHash)
-
-                        // Only load if it's the correct hash length (16 bytes)
-                        if (destHash.size != RnsConstants.TRUNCATED_HASH_BYTES) {
-                            // Skip this entry - unpack but don't store
-                            packer.unpackArrayHeader()
-                            packer.unpackLong()
-                            val phLen = packer.unpackBinaryHeader()
-                            packer.readPayload(ByteArray(phLen))
-                            val pkLen = packer.unpackBinaryHeader()
-                            packer.readPayload(ByteArray(pkLen))
-                            if (!packer.tryUnpackNil()) {
-                                val adLen = packer.unpackBinaryHeader()
-                                packer.readPayload(ByteArray(adLen))
-                            }
+                        // The entry is always consumed in full so the stream stays in
+                        // sync; it is only STORED if the key is a 16-byte hash.
+                        val (key, data) = unpackKnownDestinationEntry(packer)
+                        if (key.bytes.size != RnsConstants.TRUNCATED_HASH_BYTES) {
                             return@repeat
                         }
 
-                        packer.unpackArrayHeader() // Skip array size, we know the format
-                        val timestamp = packer.unpackLong()
-
-                        val packetHashLen = packer.unpackBinaryHeader()
-                        val packetHash = ByteArray(packetHashLen)
-                        packer.readPayload(packetHash)
-
-                        val publicKeyLen = packer.unpackBinaryHeader()
-                        val publicKey = ByteArray(publicKeyLen)
-                        packer.readPayload(publicKey)
-
-                        val appData = if (packer.tryUnpackNil()) {
-                            null
-                        } else {
-                            val appDataLen = packer.unpackBinaryHeader()
-                            val data = ByteArray(appDataLen)
-                            packer.readPayload(data)
-                            data
-                        }
-
-                        val data = IdentityData(timestamp, packetHash, publicKey, appData)
-                        knownDestinations[destHash.toKey()] = data
+                        knownDestinations[key] = data
 
                         // Index by identity hash
-                        val identityHash = Hashes.truncatedHash(publicKey)
-                        identityHashIndex[identityHash.toKey()] = destHash
+                        val identityHash = Hashes.truncatedHash(data.publicKey)
+                        identityHashIndex[identityHash.toKey()] = key.bytes
 
                         loadedCount++
                     } catch (e: Exception) {
@@ -815,8 +966,9 @@ class Identity private constructor(
         /**
          * Remember a ratchet for a destination.
          * Stores the ratchet with the current timestamp, replacing any previous
-         * ratchet for that destination: exactly one ratchet is kept per
-         * destination, as the reference does.
+         * ratchet for that destination — exactly one ratchet is kept per
+         * destination, as python `Identity._remember_ratchet` does
+         * (`known_ratchets[destination_hash] = ratchet`, Identity.py:419).
          *
          * @param destHash The destination hash
          * @param ratchet The ratchet public key bytes (32 bytes)
@@ -834,13 +986,13 @@ class Identity private constructor(
             synchronized(destinationRatchets) {
                 val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
 
-                // Already the current ratchet: nothing to do (the reference compares
-                // only against the one stored ratchet).
+                // Already the current ratchet: nothing to do (python compares only
+                // against the one stored ratchet, Identity.py:412).
                 if (entries.any { it.ratchet.contentEquals(ratchet) }) {
-                    return // Already stored
+                    return
                 }
 
-                // Replace rather than accumulate.
+                // Replace rather than accumulate (Identity.py:419).
                 entries.clear()
                 entries.add(entry)
                 shouldPersist = true
@@ -878,7 +1030,7 @@ class Identity private constructor(
                     packer.packDouble(timestamp / 1000.0)
                     packer.close()
 
-                    // Write atomically (temp file, then replace)
+                    // Write atomically (python os.replace, Identity.py:435)
                     val hexHash = destHash.toHexString()
                     val outFile = File(ratchetDir, "$hexHash.out")
                     val finalFile = File(ratchetDir, hexHash)
@@ -893,12 +1045,13 @@ class Identity private constructor(
         }
 
         /**
-         * Atomically replace [dst] with [src]. `File.renameTo` was used before; it
-         * returns false (and the result was discarded) when the target already
-         * exists on Windows, so the known-destinations file and the per-peer
-         * ratchet files were never updated after their first write. Falls back to
-         * a non-atomic replace where the filesystem cannot do an atomic one.
-         * Failures propagate to the caller, which logs them.
+         * Atomically replace [dst] with [src] — the java.nio equivalent of python's
+         * `os.replace` (Identity.py:199, 435). `File.renameTo` was used before; it
+         * returns false (silently, the result was discarded) when the target
+         * already exists on Windows, so the known-destinations file and the
+         * per-peer ratchet files were never updated after their first write.
+         * Falls back to a non-atomic replace where the filesystem cannot do an
+         * atomic one. Failures propagate to the caller, which logs them.
          */
         private fun replaceFile(src: File, dst: File) {
             try {
@@ -906,7 +1059,7 @@ class Identity private constructor(
                     src.toPath(),
                     dst.toPath(),
                     StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.ATOMIC_MOVE
+                    StandardCopyOption.ATOMIC_MOVE,
                 )
             } catch (e: AtomicMoveNotSupportedException) {
                 println("Atomic replace of ${dst.name} unsupported here (${e.message}); replacing non-atomically")
@@ -943,10 +1096,10 @@ class Identity private constructor(
                 val result = store.getRatchet(destHash) ?: return null
                 val (ratchet, timestamp) = result
                 if (System.currentTimeMillis() - timestamp > RATCHET_EXPIRY) return null
-                // Cache in memory. Only fill an empty slot: an entry that appeared
-                // meanwhile came from rememberRatchet and is at least as fresh as
-                // the store (write-through follows the in-memory update), and the
-                // slot holds at most one entry.
+                // Cache in memory. Only fill an empty slot: an entry that
+                // appeared meanwhile came from rememberRatchet and is at least
+                // as fresh as the store (write-through follows the in-memory
+                // update), and the slot holds at most one entry.
                 synchronized(destinationRatchets) {
                     val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
                     if (entries.isEmpty()) {
@@ -956,6 +1109,45 @@ class Identity private constructor(
                 return ratchet
             }
             return loadRatchetFromDisk(destHash)
+        }
+
+        /**
+         * Parsed on-disk ratchet file: `{"ratchet": bin, "received": float seconds}`
+         * (python Identity._remember_ratchet persist_job, Identity.py:414-420).
+         * Either field is null when absent.
+         */
+        private data class RatchetFile(val ratchet: ByteArray?, val received: Double?)
+
+        /**
+         * Parse a ratchet file's bytes. Unknown keys are skipped; msgpack errors
+         * propagate to the caller, which owns the per-file error policy.
+         */
+        private fun readRatchetFile(bytes: ByteArray): RatchetFile {
+            val unpacker = MessagePack.newDefaultUnpacker(bytes)
+            val mapSize = unpacker.unpackMapHeader()
+
+            var ratchet: ByteArray? = null
+            var received: Double? = null
+
+            repeat(mapSize) {
+                when (unpacker.unpackString()) {
+                    "ratchet" -> {
+                        val data = ByteArray(unpacker.unpackBinaryHeader())
+                        unpacker.readPayload(data)
+                        ratchet = data
+                    }
+                    "received" -> {
+                        received = unpacker.unpackDouble()
+                    }
+                    else -> {
+                        // Skip unknown key
+                        unpacker.skipValue()
+                    }
+                }
+            }
+            unpacker.close()
+
+            return RatchetFile(ratchet, received)
         }
 
         /**
@@ -970,33 +1162,10 @@ class Identity private constructor(
                     return null
                 }
 
-                val unpacker = MessagePack.newDefaultUnpacker(ratchetFile.readBytes())
-                val mapSize = unpacker.unpackMapHeader()
-
-                var ratchet: ByteArray? = null
-                var received: Double? = null
-
-                repeat(mapSize) {
-                    val keyName = unpacker.unpackString()
-                    when (keyName) {
-                        "ratchet" -> {
-                            val len = unpacker.unpackBinaryHeader()
-                            ratchet = ByteArray(len)
-                            unpacker.readPayload(ratchet!!)
-                        }
-                        "received" -> {
-                            received = unpacker.unpackDouble()
-                        }
-                        else -> {
-                            // Skip unknown key
-                            unpacker.skipValue()
-                        }
-                    }
-                }
-                unpacker.close()
+                val (ratchet, received) = readRatchetFile(ratchetFile.readBytes())
 
                 // Validate ratchet
-                if (ratchet == null || ratchet!!.size != RnsConstants.KEY_SIZE) {
+                if (ratchet == null || ratchet.size != RnsConstants.KEY_SIZE) {
                     println("Invalid ratchet data for ${destHash.toHexString()}")
                     return null
                 }
@@ -1015,11 +1184,11 @@ class Identity private constructor(
                 synchronized(destinationRatchets) {
                     val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
                     if (entries.isEmpty()) {
-                        entries.add(RatchetEntry(ratchet!!.copyOf(), receivedMs))
+                        entries.add(RatchetEntry(ratchet.copyOf(), receivedMs))
                     }
                 }
 
-                return ratchet!!.copyOf()
+                return ratchet.copyOf()
             } catch (e: Exception) {
                 println("Error loading ratchet for ${destHash.toHexString()}: ${e.message}")
                 return null
@@ -1028,9 +1197,9 @@ class Identity private constructor(
 
         /**
          * Get the non-expired ratchet for a destination as a list of at most one
-         * element. Only one ratchet is retained per destination (the reference has
-         * no multi-ratchet fallback), so this never returns more than [getRatchet]
-         * does. Kept for API compatibility.
+         * element. Only one ratchet is retained per destination (python has no
+         * multi-ratchet fallback; Identity.py:419), so this never returns more
+         * than [getRatchet] does. Kept for API compatibility.
          *
          * @param destHash The destination hash
          * @return The current in-memory ratchet, or an empty list
@@ -1134,34 +1303,12 @@ class Identity private constructor(
                     }
 
                     try {
-                        val unpacker = MessagePack.newDefaultUnpacker(file.readBytes())
-                        val mapSize = unpacker.unpackMapHeader()
-
-                        var received: Double? = null
-                        var ratchetSize = 0
-
-                        repeat(mapSize) {
-                            val keyName = unpacker.unpackString()
-                            when (keyName) {
-                                "ratchet" -> {
-                                    ratchetSize = unpacker.unpackBinaryHeader()
-                                    // Skip the binary content
-                                    unpacker.readPayload(ByteArray(ratchetSize))
-                                }
-                                "received" -> {
-                                    received = unpacker.unpackDouble()
-                                }
-                                else -> {
-                                    unpacker.skipValue()
-                                }
-                            }
-                        }
-                        unpacker.close()
+                        val (ratchet, received) = readRatchetFile(file.readBytes())
 
                         // Check if expired or corrupted
                         val receivedMs = ((received ?: 0.0) * 1000).toLong()
                         val isExpired = now - receivedMs > RATCHET_EXPIRY
-                        val isCorrupted = ratchetSize != RnsConstants.KEY_SIZE
+                        val isCorrupted = (ratchet?.size ?: 0) != RnsConstants.KEY_SIZE
 
                         // RNS 1.3.1 _clean_ratchets also removes "not in use" ratchets:
                         // a file whose dest-hash (its hex filename) is absent from
@@ -1414,6 +1561,15 @@ class Identity private constructor(
             data = proofData,
             packetType = network.reticulum.common.PacketType.PROOF
         )
+
+        // Send the proof back out the interface the proved packet ARRIVED on (python
+        // Identity.py:956, `attached_interface = packet.receiving_interface`). Without
+        // it the proof falls into Transport.outbound's broadcast, which fans it across
+        // every interface — leaking a proof onto networks that never saw the packet,
+        // and on a multi-client server sending N copies to reach one sender.
+        packet.receivingInterfaceHash?.let { hash ->
+            proof.attachedInterface = network.reticulum.transport.Transport.interfaceForHash(hash)
+        }
 
         proof.send()
     }

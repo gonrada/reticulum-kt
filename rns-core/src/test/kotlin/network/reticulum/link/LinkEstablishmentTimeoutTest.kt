@@ -48,7 +48,8 @@ class LinkEstablishmentTimeoutTest {
     @BeforeEach
     fun setup() {
         try { Transport.stop() } catch (_: Exception) {}
-        // Keep whatever the announce ingestion persists in a private directory.
+        // Announces injected here are written through to the path store at whatever
+        // storage path the previous test left; keep them in a private directory.
         tempDir = java.nio.file.Files.createTempDirectory("rns-test").toFile()
         Transport.setStoragePath(tempDir.absolutePath)
         Transport.pathTable.clear()
@@ -89,6 +90,7 @@ class LinkEstablishmentTimeoutTest {
         val remoteIdentity = Identity.create()
         val inDest = remoteDestination(remoteIdentity)
         Transport.inbound(signedAnnounceRaw(remoteIdentity, inDest), iface)
+        Transport.awaitInboundIdle()
         assertEquals(1, Transport.hopsTo(inDest.hash), "precondition: a one-hop path")
 
         val outDest =

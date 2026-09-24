@@ -83,6 +83,16 @@ class Packet private constructor(
         internal set
 
     /**
+     * The inbound traffic class this packet was queued under (python `packet.traffic_class`,
+     * Transport.py:1893). Stamped during inbound preprocessing and read again when the
+     * packet is drained, so the one decision that has to survive the queue — that the
+     * sending interface was under path-request ingress limiting — travels with the packet
+     * instead of being recomputed against state that may have moved on.
+     */
+    var trafficClass: Int = network.reticulum.transport.TransportConstants.TC_DATA
+        internal set
+
+    /**
      * Conformance test seam: stamp the receiving-interface hash on a crafted
      * inbound packet, the kotlin equivalent of the reference setting
      * `rx.receiving_interface = <iface>` before feeding a hand-built packet to
@@ -352,6 +362,13 @@ class Packet private constructor(
                 val flags = raw[0].toInt() and 0xFF
                 val hops = raw[1].toInt() and 0xFF
 
+                // TTL / loop guard: reject a packet that has already traveled
+                // >= PATHFINDER_M hops (python Packet.unpack raises ValueError,
+                // Packet.py:248-249). Applies to ALL packet types, not just announces.
+                if (hops >= network.reticulum.transport.TransportConstants.PATHFINDER_M) {
+                    return null
+                }
+
                 // Parse flags
                 val headerType = HeaderType.fromValue((flags and 0b01000000) shr 6)
                 val contextFlag = ContextFlag.fromValue((flags and 0b00100000) shr 5)
@@ -383,6 +400,12 @@ class Packet private constructor(
                         contextByte = raw[2 + 2 * dstLen].toInt() and 0xFF
                         data = raw.copyOfRange(3 + 2 * dstLen, raw.size)
                     }
+                }
+                // python Packet.py:275 — `if len(self.data) == 0: raise ValueError`.
+                // A header-only frame (19 bytes HEADER_1 / 35 bytes HEADER_2) is
+                // not a packet; reject it here so no dispatch branch sees empty data.
+                if (data.isEmpty()) {
+                    return null
                 }
                 // python keeps context as a raw int — an unknown code point
                 // parses fine and matches no dispatch branch. UNKNOWN +
@@ -456,6 +479,12 @@ class Packet private constructor(
     fun send(): PacketReceipt? {
         if (sent) {
             throw IllegalStateException("Packet was already sent")
+        }
+
+        // TTL guard: a packet at or past the hop ceiling is not sent
+        // (python Packet.send returns False on hops >= PATHFINDER_M, Packet.py:288).
+        if (hops >= network.reticulum.transport.TransportConstants.PATHFINDER_M) {
+            return null
         }
 
         // For link destinations, check if link is active

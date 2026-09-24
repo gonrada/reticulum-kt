@@ -18,4 +18,7 @@ interface KnownDestinationDao {
 
     @Query("SELECT COUNT(*) FROM known_destinations")
     fun count(): Int
+
+    @Query("DELETE FROM known_destinations WHERE dest_hash = :destHash")
+    fun deleteByHash(destHash: ByteArray)
 }

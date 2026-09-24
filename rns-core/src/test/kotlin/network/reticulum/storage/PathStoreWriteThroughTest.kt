@@ -68,10 +68,13 @@ class PathStoreWriteThroughTest {
             val linkId = ByteArray(16) { it.toByte() }
             val interfaceHash = ByteArray(16) { 0xFF.toByte() }
 
-            // A link-id path entry is an in-memory routing hint for the life of the
-            // link; it is never written through. The stored entry always carries
-            // hops = 1 so that outbound link DATA packets don't get HEADER_2-wrapped
-            // with the linkId as transport_id.
+            // Link-id path entries are in-memory routing hints for the
+            // establishment window only — python never writes link ids to
+            // path_table, and an unauthenticated LINKREQUEST must not create a
+            // persisted row. `hops = 2` only sizes the entry's lifetime; the
+            // in-memory entry always carries hops = 1 so that outbound link
+            // DATA packets don't get HEADER_2-wrapped with the linkId as
+            // transport_id. See Transport.registerLinkPath doc comment.
             Transport.registerLinkPath(linkId, interfaceHash, hops = 2)
 
             store.data.size shouldBe 0

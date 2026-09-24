@@ -84,6 +84,26 @@ object KISS {
     const val PLATFORM_ESP32: Byte = 0x80.toByte()
     const val PLATFORM_NRF52: Byte = 0x70
 
+    // -- Frame-duration ceiling, shared by the per-byte KISS readers --
+
+    /** Floor for [maxFrameDurationMs]: a frame may always stay open at least this long. */
+    const val MIN_FRAME_DURATION_MS = 30_000L
+
+    /** Safety multiplier applied to the worst-case (fully escaped) frame airtime. */
+    const val FRAME_DURATION_SAFETY_FACTOR = 3
+
+    /**
+     * Max time a single frame may stay open, derived from the bitrate: the airtime of
+     * [rxBound] bytes with every byte KISS-escaped, times [FRAME_DURATION_SAFETY_FACTOR],
+     * floored at [MIN_FRAME_DURATION_MS]. A non-positive [bitrate] yields the floor.
+     */
+    fun maxFrameDurationMs(rxBound: Int, bitrate: Int): Long {
+        if (bitrate <= 0) return MIN_FRAME_DURATION_MS
+        val worstCaseBits = rxBound.toLong() * 2 * 8 // every byte KISS-escaped
+        val ms = worstCaseBits * 1000 / bitrate * FRAME_DURATION_SAFETY_FACTOR
+        return maxOf(MIN_FRAME_DURATION_MS, ms)
+    }
+
     /**
      * Escape data for KISS framing.
      *
@@ -180,27 +200,31 @@ object KISS {
      *   is byte-exactly equivalent because python's gate also counts decoded
      *   bytes left-to-right and the command nibble is never appended. Defaults to
      *   uncapped so existing callers are unchanged.
+     *
+     *   When [hwMtu] is finite it ALSO bounds the (escaped) accumulation buffer:
+     *   python's gate stops appending once the buffer is full, so its memory is
+     *   bounded; without this a peer that opens a CMD_DATA frame and never sends
+     *   a closing FEND would grow the buffer without limit (memory-exhaustion
+     *   DoS on TCP/I2P KISS interfaces). Every KISS-escaped byte expands to at
+     *   most two, so `2*hwMtu` escaped bytes always decode to at least [hwMtu]
+     *   bytes; capping there and truncating the decode to [hwMtu] is byte-exactly
+     *   equivalent for every valid frame (which is <= hwMtu decoded), while a
+     *   never-closed frame is now bounded and resynced on the next FEND.
      */
     class Deframer(
         private val onFrame: (command: Byte, data: ByteArray) -> Unit,
         private val hwMtu: Int = Int.MAX_VALUE,
     ) {
+        // Escaped-byte ceiling for the accumulation buffer (see [hwMtu] docs).
+        // +2 covers a trailing escape pair so the decode always yields >= hwMtu.
+        private val maxEscapedBytes: Int =
+            if (hwMtu >= Int.MAX_VALUE / 2) Int.MAX_VALUE else hwMtu * 2 + 2
+
         private var buffer = ByteArrayOutputStream()
         private var inFrame = false
         private var command: Byte = CMD_UNKNOWN
 
-        // Ceiling on the escaped accumulation buffer. Every KISS-escaped byte expands to at
-        // most two, so 2*hwMtu escaped bytes always decode to at least hwMtu bytes; +2 covers
-        // a trailing escape pair. Without it a peer that opens a data frame and never sends
-        // FEND grows this buffer without limit.
-        private val maxEscapedBytes: Int =
-            if (hwMtu >= Int.MAX_VALUE / 2) Int.MAX_VALUE else hwMtu * 2 + 2
-
-        /**
-         * Empty the accumulation buffer, releasing a large array rather than keeping it.
-         * `ByteArrayOutputStream.reset()` keeps the capacity, so one oversized run would
-         * otherwise leave a large array pinned per connection for its whole lifetime.
-         */
+        /** Empty the accumulation buffer, releasing a large array rather than keeping it (see HDLC.Deframer). */
         private fun recycleBuffer() {
             if (buffer.size() > SHRINK_ABOVE) buffer = ByteArrayOutputStream() else buffer.reset()
         }
@@ -211,33 +235,48 @@ object KISS {
          * @param data Incoming byte data
          */
         fun process(data: ByteArray) {
-            for (byte in data) {
-                when {
-                    byte == FEND -> {
-                        if (inFrame && buffer.size() > 0 && command == CMD_DATA) {
-                            // End of frame
-                            val frameData = buffer.toByteArray()
-                            recycleBuffer()
-                            val unescaped = unescape(frameData)
-                            // python TCPInterface.py:370 — payload bytes past HW_MTU
-                            // are never accumulated; truncate the decoded frame to match.
-                            val capped = if (unescaped.size > hwMtu) unescaped.copyOf(hwMtu) else unescaped
-                            if (capped.isNotEmpty()) {
-                                onFrame(command, capped)
-                            }
-                        }
-                        // Start of new frame
-                        inFrame = true
-                        command = CMD_UNKNOWN
+            for (byte in data) processByte(byte)
+        }
+
+        /**
+         * Process [len] bytes of [data] starting at [off] — lets a read loop hand its
+         * reusable read buffer straight to the deframer without a per-read copyOf().
+         */
+        fun process(data: ByteArray, off: Int, len: Int) {
+            for (i in off until off + len) processByte(data[i])
+        }
+
+        private fun processByte(byte: Byte) {
+            when {
+                byte == FEND -> {
+                    if (inFrame && buffer.size() > 0 && command == CMD_DATA) {
+                        // End of frame
+                        val frameData = buffer.toByteArray()
                         recycleBuffer()
+                        val unescaped = unescape(frameData)
+                        // python TCPInterface.py:370 — payload bytes past HW_MTU
+                        // are never accumulated; truncate the decoded frame to match.
+                        val capped = if (unescaped.size > hwMtu) unescaped.copyOf(hwMtu) else unescaped
+                        if (capped.isNotEmpty()) {
+                            onFrame(command, capped)
+                        }
                     }
-                    inFrame && buffer.size() == 0 && command == CMD_UNKNOWN -> {
-                        // First byte after FEND is the command
-                        // Strip port nibble (upper 4 bits)
-                        command = (byte.toInt() and 0x0F).toByte()
-                    }
-                    inFrame && command == CMD_DATA -> {
-                        if (buffer.size() < maxEscapedBytes) buffer.write(byte.toInt() and 0xFF)
+                    // Start of new frame
+                    inFrame = true
+                    command = CMD_UNKNOWN
+                    recycleBuffer()
+                }
+                inFrame && buffer.size() == 0 && command == CMD_UNKNOWN -> {
+                    // First byte after FEND is the command
+                    // Strip port nibble (upper 4 bits)
+                    command = (byte.toInt() and 0x0F).toByte()
+                }
+                inFrame && command == CMD_DATA -> {
+                    // Bound the buffer: bytes past the escaped ceiling are
+                    // dropped (they lie beyond the hwMtu decode truncation
+                    // anyway) so a never-closed frame can't exhaust memory.
+                    if (buffer.size() < maxEscapedBytes) {
+                        buffer.write(byte.toInt() and 0xFF)
                     }
                 }
             }

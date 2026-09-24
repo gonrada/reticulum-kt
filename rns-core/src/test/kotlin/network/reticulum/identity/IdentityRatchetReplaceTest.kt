@@ -10,10 +10,11 @@ import java.io.File
 import java.nio.file.Files
 
 /**
- * [Identity.rememberRatchet] keeps exactly one ratchet per destination and a
- * newer ratchet replaces the older one, as the reference does. Before the fix
- * every distinct ratchet was prepended and retained for RATCHET_EXPIRY, one
- * entry per announce, so any announcer could grow the table without bound.
+ * [Identity.rememberRatchet] keeps exactly one ratchet per
+ * destination and a newer ratchet replaces the older one, as python
+ * `Identity._remember_ratchet` does (`known_ratchets[destination_hash] = ratchet`,
+ * RNS/Identity.py:419). Before the fix every distinct ratchet was prepended and
+ * retained for RATCHET_EXPIRY, one entry per announce.
  */
 class IdentityRatchetReplaceTest {
 

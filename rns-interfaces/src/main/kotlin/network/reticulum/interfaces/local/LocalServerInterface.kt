@@ -7,15 +7,12 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import network.reticulum.common.RnsLog
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.toRef
 import network.reticulum.transport.Transport
-import java.io.File
-import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -23,7 +20,6 @@ import java.net.SocketException
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.channels.ServerSocketChannel
-import java.nio.channels.SocketChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CopyOnWriteArrayList
@@ -102,6 +98,14 @@ class LocalServerInterface : Interface {
 
     private var serverChannel: ServerSocketChannel? = null
     private var serverSocket: ServerSocket? = null
+
+    /**
+     * The TCP port this server is actually bound to, or -1 when not bound (or not a TCP
+     * server). With `tcpPort = 0` the OS assigns an ephemeral port; read it here after
+     * start() to connect clients against the real port instead of a hardcoded one.
+     */
+    val boundPort: Int
+        get() = serverSocket?.localPort ?: -1
 
     // Coroutine scope for I/O operations (battery-efficient on Android)
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -266,14 +270,18 @@ class LocalServerInterface : Interface {
         serverSocket?.reuseAddress = true
         serverSocket?.bind(InetSocketAddress("127.0.0.1", port))
 
-        log("Listening on TCP: 127.0.0.1:$port")
+        // Log the actual bound port, not the requested one — with port 0 the OS assigns an
+        // ephemeral port, so `$port` would misleadingly log ":0".
+        log("Listening on TCP: 127.0.0.1:${serverSocket?.localPort}")
     }
 
     private suspend fun acceptLoop() {
         while (online.value && !detached.get()) {
             try {
-                // Blocking accept wrapped in IO dispatcher
-                val socket = withContext(Dispatchers.IO) {
+                // acceptJob runs on `ioScope`, already bound to Dispatchers.IO; accept
+                // directly rather than re-dispatching to the same dispatcher per accept
+                // (a no-op thread hop). Same rationale as PR #75's read-loop cleanup.
+                val socket =
                     if ((useUnixSocket || useAbstractSocket) && serverChannel != null) {
                         acceptUnixSocket()
                     } else if (serverSocket != null) {
@@ -281,7 +289,6 @@ class LocalServerInterface : Interface {
                     } else {
                         null
                     }
-                }
 
                 if (socket != null) {
                     handleNewClient(socket)
@@ -353,13 +360,33 @@ class LocalServerInterface : Interface {
             onPacketReceived?.invoke(data, iface)
         }
 
-        clientInterface.start()
-
+        // Register with Transport BEFORE starting the read loop. A probe connection
+        // (connect-then-immediately-close — isSharedInstanceRunning / watchdog probes) whose
+        // read loop starts first can hit EOF and detach() -> clientDisconnected() ->
+        // Transport.deregisterInterface() as a NO-OP (nothing registered yet), after which
+        // this registerInterface() adds the already-detached interface — a permanent stale
+        // entry in Transport (interfaces + localClientInterfaces) that later throws repeating
+        // IllegalStateExceptions on announce retransmit to local clients. Registering first
+        // means the eventual detach can actually deregister it. See upstream #74.
         try {
             Transport.registerInterface(clientInterface.toRef())
         } catch (e: Exception) {
+            // Registration failed: roll back and close, so we don't leak a half-attached
+            // interface or an accepted socket.
             log("Could not register spawned interface with Transport: ${e.message}")
+            clients.remove(clientInterface)
+            spawnedInterfaces?.remove(clientInterface)
+            try { socket.close() } catch (_: Exception) {}
+            return
         }
+
+        clientInterface.start()
+
+        // Now that the spawned child is started/online, bring it up to date with the
+        // destinations we already know — a client that connects after a peer announced would
+        // otherwise never learn it (announces are only forwarded to clients connected at
+        // receive time, and a local client discovers by scanning its own path table).
+        Transport.replayCachedAnnouncesToLocalClient(clientInterface.toRef())
 
         log("Client connected: $clientName (total: ${clients.size})")
     }
@@ -452,10 +479,7 @@ class LocalServerInterface : Interface {
     }
 
     private fun log(message: String) {
-        val timestamp = java.time.LocalDateTime.now().format(
-            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-        )
-        println("[$timestamp] [$name] $message")
+        RnsLog.log(RnsLog.INFO, name, message)
     }
 
     override fun toString(): String {

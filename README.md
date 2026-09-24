@@ -14,44 +14,111 @@ Thanks for reading. The rest of this page is written by the LLM and is probably 
 
 A Kotlin/JVM implementation of the [Reticulum Network Stack](https://reticulum.network/) for building resilient, delay-tolerant mesh networks on Android and JVM.
 
+The KISS and radio support, the security hardening and the reference-parity work
+are described under [Additions](#additions). The stack is driven in production
+from an Android foreground service.
+
+## Additions
+
+The four themes:
+
+**KISS / TNC radio stack** — `KissInterface` carrying KISS over any byte stream,
+with the reference's frame-duration ceiling, flow control and beacon, AX.25
+framing (`kiss/Ax25.kt`), the shared stream-framing layer the serial-class
+interfaces sit on, and IFAC on all of them.
+
+**Reference parity (RNS 1.5.2)** — asynchronous inbound processing with
+per-traffic-class queues and a single drainer, announce and path-request
+ingress limiting with per-interface `ic_*` tuning, path-request egress control,
+protocol-violation counters, the announce-retransmit machinery and announce-rate
+limiter, `MODE_INTERNAL` and the `announces_from/to_internal` knobs, waiting
+discovery path requests answered on announce arrival, management and probe
+destinations that answer remote `/path` and `/status` queries and announce every
+two hours, known-destination use tracking with batched persistence, multi-segment
+resources joined on the receive side, link requests and responses carrying any
+msgpack value, receipt-free link sends, and a `SerialInterface`. Every reference
+config key is parsed and applied, including `loglevel`, which drives the leveled
+`RnsLog`. Every timer in Packet, Link, Resource, Channel and Transport was
+inventoried against the reference with the state it checks when it fires; the
+seven divergences that inventory found (initiator establishment, the Resource
+watchdog's four branches, tunnel and link-table lifetimes, the proof timeout's
+interface term, the request budget's start, pending requests at link close) are
+fixed. The `conformance-bridge` module runs the language-agnostic
+[reticulum-conformance](https://github.com/torlando-tech/reticulum-conformance)
+suite against this port; the full suite passes against RNS 1.5.2, 1308 passed and
+none failed. That run was made with the bridge commands the suite needs, which
+arrive on the radio branch: the suite cannot be run from this branch as it stands,
+so the result is reported here rather than reproducible here.
+
+**Security hardening** — three source-level reviews of `rns-core`,
+`rns-interfaces` and `rns-cli` with Python RNS as the oracle. The first
+resolved 40-plus findings including five High: `Link.validate()` discarding the
+Ed25519 result, link DATA replay through a missing destination-type gate,
+HEADER_1 DATA relayed between interfaces without a transport-enabled gate,
+`Resource.validateProof` spinning on payloads over 1 MiB, and IFAC silently
+disabled on `BackboneInterface`. The second
+closed an unbounded receive-side segment accumulator, a never-culled
+path-request table, HDLC buffers that never shrank, the keepalive-reply race,
+and the ingress-limiter parity gaps, and audited the dependency set and the
+publication surface. The third, on the parity work itself, replaced every
+recursive msgpack decode on a remote-reachable path with span-based slicing.
+Also msgpack allocation bounds, decompression-bomb teardown, bounded deframers,
+ratchet persistence and forward secrecy, atomic file replace, and catch-alls in
+every stream read loop.
+
+**Correctness fixes** — announces replayed to late-joining local clients,
+shared-instance startup race, sender-side `Resource` recovery and in-flight
+failure on link teardown, IN-only destination registration, and an SPP socket
+leak on a failed connect or accept.
+
+Every intentional departure from Python RNS is recorded in
+[`port-deviations.md`](port-deviations.md) (the authoritative list) and summarised
+in [`PYTHON_DEVIATIONS.md`](PYTHON_DEVIATIONS.md). What is still open against the
+reference is listed in [`TODO.md`](TODO.md); the per-component status is in
+[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
+
 ## Implementation Status
 
-Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference implementation. Interoperability is validated by automated tests against the Python reference.
+Comparison with [Python RNS](https://github.com/markqvist/Reticulum).
+Interoperability is validated by automated tests against the Python reference.
 
 ### Core Protocol
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Identity | Complete | X25519/Ed25519, ratchets, known destinations, persistent storage |
-| Destination | Complete | All types (SINGLE, GROUP, PLAIN, LINK), request handlers, proof strategies |
-| Packet | Complete | Full wire format, HEADER_1/HEADER_2, receipts, proofs |
-| Transport | Complete | Routing, path management, tunnels, announces, announce caching, link management, IFAC, mode-based filtering |
-| Link | Complete | Establishment, encryption, channels, resources, request/response, MTU discovery |
+| Identity | Complete | X25519/Ed25519, ratchets (one per destination, persisted), known destinations with use tracking and eviction, atomic-replace storage |
+| Destination | Complete | All types (SINGLE, GROUP, PLAIN, LINK), request handlers, proof strategies, persisted peer ratchets consulted on encrypt |
+| Packet | Complete | Full wire format, HEADER_1/HEADER_2, receipts, proofs, zero-length data rejected |
+| Transport | Complete | Routing, path management, tunnels, announces, announce caching and retransmit, link management, IFAC, mode-based filtering, blackhole, traffic-class inbound queues, ingress/egress limiting, management and probe destinations |
+| Link | Complete | Establishment, encryption, channels, resources, request/response with any msgpack value, MTU discovery, peer-supplied RTT/MTU clamped |
 | Channel | Complete | Windowed flow control, ordered delivery, retransmission, message type registry |
-| Buffer | Complete | Stream I/O over channels |
-| Resource | Complete | Chunked transfer, BZ2 compression, progress tracking, metadata |
+| Buffer | Complete | Stream I/O over channels, partial writes re-driven |
+| Resource | Complete | Chunked transfer, BZ2 compression with a bomb ceiling, progress on both ends, segmented above 1 MiB and joined on receive, metadata |
 | Crypto | Complete | BouncyCastle: X25519, Ed25519, HKDF, AES-256-CBC, SHA-256/512 |
+| Blackhole | Complete | Identity blacklisting with expiry, trusted remote sources, persistence, path removal |
+| Interface Discovery | Complete | Announcer with PoW stamps, self-filtering handler, persistence and auto-connect |
 
 ### Interfaces
 
 | Interface | Status | Notes |
 |-----------|--------|-------|
-| TCP Server/Client | Complete | HDLC framing, fixed five-second reconnect matching Python |
+| TCP Server/Client | Complete | HDLC framing, fixed five-second reconnect matching Python, keepalive on server children |
+| Backbone | Complete | NIO selector listener, IFAC with configurable tag size on the parent and spawned clients, 1024-client cap, bounded HDLC deframer, coalescing transmit buffer |
 | UDP | Complete | Unicast, broadcast, multicast |
-| Local (Shared Instance) | Complete | Server/client IPC for sharing Reticulum across apps |
-| RNode (LoRa) | Complete | Full KISS protocol, firmware checking, BLE + serial transport |
+| Local (Shared Instance) | Complete | Server/client IPC for sharing Reticulum across apps, bounded child deframer, accept loop survives transient errors |
+| RNode (LoRa) | Complete | Full KISS protocol, firmware checking, BLE + serial transport, bitrate-derived frame-duration ceiling |
+| KISS | Complete | Fork addition — KISS TNC over any byte stream, frame-duration ceiling, flow control, beacon, IFAC |
+| AX.25 over KISS | Complete | Fork addition — callsign/SSID validation, 16-byte header, prepend on transmit and strip on receive |
 | BLE Mesh | Complete | Dual-role GATT, identity handshake, fragmentation, Android driver — Kotlin-only |
-| Nearby Connections | Complete | Google Nearby Connections (WiFi Direct + BLE), dual-role advertise/discover — Kotlin-only |
-| Bluetooth SPP | Complete | Bluetooth Classic RFCOMM with HDLC framing, client + server modes — Kotlin-only |
+| Bluetooth SPP | Complete | Bluetooth Classic RFCOMM with HDLC framing, client + server, decoupled transmit, 8-byte serial IFAC tag |
 | Pipe | Complete | HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) — Python-parity |
-| Auto (Discovery) | Complete | IPv6 multicast peer discovery, per-peer UDP connections |
+| Auto (Discovery) | Complete | IPv6 multicast peer discovery, per-peer UDP connections, working multi-interface dedup |
 | I2P | Complete | SAM API tunnels with HDLC-framed TCP, server tunnel + client tunnels |
-| KISS Framing | Complete | Used by TCP and RNode interfaces |
-| HDLC Framing | Complete | Used by TCP, SPP, Pipe, and I2P interfaces |
-| PHY Stats | Complete | RSSI/SNR exposed via `Interface.rStatRssi` / `rStatSnr` (RNode + BLE + Nearby) |
-| Serial | Not implemented | Direct serial port; RNode covers most serial use cases |
-| KISS Interface | Not implemented | Legacy serial TNC path; RNode covers most serial use cases |
-| AX.25 KISS Interface | Not implemented | AX.25 over KISS; specialized amateur-radio path |
+| Nearby Connections | Present, scheduled for removal | Google Nearby Connections (WiFi Direct + BLE) — Kotlin-only. The Android driver pulls in `play-services` for a transport no consumer instantiates; the driver and dependency are slated to go, the abstract seam stays |
+| KISS Framing | Complete | Used by TCP, RNode and the KISS interfaces |
+| HDLC Framing | Complete | Bounded deframer, used by TCP, Backbone, SPP, Pipe and I2P |
+| PHY Stats | Complete | RSSI/SNR exposed via `Interface.rStatRssi` / `rStatSnr` |
+| Serial | Complete | Fork addition — Python `SerialInterface` (HDLC over a serial stream) on any `KissSerialPort`; `jSerialComm` backend in the CLI |
 
 ### Android
 
@@ -65,23 +132,22 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 
 ### Remaining Work
 
-Features that exist in the Python reference but are not yet implemented:
-
 | Feature | Priority | Description |
 |---------|----------|-------------|
-| Blackhole system | Medium | Identity blacklisting to block bad actors |
-| Remote management | Low | Control destinations for remote `/path` and `/status` queries |
-| RPC server | Low | Multi-process sharing of a single Reticulum instance |
-| CLI utilities | Low | `rnstatus`, `rnpath`, `rnprobe` equivalents |
-| SerialInterface | Low | Direct serial port (RNode covers most use cases) |
-| KISSInterface | Low | Legacy serial TNC path (RNode covers most use cases) |
-| AX25KISSInterface | Low | AX.25 over KISS — specialized amateur-radio path |
+| Shared-medium hints, stream `Resource` init, auto-MTU tuning | Medium | Three reference behaviours not yet ported; see [`TODO.md`](TODO.md) |
+| Bounded resource worker | Medium | Resource assembly and request handling run on the ingest thread; Python uses daemon threads |
+| `WeaveInterface`, `RNodeMultiInterface` | Low | Hardware drivers (Weave switch protocol, multi-radio RNode firmware); not started, no device to verify against |
+| `rnstatus` / `rnpath` / `rnprobe` | Low | CLI equivalents; the RPC server answers the requests they would make |
+| CLI interface construction | Low | `InterfaceConfigFactory` builds TCP client/server, Backbone, Auto, Serial, KISS and AX.25 KISS. It warns and returns null for RNode, I2P, UDP and BLE — desktop has no backend for BLE, the rest are simply unwired |
+| TCP server client cap | Low | The 64-slot cap is a constructor default with no config key |
 
 ### Utilities/CLI
 
 | Tool | Status | Notes |
 |------|--------|-------|
-| `rnsd-kt` | Complete | Daemon matching Python `rnsd` behavior |
+| `rnsd-kt` | Complete | Daemon matching Python `rnsd` behavior; config parser (ConfigObj quoting and inline comments) and an interface factory covering TCP client/server, Backbone, Auto, Serial, KISS and AX.25 KISS, with IFAC, mode, announce-cap, announce-rate and ingress/egress knobs applied from config |
+| RPC server | Complete | `rns-core/rpc/RpcServer.kt` — Python `multiprocessing.connection` handshake, msgpack payloads, the full RNS 1.5.2 request set (status, path and rate tables, blackhole, drops, identity and destination data), bound to localhost, key derived from the transport identity as in Python |
+| `conformance-bridge` | Complete | In-process peer for the reticulum-conformance suite |
 | `rnstatus` | Not started | Network status |
 | `rnpath` | Not started | Path discovery |
 | `rnprobe` | Not started | Ping/latency |
@@ -90,57 +156,64 @@ Features that exist in the Python reference but are not yet implemented:
 
 ## Requirements
 
-- JDK 21+
-- Python 3.8+ with [RNS](https://github.com/markqvist/Reticulum) installed (for interop tests)
-- Android API 26+ (for Android deployment)
+- JDK 21+ (Android modules target 17)
+- Python 3.8+ with [RNS](https://github.com/markqvist/Reticulum) installed, for the interop tests
+- Android API 26+ for Android deployment
 
 ## Project Structure
 
 ```
-rns-core/        # Core protocol (Identity, Destination, Transport, Link, Channel, Resource)
-rns-interfaces/  # Network interfaces (TCP, UDP, Local, RNode, BLE, Auto, I2P, Nearby, SPP, Pipe)
-rns-android/     # Android-specific code (BLE driver, foreground service, power management)
-rns-cli/         # CLI utilities (rnsd-kt daemon)
-rns-test/        # Integration and interop tests
-python-bridge/   # Python bridge server for interop testing (145+ commands)
+rns-core/            # Core protocol (Identity, Destination, Transport, Link, Channel, Resource, discovery, storage)
+rns-interfaces/      # Network interfaces (TCP, Backbone, UDP, Local, RNode, KISS, BLE, SPP, Auto, I2P, Pipe) + framing
+rns-android/         # Android code (BLE driver, foreground service, power management)
+rns-cli/             # CLI utilities (rnsd-kt daemon, config parser, interface factory, serial port)
+rns-test/            # Integration and interop tests
+python-bridge/       # Python bridge server for interop testing (150+ commands)
+conformance-bridge/  # In-process Python conformance sessions
 ```
 
 ## Building
+
+A standard Gradle build with JDK 21 and, for the Android module, an Android SDK
+on `ANDROID_HOME`:
 
 ```bash
 ./gradlew build
 ```
 
+`gradlew` is committed with LF endings. If a Windows checkout has converted it
+to CRLF, the wrapper JAR runs the same build without the script:
+
+```bash
+java -cp gradle/wrapper/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain build
+```
+
+A consumer that includes this project as a composite build (`includeBuild`)
+holds this tree's Gradle lock while its own build runs.
+
+To consume a specific commit from another project, publish it to the local Maven
+repository with `VERSION=<short commit SHA> ./gradlew publishToMavenLocal`; the
+modules declare `maven-publish` and read the version from `VERSION`, and a
+commit-SHA version keeps a consumer's pin honest.
+
 ## Running Tests
 
-Run all tests:
 ```bash
-./gradlew test
-```
-
-Run only interop tests (requires Python RNS):
-```bash
-./gradlew test --tests "*InteropTest*"
-```
-
-Run a specific test class:
-```bash
-./gradlew test --tests "network.reticulum.interop.identity.IdentityInteropTest"
+./gradlew test                                    # everything
+./gradlew test --tests "*InteropTest*"            # interop only (requires Python RNS)
+./gradlew :rns-interfaces:test                    # pure-JVM interface tests
+./gradlew :rns-android:compileDebugKotlin         # Android compile check
 ```
 
 ## Running rnsd-kt
 
-Build the fat JAR:
 ```bash
 ./gradlew :rns-cli:shadowJar
-```
-
-Run the daemon:
-```bash
 java -jar rns-cli/build/libs/rnsd-kt.jar
 ```
 
 CLI options (matching Python `rnsd`):
+
 ```
 Options:
   --config PATH     Path to config directory (default: ~/.reticulum)
@@ -186,10 +259,20 @@ Reticulum.stop()
 
 ## Interop Testing
 
-The test suite validates byte-perfect compatibility with Python RNS. The Python bridge server (`python-bridge/bridge_server.py`) provides 145+ commands for cross-implementation verification covering crypto, packet formats, link encryption, channel messaging, and resource transfer.
+The test suite validates byte-perfect compatibility with Python RNS. The Python
+bridge server (`python-bridge/bridge_server.py`) provides 150+ commands for
+cross-implementation verification covering crypto, packet formats, link
+encryption, channel messaging, resource transfer and propagation-node exchanges.
+Tests start it automatically — no manual setup. The `conformance-bridge` module
+plays the same role for the reticulum-conformance suite.
 
-Tests are started automatically - no manual setup required.
+The Python reference is the oracle for every parity decision here. Where
+Kotlin behaviour differs on purpose, the divergence is recorded in
+[`port-deviations.md`](port-deviations.md) with the Python file and line it
+departs from.
 
 ## License
 
-[MPL-2.0](LICENSE)
+[MPL-2.0](LICENSE). `rns-core` and `rns-interfaces` are a port of
+[Reticulum](https://github.com/markqvist/Reticulum); its license and copyright
+notice are reproduced in [`NOTICE`](NOTICE).

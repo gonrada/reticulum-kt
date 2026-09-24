@@ -15,7 +15,8 @@ import java.io.RandomAccessFile
 
 /**
  * Unit tests for the receiver-side integrity-failure branches in
- * Resource.assemble() and the split temp-file cleanup in closeInputFile().
+ * Resource.assemble(). (The reference tree's temp-file cleanup case does not apply:
+ * this port keeps split transfers in memory, see port-deviations.md.)
  *
  * These are the "corrupted-in-flight transfer must become CORRUPT, not be
  * silently accepted" branches. Each marks the transfer CORRUPT (or cancels it
@@ -150,34 +151,10 @@ class ResourceAssemblyIntegrityFailureTest {
 
         res.assembleForTest()
 
-        // The bomb guard marks the transfer CORRUPT. (It then rejects the
-        // resource and tears the link down; on this never-active link the
-        // reject packet cannot be encrypted and is skipped. ResourceBombTeardownTest
-        // covers the teardown on a real link; only the CORRUPT transition is
-        // asserted here.)
+        // The bomb guard marks the transfer CORRUPT. (It also calls cancel(), but
+        // markCorrupt runs first and sets status to CORRUPT, which is already a
+        // terminal state (>= COMPLETE), so cancel() is a no-op here and is not
+        // observable; only the CORRUPT transition is asserted.)
         assertEquals(ResourceConstants.CORRUPT, statusOf(res))
-    }
-
-    @Test
-    @DisplayName("cancel() releases the split temp file and input file (closeInputFile)")
-    fun `cancel closes and deletes the split temp file`() {
-        val res = receiverResource(freshSingleLink())
-        setField(res, "status", ResourceConstants.TRANSFERRING)
-        // Back a split transfer's input file / temp file via reflection (both
-        // are private), then cancel and confirm closeInputFile released them.
-        val temp = File.createTempFile("rns-res-test", ".tmp")
-        temp.writeBytes(ByteArray(16) { 3 })
-        val input = RandomAccessFile(temp, "rw")
-        setField(res, "tempFile", temp)
-        setField(res, "inputFile", input)
-
-        val failed = java.util.concurrent.atomic.AtomicBoolean(false)
-        res.callbacks.failed = { failed.set(true) }
-
-        res.cancel()
-
-        assertEquals(ResourceConstants.FAILED, statusOf(res))
-        assertTrue(failed.get(), "the failed callback must fire on cancel")
-        assertTrue(!temp.exists(), "closeInputFile should delete the split temp file")
     }
 }

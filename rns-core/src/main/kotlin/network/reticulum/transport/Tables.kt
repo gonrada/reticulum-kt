@@ -191,6 +191,34 @@ data class ReverseEntry(
 /**
  * Entry in the announce table, storing announces waiting to be retransmitted.
  */
+/**
+ * Per-destination announce-rate state for one rate-limited interface
+ * (python `Transport.announce_rate_table`, `Transport.py:2304-2330`).
+ *
+ * The mechanism is a tolerance, not a hard gate. Each announce that arrives sooner than
+ * `announce_rate_target` since the last ACCEPTED one adds a violation, and each one that
+ * arrives later removes one; only when violations exceed `announce_rate_grace` does the
+ * destination get blocked, and only until `last + target + penalty`. A destination that
+ * announces fast once is forgiven; one that will not slow down is not.
+ *
+ * Note which field the block is measured from: `last` is the last announce that was
+ * ACCEPTED, and it deliberately stops advancing once blocking begins, so a destination
+ * cannot push its own unblock time further out by continuing to announce.
+ */
+data class AnnounceRateEntry(
+    /** When the last accepted announce arrived. Frozen while blocked. */
+    var last: Long,
+
+    /** Running violation count, incremented and decremented as the rate moves. */
+    var rateViolations: Int = 0,
+
+    /** Announces are suppressed until this time; 0 when not blocked. */
+    var blockedUntil: Long = 0,
+
+    /** Arrival times, newest last, capped at [TransportConstants.MAX_RATE_TIMESTAMPS]. */
+    val timestamps: MutableList<Long> = mutableListOf(),
+)
+
 data class AnnounceEntry(
     /** The destination hash being announced. */
     val destinationHash: ByteArray,
@@ -214,7 +242,30 @@ data class AnnounceEntry(
     val receivingInterfaceHash: ByteArray,
 
     /** Local rebroadcast count. */
-    var localRebroadcasts: Int
+    var localRebroadcasts: Int,
+
+    /**
+     * When set, the rebroadcast goes out as a PATH_RESPONSE rather than a plain announce
+     * (python `block_rebroadcasts`, `Transport.py:3494`, applied at `:783-786`). A path
+     * response answers one requester; a plain announce invites every hearer to rebroadcast
+     * it onward, which is exactly what must not happen when we are replying to a request.
+     */
+    var blockRebroadcasts: Boolean = false,
+
+    /**
+     * Interface the rebroadcast is pinned to, or null to emit on all eligible interfaces
+     * (python `attached_interface`, `Transport.py:3519`). A path request is answered only
+     * on the interface it arrived on.
+     */
+    var attachedInterfaceHash: ByteArray? = null,
+
+    /**
+     * Who this announce came from: the announcing transport node's ID when the packet
+     * carried one, otherwise the destination's own hash (python `received_from`,
+     * `Transport.py:2178`/`:2202`). It is a HASH, not an interface, despite the reference
+     * naming its slot IDX_AT_RCVD_IF.
+     */
+    var receivedFrom: ByteArray = destinationHash,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

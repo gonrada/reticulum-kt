@@ -10,18 +10,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import network.reticulum.identity.Identity
-import network.reticulum.interfaces.IfacCredentials
-import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
+import network.reticulum.interfaces.framing.DeframerFeed
 import network.reticulum.interfaces.framing.HDLC
-import network.reticulum.interfaces.framing.KISS
+import network.reticulum.interfaces.framing.streamDeframer
+import network.reticulum.interfaces.framing.streamFramer
 import java.io.IOException
 import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * I2P peer interface — handles a single I2P connection.
@@ -80,12 +77,10 @@ class I2PInterfacePeer(
     override val hwMtu: Int = I2PInterface.HW_MTU
     override val supportsLinkMtuDiscovery: Boolean = false
 
-    // IFAC: delegate to parent
+    // IFAC: same network as the parent. Credentials and the 16-byte tag size derive
+    // in the Interface base from the delegated netname/netkey (identical bytes).
     override val ifacNetname: String? get() = parentI2P.ifacNetname
     override val ifacNetkey: String? get() = parentI2P.ifacNetkey
-    override val ifacSize: Int get() = parentI2P.ifacSize
-    override val ifacKey: ByteArray? get() = parentI2P.ifacKey
-    override val ifacIdentity: Identity? get() = parentI2P.ifacIdentity
 
     /** Whether this peer initiated the connection (outbound). */
     val isInitiator: Boolean = targetI2pDest != null
@@ -95,9 +90,14 @@ class I2PInterfacePeer(
         private set
 
     private var socket: Socket? = connectedSocket
-    private val writing = AtomicBoolean(false)
-    private val reconnecting = AtomicBoolean(false)
-    private val neverConnected = AtomicBoolean(true)
+    // Serializes concurrent writes to the socket. Was an AtomicBoolean check-then-set with a
+    // 1ms Thread.sleep busy-spin — racy (two threads can pass the check before either sets
+    // the flag, interleaving frame bytes on the socket). A ReentrantLock gives real mutual
+    // exclusion and wakes immediately. Same fix as TCPClientInterface.
+    private val writeLock = java.util.concurrent.locks.ReentrantLock()
+
+    // Two HDLC flags — the watchdog keepalive. Allocated once, not per tick.
+    private val keepaliveFrame = byteArrayOf(HDLC.FLAG, HDLC.FLAG)
     private var samStreamConnection: SamConnection? = null
 
     // Watchdog timing
@@ -110,13 +110,11 @@ class I2PInterfacePeer(
     private var tunnelJob: Job? = null
     private var samSessionConnection: SamConnection? = null
 
-    // A peer that never sends a closing FLAG must not grow the deframer without limit:
-    // one MTU of payload escapes to at most twice its size.
-    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = 2 * hwMtu + 16) { data ->
-        processIncoming(data)
-    }
-
-    private val kissDeframer = KISS.createDeframer { _, data ->
+    // Framer and deframer are selected once from useKissFraming; the deframer bounds
+    // (KISS decode cap at HW_MTU, HDLC escaped-buffer cap 2*HW_MTU+16) derive from hwMtu.
+    private val framer: (ByteArray) -> ByteArray = streamFramer(useKissFraming)
+    private val deframer: DeframerFeed =
+        streamDeframer(useKissFraming, hwMtu, ifacSize = { ifacSize }) { data ->
         processIncoming(data)
     }
 
@@ -129,7 +127,6 @@ class I2PInterfacePeer(
             // Inbound connection — socket already connected
             socket = connectedSocket
             setOnline(true)
-            neverConnected.set(false)
 
             configureSocket(socket!!)
             startReadLoop()
@@ -181,7 +178,6 @@ class I2PInterfacePeer(
                 configureSocket(streamConn.socket)
 
                 setOnline(true)
-                neverConnected.set(false)
                 tunnelState = TUNNEL_STATE_ACTIVE
 
                 // Request tunnel synthesis for this I2P connection
@@ -235,7 +231,7 @@ class I2PInterfacePeer(
         lastWrite = System.currentTimeMillis()
 
         readJob = ioScope.launch {
-            readLoop(sock, input)
+            readLoop(input)
         }
 
         // Start watchdog for tunnel health monitoring
@@ -251,24 +247,16 @@ class I2PInterfacePeer(
      * Matches Python's I2PInterfacePeer.read_loop, including the
      * inline HDLC/KISS deframing.
      */
-    private suspend fun readLoop(@Suppress("UNUSED_PARAMETER") sock: Socket, input: InputStream) {
+    private suspend fun readLoop(input: InputStream) {
         val buffer = ByteArray(4096)
 
         try {
             while (ioScope.isActive && online.value && !detached.get()) {
-                val bytesRead = withContext(Dispatchers.IO) {
-                    input.read(buffer)
-                }
+                val bytesRead = input.read(buffer)
 
                 if (bytesRead > 0) {
                     lastRead = System.currentTimeMillis()
-                    val data = buffer.copyOf(bytesRead)
-
-                    if (useKissFraming) {
-                        kissDeframer.process(data)
-                    } else {
-                        hdlcDeframer.process(data)
-                    }
+                    deframer(buffer, 0, bytesRead)
                 } else if (bytesRead == -1) {
                     // Connection closed
                     setOnline(false)
@@ -332,10 +320,16 @@ class I2PInterfacePeer(
                 if (timeSinceWrite > I2P_PROBE_AFTER_S) {
                     try {
                         if (!sock.isClosed && sock.isConnected) {
-                            // Send empty HDLC flags as keepalive
-                            val keepalive = byteArrayOf(HDLC.FLAG.toByte(), HDLC.FLAG.toByte())
-                            sock.getOutputStream().write(keepalive)
-                            sock.getOutputStream().flush()
+                            // Send empty HDLC flags as keepalive — under writeLock so it can
+                            // never be spliced into a frame processOutgoing is mid-write.
+                            writeLock.lock()
+                            try {
+                                val out = sock.getOutputStream()
+                                out.write(keepaliveFrame)
+                                out.flush()
+                            } finally {
+                                writeLock.unlock()
+                            }
                             lastWrite = System.currentTimeMillis()
                         }
                     } catch (e: Exception) {
@@ -364,18 +358,11 @@ class I2PInterfacePeer(
 
         val sock = socket ?: throw IllegalStateException("Socket is null")
 
-        while (writing.get()) {
-            Thread.sleep(1)
-        }
-
+        // lockInterruptibly() keeps the old busy-spin's InterruptedException path, so a
+        // teardown can still interrupt a contended writer (see TCPClientInterface).
+        writeLock.lockInterruptibly()
         try {
-            writing.set(true)
-
-            val framedData = if (useKissFraming) {
-                KISS.frame(data)
-            } else {
-                HDLC.frame(data)
-            }
+            val framedData = framer(data)
 
             sock.getOutputStream().write(framedData)
             sock.getOutputStream().flush()
@@ -389,7 +376,7 @@ class I2PInterfacePeer(
             teardown()
             throw e
         } finally {
-            writing.set(false)
+            writeLock.unlock()
         }
     }
 

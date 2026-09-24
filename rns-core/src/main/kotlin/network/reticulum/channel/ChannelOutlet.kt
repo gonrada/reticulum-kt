@@ -35,6 +35,19 @@ interface ChannelOutlet {
     val isUsable: Boolean
 
     /**
+     * Whether the underlying transport has gone away for good, so no later send
+     * can succeed. A full send window or a transport that is still coming up is
+     * NOT closed — those recover.
+     *
+     * Separate from [isUsable] because the Link outlet reports itself usable
+     * unconditionally, mirroring python `LinkChannelOutlet.is_usable`
+     * (Channel.py:579), so readiness alone cannot tell a transient refusal from
+     * a terminal one. Defaults to the inverse of [isUsable] for outlets that do
+     * report readiness honestly.
+     */
+    val isClosed: Boolean get() = !isUsable
+
+    /**
      * Whether the outlet has timed out.
      */
     val timedOut: Boolean

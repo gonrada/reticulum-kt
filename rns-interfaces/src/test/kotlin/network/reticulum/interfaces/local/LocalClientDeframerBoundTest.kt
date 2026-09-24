@@ -36,15 +36,13 @@ class LocalClientDeframerBoundTest {
         val received = CopyOnWriteArrayList<ByteArray>()
         val latch = CountDownLatch(1)
 
-        // Off the range the other local-interface tests use.
-        val tcpPort = 37439
-        val srv = LocalServerInterface(name = "BoundServer", tcpPort = tcpPort)
+        val srv = LocalServerInterface(name = "BoundServer", tcpPort = 0)
         srv.onPacketReceived = { data, _ -> received.add(data); latch.countDown() }
         server = srv
         srv.start()
 
         val sock = Socket()
-        sock.connect(InetSocketAddress("127.0.0.1", tcpPort), 3000)
+        sock.connect(InetSocketAddress("127.0.0.1", srv.boundPort), 3000)
         raw = sock
         val out = sock.getOutputStream()
 

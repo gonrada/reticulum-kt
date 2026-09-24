@@ -7,18 +7,15 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
+import network.reticulum.common.RnsLog
 import network.reticulum.interfaces.toRef
 import network.reticulum.transport.Transport
-import kotlinx.coroutines.withContext
-import network.reticulum.identity.Identity
-import network.reticulum.interfaces.IfacCredentials
-import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
-import network.reticulum.interfaces.framing.HDLC
-import network.reticulum.interfaces.framing.KISS
+import network.reticulum.interfaces.framing.DeframerFeed
+import network.reticulum.interfaces.framing.streamDeframer
+import network.reticulum.interfaces.framing.streamFramer
 import network.reticulum.interfaces.util.TcpKeepalive
 import java.io.IOException
 import java.net.InetSocketAddress
@@ -26,7 +23,6 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -66,24 +62,16 @@ class TCPServerInterface(
         const val ACCEPT_ERROR_DELAY_MS = 250L
     }
 
-    // IFAC credentials - derived lazily from network name/passphrase
-    private val _ifacCredentials: IfacCredentials? by lazy {
-        IfacUtils.deriveIfacCredentials(ifacNetname, ifacNetkey)
-    }
+    // IFAC credentials are derived in the Interface base from ifacNetname/ifacNetkey;
+    // only the tag size is interface-specific.
+    // python Reticulum.py:719-723: a configured ifac_size (bits) >=
+    // IFAC_MIN_SIZE*8 (==8) divides by 8; otherwise it floors back to
+    // DEFAULT_IFAC_SIZE.
+    override val defaultIfacSize: Int
+        get() = DEFAULT_IFAC_SIZE
 
-    override val ifacSize: Int
-        get() = if (_ifacCredentials != null) {
-            // python Reticulum.py:719-723: a configured ifac_size (bits) >=
-            // IFAC_MIN_SIZE*8 (==8) divides by 8; otherwise it floors back to
-            // DEFAULT_IFAC_SIZE.
-            ifacSizeBits?.takeIf { it >= 8 }?.div(8) ?: DEFAULT_IFAC_SIZE
-        } else 0
-
-    override val ifacKey: ByteArray?
-        get() = _ifacCredentials?.key
-
-    override val ifacIdentity: Identity?
-        get() = _ifacCredentials?.identity
+    override val configuredIfacSizeBits: Int?
+        get() = ifacSizeBits
 
     // python Reticulum.py:765-768 — a configured bitrate below MINIMUM_BITRATE
     // is ignored; the interface keeps its class BITRATE_GUESS.
@@ -168,10 +156,7 @@ class TCPServerInterface(
         while (online.value && !detached.get()) {
             try {
                 val server = serverSocket ?: break
-                // Blocking accept wrapped in IO dispatcher
-                val clientSocket = withContext(Dispatchers.IO) {
-                    server.accept()
-                }
+                val clientSocket = server.accept()
 
                 if (clients.size >= maxClients) {
                     log("Max clients ($maxClients) reached, rejecting connection")
@@ -275,8 +260,13 @@ class TCPServerInterface(
 
     /**
      * Get list of connected client interfaces.
+     *
+     * Snapshot with a Java copy, not Kotlin's List.toList(): its size==1 fast path
+     * reads size then get(0) separately, which races with a concurrent removal on
+     * the CopyOnWriteArrayList (ArrayIndexOutOfBoundsException during teardown).
+     * Same fix as LocalServerInterface.
      */
-    fun getClients(): List<Interface> = clients.toList()
+    fun getClients(): List<Interface> = ArrayList(clients)
 
     override fun detach() {
         super.detach()
@@ -285,8 +275,8 @@ class TCPServerInterface(
         acceptJob?.cancel()
         ioScope.cancel()
 
-        // Disconnect all clients
-        for (client in clients.toList()) {
+        // Disconnect all clients (Java snapshot copy; see getClients for why not toList()).
+        for (client in ArrayList(clients)) {
             client.detach()
         }
         clients.clear()
@@ -303,10 +293,7 @@ class TCPServerInterface(
     }
 
     private fun log(message: String) {
-        val timestamp = java.time.LocalDateTime.now().format(
-            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-        )
-        println("[$timestamp] [$name] $message")
+        RnsLog.log(RnsLog.INFO, name, message)
     }
 
     override fun toString(): String = "TCPServerInterface[$name @ $bindAddress:$bindPort]"
@@ -326,12 +313,12 @@ class TCPServerClientInterface internal constructor(
         parentInterface = parentServer
     }
 
-    // IFAC: delegate to parent server (same credentials for all clients on this server)
+    // IFAC: same network as the parent server. Credentials derive in the Interface
+    // base from the delegated netname/netkey (identical bytes); the tag size follows
+    // the parent so a configured ifacSizeBits applies to every client.
     override val ifacNetname: String? get() = parentServer.ifacNetname
     override val ifacNetkey: String? get() = parentServer.ifacNetkey
     override val ifacSize: Int get() = parentServer.ifacSize
-    override val ifacKey: ByteArray? get() = parentServer.ifacKey
-    override val ifacIdentity: Identity? get() = parentServer.ifacIdentity
 
     // Spawned children inherit the parent server's MTU/bitrate posture so the
     // RECEIVER side of a fixed-MTU link negotiates the same value as the parent
@@ -343,21 +330,16 @@ class TCPServerClientInterface internal constructor(
     override val fixedMtu: Boolean = parentServer.fixedMtu
     override val supportsLinkMtuDiscovery: Boolean = true
 
-    private val writing = AtomicBoolean(false)
 
     // Coroutine scope for I/O operations (battery-efficient on Android)
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var readJob: Job? = null
 
-    // A peer that never sends a closing FLAG must not grow the deframer without limit:
-    // one MTU of payload escapes to at most twice its size.
-    private val hdlcDeframer = HDLC.createDeframer(maxFrameBytes = 2 * hwMtu + 16) { data ->
-        processIncoming(data)
-    }
-
-    // Cap decoded KISS frames at this interface's HW_MTU, matching python's
-    // `len(data_buffer) < self.HW_MTU` read-loop gate (TCPInterface.py:370).
-    private val kissDeframer = KISS.createDeframer(hwMtu) { _, data ->
+    // Framer and deframer are selected once from useKissFraming; the deframer bounds
+    // (KISS decode cap at HW_MTU, HDLC escaped-buffer cap 2*HW_MTU+16) derive from hwMtu.
+    private val framer: (ByteArray) -> ByteArray = streamFramer(useKissFraming)
+    private val deframer: DeframerFeed =
+        streamDeframer(useKissFraming, hwMtu, ifacSize = { ifacSize }) { data ->
         processIncoming(data)
     }
 
@@ -382,18 +364,10 @@ class TCPServerClientInterface internal constructor(
 
         try {
             while (online.value && !detached.get()) {
-                // Blocking read wrapped in IO dispatcher
-                val bytesRead = withContext(Dispatchers.IO) {
-                    socket.getInputStream().read(buffer)
-                }
+                val bytesRead = socket.getInputStream().read(buffer)
 
                 if (bytesRead > 0) {
-                    val data = buffer.copyOf(bytesRead)
-                    if (useKissFraming) {
-                        kissDeframer.process(data)
-                    } else {
-                        hdlcDeframer.process(data)
-                    }
+                    deframer(buffer, 0, bytesRead)
                 } else if (bytesRead == -1) {
                     // Connection closed
                     break
@@ -409,7 +383,7 @@ class TCPServerClientInterface internal constructor(
             // python TCPInterface.py:426-434 catches Exception and tears the client
             // down; without this the slot in the parent's client list leaked.
             if (!detached.get()) {
-                log("Read loop error: ${e.javaClass.name}: ${e.message}")
+                RnsLog.log(RnsLog.WARNING, name, "Read loop error: ${e.javaClass.name}: ${e.message}")
                 setOnline(false)
             }
         }
@@ -435,26 +409,18 @@ class TCPServerClientInterface internal constructor(
         // GIL around blocking socket writes.
         synchronized(this) {
             try {
-                writing.set(true)
-
-                val framedData = if (useKissFraming) {
-                    KISS.frame(data)
-                } else {
-                    HDLC.frame(data)
-                }
+                val framedData = framer(data)
 
                 socket.getOutputStream().write(framedData)
                 socket.getOutputStream().flush()
 
-                log("Sent ${data.size} bytes (framed: ${framedData.size} bytes)")
+                logDebug { "Sent ${data.size} bytes (framed: ${framedData.size} bytes)" }
                 txBytes.addAndGet(framedData.size.toLong())
                 parentInterface?.txBytes?.addAndGet(framedData.size.toLong())
 
             } catch (e: IOException) {
                 detach()
                 throw e
-            } finally {
-                writing.set(false)
             }
         }
     }
@@ -477,10 +443,12 @@ class TCPServerClientInterface internal constructor(
     }
 
     private fun log(message: String) {
-        val timestamp = java.time.LocalDateTime.now().format(
-            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-        )
-        println("[$timestamp] [$name] $message")
+        RnsLog.log(RnsLog.INFO, name, message)
+    }
+
+    /** Lazy DEBUG log for per-frame hot paths — the message is built only when enabled. */
+    private inline fun logDebug(message: () -> String) {
+        RnsLog.log(RnsLog.DEBUG, name, message)
     }
 
     override fun toString(): String = "TCPServerClientInterface[$name]"

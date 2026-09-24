@@ -55,13 +55,16 @@ class TCPInterfaceTuningTest {
     fun `default mtu posture`() {
         val server = TCPServerInterface(name = "s", bindPort = 0)
         // python interface_post_init runs optimise_mtu() on every non-fixed
-        // interface (Reticulum.py:780); the 10 Mbps BITRATE_GUESS maps to 8192,
+        // interface (Reticulum.py:780); the 10 Mbps BITRATE_GUESS maps to 16384,
         // NOT the class HW_MTU=262144 (that is only the pre-optimise default).
+        // 10 Mbps sits exactly on a tier boundary, and RNS 1.5.2 made every
+        // comparison inclusive (Interface.py:250-262), so it lands in the 16384
+        // tier rather than the 8192 one below it as it did through 1.3.1.
         assertEquals(
             Interface.optimiseMtu(server.bitrate.toLong()) ?: TCPServerInterface.HW_MTU,
             server.hwMtu,
         )
-        assertEquals(8192, server.hwMtu)
+        assertEquals(16384, server.hwMtu)
         assertTrue(server.autoconfigureMtu)
         assertFalse(server.fixedMtu)
         assertTrue(server.supportsLinkMtuDiscovery)

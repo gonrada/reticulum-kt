@@ -229,12 +229,12 @@ class NearbyInterface(
         peers[endpointId] = peer
         spawnedInterfaces?.add(peer)
 
-        // Set up packet callback and register with Transport
-        peer.onPacketReceived = { data, fromInterface ->
-            Transport.inbound(data, fromInterface.toRef())
-        }
+        // Create the adapter before start(): toRef() installs the default receive
+        // callback (InterfaceAdapter: Transport.inbound(data, peerRef)) since none is
+        // set, so packets are deliverable as soon as the peer starts. Then register.
+        val peerRef = peer.toRef()
         peer.start()
-        Transport.registerInterface(peer.toRef())
+        Transport.registerInterface(peerRef)
 
         log("Spawned peer interface: $peerName ($endpointName), total=${peers.size}")
     }

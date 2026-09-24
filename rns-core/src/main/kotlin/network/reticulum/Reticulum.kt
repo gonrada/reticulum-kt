@@ -1,6 +1,7 @@
 package network.reticulum
 
 import network.reticulum.common.RnsConstants
+import network.reticulum.common.RnsLog
 import network.reticulum.common.hexToByteArray
 import network.reticulum.common.toHexString
 import network.reticulum.crypto.Hashes
@@ -80,6 +81,16 @@ class Reticulum private constructor(
     val enableRemoteManagement: Boolean = false,     // python __remote_management_enabled (default False, :255)
     private val remoteManagementAllowedHashes: List<ByteArray> = emptyList(),
     val panicOnInterfaceError: Boolean = false,      // python panic_on_interface_error (default False, :281)
+    /**
+     * Inbound queue depth per traffic class (python `qlen_in_data`, `qlen_in_announce`,
+     * `qlen_in_pr`, `qlen_in_il`, Reticulum.py:705-719). Read once by Transport.start() when
+     * it builds the queues; a value of zero or less falls back to the Transport default,
+     * exactly as the reference treats a non-positive config value.
+     */
+    val inboundDataQueueLength: Int = network.reticulum.transport.TransportConstants.INBOUND_DA_QUEUE_LENGTH,
+    val inboundAnnounceQueueLength: Int = network.reticulum.transport.TransportConstants.INBOUND_AN_QUEUE_LENGTH,
+    val inboundPrQueueLength: Int = network.reticulum.transport.TransportConstants.INBOUND_PR_QUEUE_LENGTH,
+    val inboundIlQueueLength: Int = network.reticulum.transport.TransportConstants.INBOUND_IL_QUEUE_LENGTH,
     private val blackholeSourceHashes: List<ByteArray> = emptyList(),
     /** Trusted interface-discovery-source identity hashes (python __interface_sources). */
     val interfaceDiscoverySources: List<ByteArray> = emptyList(),
@@ -104,15 +115,22 @@ class Reticulum private constructor(
         const val LINK_MTU_DISCOVERY = true
 
         /**
-         * Maximum queued announces.
+         * Maximum queued announces per interface; past this depth a forwarded announce
+         * is dropped rather than queued (python Reticulum.py:111, Transport.py:1536).
+         *
+         * RNS 1.5.2 lowered this from 16384 to 4096. It bounds how much memory a peer
+         * flooding announces can make us hold, so keeping the old ceiling meant absorbing
+         * four times what the reference will.
          */
-        const val MAX_QUEUED_ANNOUNCES = 16384
+        const val MAX_QUEUED_ANNOUNCES = 4096
 
         /**
-         * How long a queued announce survives before being purged as stale,
-         * in seconds (python: QUEUED_ANNOUNCE_LIFE = 60*60*24, Reticulum.py:111).
+         * How long a queued announce survives before being purged as stale, in seconds
+         * (python Reticulum.py:112, applied at Interface.py:399).
+         *
+         * RNS 1.5.2 lowered this from 24h to 3h.
          */
-        const val QUEUED_ANNOUNCE_LIFE = 60 * 60 * 24
+        const val QUEUED_ANNOUNCE_LIFE = 60 * 60 * 3
 
         /**
          * Announce cap - maximum percentage of bandwidth for announces.
@@ -192,6 +210,7 @@ class Reticulum private constructor(
         private var pendingLocalClientFactory: ((Int, String) -> Any)? = null
         private var pendingLocalServerFactory: ((Int) -> Any)? = null
         private var pendingInterfaceRegistrar: ((Any) -> Unit)? = null
+        private var pendingInterfaceDeregistrar: ((Any) -> Unit)? = null
 
         /**
          * Set the LocalClientInterface factory before calling start().
@@ -216,6 +235,17 @@ class Reticulum private constructor(
          */
         fun setInterfaceRegistrar(registrar: (Any) -> Unit) {
             pendingInterfaceRegistrar = registrar
+        }
+
+        /**
+         * Set the inverse of [setInterfaceRegistrar]: deregister an interface from Transport.
+         * Optional — when set, it lets rns-core undo a registration if interface startup fails
+         * after the interface was registered (see [tryConnectToSharedInstance]). A consumer
+         * that wires a registrar should wire the matching deregistrar as
+         * `Transport.deregisterInterface(iface.toRef())`.
+         */
+        fun setInterfaceDeregistrar(deregistrar: (Any) -> Unit) {
+            pendingInterfaceDeregistrar = deregistrar
         }
 
         /**
@@ -289,11 +319,13 @@ class Reticulum private constructor(
                         rpcKeyHex = rpcKey,
                     )
                 instance = rns
+                registerExitHandler()
 
                 // Apply pre-set factories before initialize
                 pendingLocalClientFactory?.let { rns.localClientInterfaceFactory = it }
                 pendingLocalServerFactory?.let { rns.localServerInterfaceFactory = it }
                 pendingInterfaceRegistrar?.let { rns.interfaceRegistrar = it }
+                pendingInterfaceDeregistrar?.let { rns.interfaceDeregistrar = it }
 
                 try {
                     rns.initialize()
@@ -363,6 +395,33 @@ class Reticulum private constructor(
         }
 
         /**
+         * JVM shutdown hook, the counterpart of python's `atexit.register(exit_handler)`
+         * plus its SIGINT/SIGTERM handlers (`Reticulum.py:374-376`).
+         *
+         * Without it a process that simply ends — the normal way a CLI tool or a test
+         * harness finishes — leaves its links to be discovered as dead by the peer's
+         * watchdog, which reports TIMEOUT. The peer cannot tell that from a node that
+         * crashed. Running [stop] here sends the LINKCLOSE that says otherwise.
+         *
+         * Registered once, on the first start, and idempotent through `stop`'s
+         * compare-and-set. The JVM runs shutdown hooks on SIGINT and SIGTERM too, so this
+         * single hook covers all three cases python handles separately.
+         */
+        private val shutdownHookRegistered = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        private fun registerExitHandler() {
+            if (!shutdownHookRegistered.compareAndSet(false, true)) return
+            try {
+                Runtime.getRuntime().addShutdownHook(
+                    Thread({ runCatching { stop() } }, "Reticulum-shutdown"),
+                )
+            } catch (e: Exception) {
+                // A host that forbids shutdown hooks, or one already shutting down.
+                // Nothing to recover: an explicit stop() still works.
+            }
+        }
+
+        /**
          * Clear any pending local-client / local-server / interface-registrar
          * factories previously installed via the `set*Factory` / `setInterfaceRegistrar`
          * setters. Intended for test harnesses (e.g. the conformance bridge) that
@@ -382,6 +441,7 @@ class Reticulum private constructor(
             pendingLocalClientFactory = null
             pendingLocalServerFactory = null
             pendingInterfaceRegistrar = null
+            pendingInterfaceDeregistrar = null
         }
 
         /**
@@ -418,6 +478,23 @@ class Reticulum private constructor(
          * Reticulum.panic_on_interface_error, default False).
          */
         fun panicOnInterfaceError(): Boolean = instance?.panicOnInterfaceError ?: false
+
+        // Inbound queue depths (python Reticulum.default_*_queue_length, Reticulum.py:2060-2073).
+        // `or Transport.INBOUND_*_QUEUE_LENGTH` in the reference is the non-positive fallback here.
+        private fun queueLength(configured: Int?, default: Int): Int =
+            if (configured != null && configured > 0) configured else default
+
+        fun inboundDataQueueLength(): Int =
+            queueLength(instance?.inboundDataQueueLength, network.reticulum.transport.TransportConstants.INBOUND_DA_QUEUE_LENGTH)
+
+        fun inboundAnnounceQueueLength(): Int =
+            queueLength(instance?.inboundAnnounceQueueLength, network.reticulum.transport.TransportConstants.INBOUND_AN_QUEUE_LENGTH)
+
+        fun inboundPrQueueLength(): Int =
+            queueLength(instance?.inboundPrQueueLength, network.reticulum.transport.TransportConstants.INBOUND_PR_QUEUE_LENGTH)
+
+        fun inboundIlQueueLength(): Int =
+            queueLength(instance?.inboundIlQueueLength, network.reticulum.transport.TransportConstants.INBOUND_IL_QUEUE_LENGTH)
 
         /**
          * Trusted interface-discovery-source identity hashes (python
@@ -457,12 +534,7 @@ class Reticulum private constructor(
         fun linkMtuDiscovery(): Boolean = LINK_MTU_DISCOVERY
 
         private fun log(message: String) {
-            val timestamp =
-                java.time.LocalDateTime.now().format(
-                    java.time.format.DateTimeFormatter
-                        .ofPattern("yyyy-MM-dd HH:mm:ss.SSS"),
-                )
-            println("[$timestamp] [Reticulum] $message")
+            RnsLog.log(RnsLog.INFO, "Reticulum", message)
         }
     }
 
@@ -503,6 +575,9 @@ class Reticulum private constructor(
 
     /** Callback to adapt an interface and register it with Transport. */
     var interfaceRegistrar: ((Any) -> Unit)? = null
+
+    /** Optional inverse of [interfaceRegistrar]: deregister an interface from Transport. */
+    var interfaceDeregistrar: ((Any) -> Unit)? = null
 
     /**
      * Initialize the Reticulum instance.
@@ -622,18 +697,40 @@ class Reticulum private constructor(
         try {
             val clientInterface = factory(sharedInstancePort, "127.0.0.1")
 
+            // The shared-instance-client posture is set on Transport BEFORE it starts:
+            // Transport.start() builds the probe and remote-management destinations, and
+            // the gates it reads (Reticulum.probeDestinationEnabled / remoteManagementEnabled)
+            // return false only when this flag is already true. Setting it afterwards let a
+            // client register those destinations under the transport identity it shares
+            // with the master — the same hashes the master serves. Python forces the
+            // knobs off at attach time, before Transport.start (Reticulum.py:437-440). The
+            // instance-level flag still flips only on success, below; the catch resets both.
+            Transport.isConnectedToSharedInstance = true
+
             // Start Transport (without transport routing) so inbound() works
             Transport.start(transportIdentity = transportIdentity, enableTransport = false)
 
-            // Start the interface
-            clientInterface::class.java.getMethod("start").invoke(clientInterface)
-
-            // Register with Transport so packets flow through
+            // Register with Transport — which wires onPacketReceived — BEFORE launching the
+            // read loop. Python installs the callback atomically with the interface
+            // (Reticulum.py:402-414). Starting the read loop first (the previous order) opened
+            // a race: a frame arriving in the start()/registrar() gap hit a null
+            // onPacketReceived and was silently dropped (Interface.processIncoming no-ops on a
+            // null callback after counting rxBytes). See issue #71.
             val registrar = interfaceRegistrar
             if (registrar != null) {
                 registrar(clientInterface)
             } else {
                 log("WARNING: No interface registrar set, packets will not be processed")
+            }
+
+            // Now launch the read loop. If startup fails after registration, undo the
+            // registration so a failed connect does not leave a dead interface registered
+            // in Transport (the reorder above registers before connect() can throw).
+            try {
+                clientInterface::class.java.getMethod("start").invoke(clientInterface)
+            } catch (e: Exception) {
+                interfaceDeregistrar?.invoke(clientInterface)
+                throw e
             }
 
             // Set state only after all steps succeed (matches Python Reticulum.py:414-416)
@@ -666,15 +763,22 @@ class Reticulum private constructor(
             sharedInterface = serverInterface
             isSharedInstance = true
 
-            // Start the interface
-            serverInterface::class.java.getMethod("start").invoke(serverInterface)
-
-            // Register with Transport
+            // Register with Transport — wiring onPacketReceived — before launching the accept
+            // loop, mirroring the client path (issue #71). The window is narrower here (a fresh
+            // listener has no connected peer yet), but reordered for consistency and safety.
             val registrar = interfaceRegistrar
             if (registrar != null) {
                 registrar(serverInterface)
             } else {
                 log("WARNING: No interface registrar set for server interface")
+            }
+
+            // Launch the accept loop; undo registration if startup fails.
+            try {
+                serverInterface::class.java.getMethod("start").invoke(serverInterface)
+            } catch (e: Exception) {
+                interfaceDeregistrar?.invoke(serverInterface)
+                throw e
             }
 
             log("Started shared instance server on port $sharedInstancePort")
@@ -811,6 +915,16 @@ class Reticulum private constructor(
      */
     private fun shutdown() {
         log("Shutting down Reticulum...")
+
+        // FIRST, before anything is detached: the LINKCLOSE packets have to travel over
+        // the interfaces, and everything below this line takes them down. python orders it
+        // the same way — detach_interfaces tears the links down and waits before it
+        // detaches anything (Transport.py:3625-3637).
+        try {
+            Transport.tearDownLinksForShutdown()
+        } catch (e: Exception) {
+            log("Error tearing down links during shutdown: ${e.message}")
+        }
 
         // Persist known destinations before shutdown so identities survive restart
         try {

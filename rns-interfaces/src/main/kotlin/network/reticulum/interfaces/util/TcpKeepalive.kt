@@ -7,7 +7,8 @@ import java.nio.channels.SocketChannel
 
 /**
  * TCP dead-peer detection, mirroring python `TCPClientInterface.set_timeouts_linux`
- * (RNS/Interfaces/TCPInterface.py:183-197): `SO_KEEPALIVE` on, first probe after
+ * (RNS/Interfaces/TCPInterface.py:183-197) and `BackboneClientInterface.set_timeouts_linux`
+ * (RNS/Interfaces/BackboneInterface.py:920-922): `SO_KEEPALIVE` on, first probe after
  * [TCP_PROBE_AFTER] s of idle, then every [TCP_PROBE_INTERVAL] s, giving up after
  * [TCP_PROBES] probes — a peer that vanishes without FIN is detected in ~30 s instead of
  * the OS default (~2 h on Linux), so it cannot hold a server slot forever.

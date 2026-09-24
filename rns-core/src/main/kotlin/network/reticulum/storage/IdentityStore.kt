@@ -26,6 +26,10 @@ interface IdentityStore {
     /** Return the number of stored known destinations. */
     fun knownDestinationCount(): Int
 
+    /** Remove a known destination (used when the in-memory cache evicts a
+     *  stale, pathless entry so persistence does not reload it on restart). */
+    fun removeKnownDestination(destHash: ByteArray)
+
     // ===== Per-Peer Ratchets =====
 
     /** Store a ratchet received from a remote peer's announce. */
