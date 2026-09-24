@@ -405,12 +405,20 @@ private fun buildResourceReceiver(link: Link, payloadLen: Int, forceSdu: Int? = 
  * (Link.kt:1773-1781), then dispatched — the kotlin analog of the reference
  * driving RNS.Link.receive on a crafted inbound packet.
  */
-private fun feedInboundLinkPacket(link: Link, plaintext: ByteArray, context: network.reticulum.common.PacketContext) {
+private fun craftInboundLinkPacket(
+    link: Link,
+    plaintext: ByteArray,
+    context: network.reticulum.common.PacketContext,
+): Packet {
     val raw = buildLinkPacketRaw(link, plaintext, context)
     val rx = Packet.unpack(raw)
         ?: throw IllegalStateException("could not unpack crafted inbound resource packet")
     rx.setReceivingInterfaceHashForTest(link.attachedInterfaceHash)
-    link.receive(rx)
+    return rx
+}
+
+private fun feedInboundLinkPacket(link: Link, plaintext: ByteArray, context: network.reticulum.common.PacketContext) {
+    link.receive(craftInboundLinkPacket(link, plaintext, context))
 }
 
 /** Lifecycle snapshot of an RNS.Link — mirrors the reference _link_status_dict.
@@ -465,6 +473,10 @@ private class Listener(
     val identity: Identity,
     val recvBuffer: ConcurrentLinkedDeque<ByteArray> = ConcurrentLinkedDeque(),
     val resourceBuffer: ConcurrentLinkedDeque<ByteArray> = ConcurrentLinkedDeque(),
+    // Opportunistic DATA: packets addressed straight to the SINGLE destination, not
+    // routed through a Link. Kept apart from recvBuffer so a test that uses both
+    // surfaces on one destination can drain each unambiguously (wire_tcp.py:10373).
+    val opportunisticBuffer: ConcurrentLinkedDeque<ByteArray> = ConcurrentLinkedDeque(),
     // Inbound (receiver-side) links this destination has accepted, in arrival
     // order — lets wire_listener_link_status observe teardown_reason on the
     // side that did NOT initiate the close.
@@ -587,6 +599,7 @@ private fun parseInterfaceMode(raw: String?): InterfaceMode? {
         "roaming" -> InterfaceMode.ROAMING
         "boundary" -> InterfaceMode.BOUNDARY
         "gateway", "gw" -> InterfaceMode.GATEWAY
+        "internal" -> InterfaceMode.INTERNAL
         else -> throw IllegalArgumentException("Unknown interface mode: $raw")
     }
 }
@@ -618,7 +631,13 @@ private fun allocateFreePort(): Int {
 /** Detach interfaces, clear the map, and stop the RNS singleton.
  *  Clearing the map BEFORE stopping ensures no stale handle can survive
  *  and point at a dead Reticulum. */
+internal fun shutdownWireState() = resetWireState()
+
 private fun resetWireState() {
+    // BEFORE any interface is detached: link teardown sends LINKCLOSE over the very
+    // interfaces this function is about to close, and a peer that does not receive one
+    // reports TIMEOUT rather than DESTINATION_CLOSED.
+    runCatching { Transport.tearDownLinksForShutdown() }
     val stale = wireInstances.values.toList()
     wireInstances.clear()
     wireRequestHandlerLog.clear()
@@ -1020,6 +1039,11 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
                         Transport.registerInterface(iface.toRef())
                     }
                 }
+                Reticulum.setInterfaceDeregistrar { iface ->
+                    if (iface is network.reticulum.interfaces.Interface) {
+                        Transport.deregisterInterface(iface.toRef())
+                    }
+                }
 
                 rns = Reticulum.start(
                     configDir = configDir.absolutePath,
@@ -1284,6 +1308,17 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
         // receiver-relative RawChannelReaders for the multi-reader stream-id test.
         val openChannel = p.get("open_channel")?.asBoolean ?: true
         val bufferStreamIds = p.get("buffer_stream_ids")?.asJsonArray?.map { it.asInt }
+        // Single-packet proof strategy for this destination. Without honouring it the
+        // destination stays PROVE_NONE and never answers an opportunistic DATA packet,
+        // so the sender's receipt can only time out.
+        val proofStrategy = when (p.get("proof_strategy")?.asString) {
+            "all" -> Destination.PROVE_ALL
+            "app" -> Destination.PROVE_APP
+            "none", null -> Destination.PROVE_NONE
+            else -> throw IllegalArgumentException(
+                "Unknown proof_strategy: ${p.get("proof_strategy")?.asString} (use all|app|none)",
+            )
+        }
 
         val inst = wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
@@ -1304,7 +1339,16 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
             destination.enableRatchets(ratchetsFile.absolutePath)
         }
 
+        destination.setProofStrategy(proofStrategy)
+        if (proofStrategy == Destination.PROVE_APP) {
+            // PROVE_APP defers to the application; the reference's listener proves
+            // everything it is asked about (cmd_wire_set_proof_strategy).
+            destination.setProofRequestedCallback { true }
+        }
+
         val listener = Listener(destination, identity, resourceStrategy = resourceStrategy)
+        // Opportunistic DATA lands on the destination itself, not on a link.
+        destination.packetCallback = { data, _ -> listener.opportunisticBuffer.add(data.copyOf()) }
         // On link established, wire both packet and resource callbacks into
         // the listener's buffers.
         destination.setLinkEstablishedCallback { linkObj ->
@@ -1584,6 +1628,29 @@ private fun handleWireCmd1(command: String, p: JsonObject): JsonObject? = when (
             arr.add(item.toHex())
         }
         result("resources" to arr)
+    }
+
+    "wire_opportunistic_poll" -> {
+        // Drain opportunistic DATA for a listening destination. Mirrors
+        // cmd_wire_opportunistic_poll (wire_tcp.py:10364-10405): wait up to
+        // timeout_ms for at least one packet, then return everything buffered.
+        val handle = p.str("handle")
+        val destHashHex = p.str("destination_hash")
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 5000
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val listener = inst.listeners[destHashHex]
+            ?: throw IllegalArgumentException("No listener registered for destination_hash=$destHashHex")
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline && listener.opportunisticBuffer.isEmpty()) {
+            Thread.sleep(50)
+        }
+        val out = JsonArray()
+        while (true) {
+            val pkt = listener.opportunisticBuffer.pollFirst() ?: break
+            out.add(pkt.toHex())
+        }
+        result("packets" to out)
     }
 
     "wire_link_poll" -> {
@@ -2233,13 +2300,9 @@ private fun handleWireCmd2(command: String, p: JsonObject): JsonObject? = when (
             "recall_after_clear_found" to boolVal(afterClear != null),
             "recall_after_load_found" to boolVal(reloaded != null),
             "app_data_after_load" to (appDataAfter?.let { hexVal(it) } ?: JsonNull.INSTANCE),
-            // kotlin's known_destinations record is the 4-field IdentityData
-            // (timestamp, packet_hash, public_key, app_data). RNS 1.3.1 stores a
-            // 5-element entry with a trailing `used` LRU marker
-            // (Identity.py:107/:252-254). kotlin does not track that marker —
-            // a genuine divergence flagged for the Phase 6 triage; report the
-            // honest kotlin field count rather than faking a 5th element.
-            "entry_len_after_load" to intVal(if (reloaded != null) 4 else 0),
+            // [timestamp, packet_hash, public_key, app_data, last_used] — the same
+            // five fields the reference writes (Identity.py:107).
+            "entry_len_after_load" to intVal(if (reloaded != null) 5 else 0),
             "table_size_after_load" to intVal(Identity.knownDestinationCount()),
         )
     }
@@ -2511,16 +2574,12 @@ private fun handleWireCmd2(command: String, p: JsonObject): JsonObject? = when (
         val path = p.str("path")
         val responseNone = p.get("response_none")?.asBoolean ?: false
         val response = p.get("response")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
-        // kotlin's response generator returns ByteArray? only — it cannot return
-        // python's (file, metadata) tuple, so the streamed-file response branch
-        // is unsupported. Surface that clearly rather than silently mis-answering.
-        if (p.get("response_file") != null && !p.get("response_file").isJsonNull) {
-            throw IllegalArgumentException(
-                "wire_register_request_handler: response_file (streamed file + metadata " +
-                    "response) is not supported by the kotlin Destination request API " +
-                    "(its generator returns ByteArray only).",
-            )
-        }
+        // response_file selects the file branch: a Resource carrying its metadata in the
+        // resource's metadata block rather than inside the content.
+        val responseFile = p.get("response_file")
+            ?.takeIf { !it.isJsonNull }?.asString?.fromHex()
+        val responseMetadata = p.get("response_metadata")
+            ?.takeIf { !it.isJsonNull }?.asString?.takeIf { it.isNotEmpty() }?.fromHex()
         val allowParam = p.get("allow")?.asString ?: "all"
         val allowedListHex = p.get("allowed_identity_hashes")?.asJsonArray?.map { it.asString } ?: emptyList()
 
@@ -2542,7 +2601,7 @@ private fun handleWireCmd2(command: String, p: JsonObject): JsonObject? = when (
 
         val logKey = "$handle|${destHash.toHex()}|$path"
         wireRequestHandlerLog.getOrPut(logKey) { java.util.Collections.synchronizedList(mutableListOf()) }
-        destination.registerRequestHandler(
+        destination.registerResponseHandler(
             path,
             responseGenerator = { _, data, requestId, linkId, remoteIdentity, requestedAt ->
                 val entry = JsonObject().apply {
@@ -2555,7 +2614,14 @@ private fun handleWireCmd2(command: String, p: JsonObject): JsonObject? = when (
                     addProperty("requested_at", requestedAt / 1000.0)
                 }
                 wireRequestHandlerLog[logKey]?.add(entry)
-                if (responseNone) null else response
+                when {
+                    responseNone -> null
+                    responseFile != null -> network.reticulum.destination.RequestResponse.File(
+                        content = responseFile,
+                        metadata = responseMetadata,
+                    )
+                    else -> network.reticulum.destination.RequestResponse.Bytes(response)
+                }
             },
             allow = allow,
             allowedList = allowedList,
@@ -2616,19 +2682,41 @@ private fun handleWireCmd2(command: String, p: JsonObject): JsonObject? = when (
         val data = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex()
         val defaultTimeout = if (command == "wire_link_request_large") 30000 else 10000
         val timeoutMs = p.get("timeout_ms")?.asInt ?: defaultTimeout
+        // wait_ms decouples the poll from the request budget so a response
+        // Resource that outlives the budget can be watched to completion;
+        // status_at_timeout samples the receipt at the first poll past the budget.
+        val waitMs = p.get("wait_ms")?.takeIf { !it.isJsonNull }?.asLong ?: (timeoutMs + 500L)
 
         val inst = wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
         val link = inst.outLinks[linkIdHex]
             ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
 
-        val receipt = link.request(path, data = data, timeout = timeoutMs.toLong())
-            ?: throw IllegalStateException("Link.request returned null (link not active / REQUEST not sent)")
-        // +500ms slack so the receipt's own internal timeout fires first.
-        val deadline = System.currentTimeMillis() + timeoutMs + 500
+        val failedFired = java.util.concurrent.atomic.AtomicBoolean(false)
+        val receipt = link.request(
+            path,
+            data = data,
+            failedCallback = { failedFired.set(true) },
+            timeout = timeoutMs.toLong(),
+        ) ?: throw IllegalStateException("Link.request returned null (link not active / REQUEST not sent)")
+        val issued = System.currentTimeMillis()
+        val deadline = issued + waitMs
+        val statusName = { s: Int ->
+            when (s) {
+                RequestReceipt.SENT -> "sent"
+                RequestReceipt.DELIVERED -> "delivered"
+                RequestReceipt.RECEIVING -> "receiving"
+                RequestReceipt.READY -> "ready"
+                RequestReceipt.FAILED -> "failed"
+                else -> s.toString()
+            }
+        }
+        var statusAtTimeout: String? = null
         var out: JsonObject? = null
         while (System.currentTimeMillis() < deadline) {
-            when (receipt.status) {
+            val status = receipt.status
+            if (statusAtTimeout == null && System.currentTimeMillis() >= issued + timeoutMs) statusAtTimeout = statusName(status)
+            when (status) {
                 RequestReceipt.READY -> {
                     val resp = receipt.getResponseCopy()
                     val meta = receipt.metadata
@@ -2637,6 +2725,8 @@ private fun handleWireCmd2(command: String, p: JsonObject): JsonObject? = when (
                         "response" to (resp?.let { hexVal(it) } ?: JsonNull.INSTANCE),
                         "response_metadata" to (meta?.let { hexVal(it) } ?: JsonNull.INSTANCE),
                         "response_time_s" to (receipt.getResponseTime()?.let { doubleVal(it / 1000.0) } ?: JsonNull.INSTANCE),
+                        "status_at_timeout" to (statusAtTimeout?.let { strVal(it) } ?: JsonNull.INSTANCE),
+                        "failed_callback_fired" to boolVal(failedFired.get()),
                     )
                 }
                 RequestReceipt.FAILED -> {
@@ -2644,6 +2734,8 @@ private fun handleWireCmd2(command: String, p: JsonObject): JsonObject? = when (
                         "status" to strVal("failed"),
                         "response" to JsonNull.INSTANCE,
                         "response_metadata" to JsonNull.INSTANCE,
+                        "status_at_timeout" to (statusAtTimeout?.let { strVal(it) } ?: JsonNull.INSTANCE),
+                        "failed_callback_fired" to boolVal(failedFired.get()),
                     )
                 }
             }
@@ -2654,7 +2746,22 @@ private fun handleWireCmd2(command: String, p: JsonObject): JsonObject? = when (
             "status" to strVal("timeout"),
             "response" to JsonNull.INSTANCE,
             "response_metadata" to JsonNull.INSTANCE,
+            "status_at_timeout" to (statusAtTimeout?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "failed_callback_fired" to boolVal(failedFired.get()),
         )
+    }
+
+    "wire_set_tx_delay" -> {
+        // Delay every outbound packet of this bridge process by delay_ms (the
+        // reference wraps process_outgoing per interface; a bridge process hosts
+        // one wire instance, so the Transport-wide tap is the same scope). RNS
+        // has no rate shaping of its own; this makes a Resource transfer take a
+        // known minimum time on loopback: parts × delay. delay_ms = 0 clears it.
+        val handle = p.str("handle")
+        wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val delayMs = p.get("delay_ms")?.takeIf { !it.isJsonNull }?.asLong ?: 0L
+        Transport.outboundTapForTest = if (delayMs > 0) { { _ -> Thread.sleep(delayMs) } } else null
+        result("delay_ms" to intVal(delayMs.toInt()), "interfaces" to intVal(if (delayMs > 0) 1 else 0))
     }
 
     "wire_link_request_timeout" -> {
@@ -3028,22 +3135,28 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
             destinationType = DestinationType.SINGLE,
         )
         val raw = pkt.pack()
+        // A crafted request the receiver REFUSES TO PARSE is a legitimate outcome, not a
+        // harness error: the size_0 variant carries a zero-length data field, which python
+        // rejects in Packet.unpack (Packet.py:275) and so do we. The test asserts exactly
+        // that — data_len 0, accepted false — so report the refusal instead of throwing.
         val rx = Packet.unpack(raw)
-            ?: throw IllegalStateException("could not unpack crafted link request packet")
-        rx.hops = hops
-        val iface = (inst.serverIface ?: inst.clientIface)
-        rx.setReceivingInterfaceHashForTest(iface?.getHash())
-
-        val link = runCatching { Link.validateRequest(owner, rx.data, rx) }.getOrNull()
-        val accepted = link != null
         var establishmentTimeout: Long? = null
         var mode: Int? = null
         var mtu: Int? = null
-        if (link != null) {
-            establishmentTimeout = link.establishmentTimeout
-            mode = link.mode
-            mtu = link.mtu
-            runCatching { link.teardown() }
+        var accepted = false
+        if (rx != null) {
+            rx.hops = hops
+            val iface = (inst.serverIface ?: inst.clientIface)
+            rx.setReceivingInterfaceHashForTest(iface?.getHash())
+
+            val link = runCatching { Link.validateRequest(owner, rx.data, rx) }.getOrNull()
+            accepted = link != null
+            if (link != null) {
+                establishmentTimeout = link.establishmentTimeout
+                mode = link.mode
+                mtu = link.mtu
+                runCatching { link.teardown() }
+            }
         }
         result(
             "variant" to strVal(variant),
@@ -3282,6 +3395,11 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
             ?: throw IllegalArgumentException("Unknown handle: $handle")
         val link = findLinkByIdWaiting(inst, linkIdHex)
             ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        if (p.get("age_last_outbound")?.asBoolean == true) {
+            // Backdate past `keepalive` so the 1.5.2 response throttle opens.
+            link.setLastOutboundForTest(System.currentTimeMillis() - (link.keepalive + 1000))
+        }
 
         // KEEPALIVE packets carry their value unencrypted (Packet ciphertext==data).
         val pkt = Packet.createRaw(
@@ -3841,6 +3959,72 @@ private fun handleWireCmd4(command: String, p: JsonObject): JsonObject? = when (
         )
     }
 
+    "wire_mgmt_destinations" -> {
+        // The live transport-management Destinations the library registered at
+        // Transport.start, read straight off Transport rather than rebuilt here: the
+        // hashes are the genuine Destination.hash outputs and the handler table is the
+        // destination's own (reference wire_tcp.py:8769-8850).
+        wireInstances[p.str("handle")]
+            ?: throw IllegalArgumentException("Unknown handle: ${p.str("handle")}")
+
+        val probe = Transport.probeDestination
+        val probeObj = JsonObject().apply {
+            if (probe == null) {
+                addProperty("present", false)
+            } else {
+                addProperty("present", true)
+                addProperty("hash", probe.hash.toHex())
+                addProperty("name", probe.name)
+                addProperty("proof_strategy", probe.getProofStrategy())
+                addProperty("accepts_links", probe.acceptsLinks())
+                addProperty(
+                    "in_mgmt_destinations",
+                    Transport.mgmtDestinations.any { it === probe },
+                )
+            }
+        }
+
+        val rmd = Transport.remoteManagementDestination
+        val rmObj = JsonObject().apply {
+            if (rmd == null || !Reticulum.remoteManagementEnabled()) {
+                addProperty("present", false)
+            } else {
+                addProperty("present", true)
+                addProperty("hash", rmd.hash.toHex())
+                addProperty("name", rmd.name)
+                addProperty("in_mgmt_destinations", Transport.mgmtDestinations.any { it === rmd })
+                addProperty("in_mgmt_hashes", Transport.mgmtHashes.any { it.contentEquals(rmd.hash) })
+                add("request_handlers", JsonArray().apply {
+                    rmd.requestHandlerEntries().forEach { (pathHash, handler) ->
+                        add(JsonObject().apply {
+                            addProperty("path", handler.path)
+                            addProperty("path_hash", pathHash.toHex())
+                            addProperty("allow", handler.allow)
+                            add("allowed_hashes", JsonArray().apply {
+                                handler.allowedList?.forEach { add(it.toHex()) }
+                            })
+                            // Reference identity, not equality: the ACL is populated after
+                            // registration, so a handler holding a copy would enforce an
+                            // empty list forever.
+                            addProperty(
+                                "allowed_list_is_acl",
+                                handler.allowedList === Transport.remoteManagementAllowed,
+                            )
+                        })
+                    }
+                })
+            }
+        }
+
+        result(
+            "transport_identity_hash" to
+                (Transport.identity?.hash?.let { strVal(it.toHex()) } ?: JsonNull.INSTANCE),
+            "app_name" to strVal(TransportConstants.APP_NAME),
+            "probe" to probeObj,
+            "remote_management" to rmObj,
+        )
+    }
+
     "wire_instance_posture" -> {
         // Union of the process-wide posture flags RNS resolves at start
         // (reference wire_tcp.py:8497-8542). Each reads the companion static /
@@ -4308,6 +4492,10 @@ private fun handleWireCmd5(command: String, p: JsonObject): JsonObject? = when (
                 val frame = p.hex("raw")
                 val dh = p.hex("dest_hash")
                 Transport.inbound(frame, target)
+                // inbound() only queues now (RNS 1.5.2 semantics); the reference bridge
+                // polls with _await_path here. Draining is the exact equivalent, and it
+                // gives the negative case a definite answer instead of a timed-out one.
+                Transport.awaitInboundIdle()
                 result(
                     "dest_hash" to hexVal(dh),
                     "frame_len" to intVal(frame.size),
@@ -4360,6 +4548,8 @@ private fun handleWireCmd5(command: String, p: JsonObject): JsonObject? = when (
                     else -> throw IllegalArgumentException("unknown variant: $variant")
                 }
                 Transport.inbound(frame, target)
+                // See inject_external above: drain before reading `learned`.
+                Transport.awaitInboundIdle()
                 val out = mutableListOf<Pair<String, JsonElement>>(
                     "dest_hash" to hexVal(dest.hash),
                     "frame_len" to intVal(frame.size),
@@ -5135,7 +5325,10 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
                 val writeReturns = JsonArray()
                 while (remaining.isNotEmpty() && System.currentTimeMillis() < deadline) {
                     if (!channel.isReadyToSend()) { Thread.sleep(20); continue }
-                    if (eofWithData && remaining.size <= StreamDataMessage.MAX_DATA_LEN) writer.flagEofForTest()
+                    // Gate on the writer's LIVE mdu, not the class constant: with link
+                    // MTU discovery the writer chunks far larger than MAX_DATA_LEN, so the
+                    // constant would never mark the final write.
+                    if (eofWithData && remaining.size <= writer.writerMduForTest) writer.flagEofForTest()
                     val nw = writer.writeChunkForTest(remaining)
                     if (nw > 0) {
                         remaining = remaining.copyOfRange(nw, remaining.size)
@@ -5161,6 +5354,8 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
                     "manifest" to manifestJson(),
                     "write_returns" to writeReturns,
                     "max_data_len" to intVal(StreamDataMessage.MAX_DATA_LEN),
+                    // The size chunking ACTUALLY uses, from the live channel MDU.
+                    "writer_mdu" to intVal(writer.writerMduForTest),
                     "max_chunk_len" to intVal(RawChannelWriter.MAX_CHUNK_LEN),
                     "compression_tries" to intVal(RawChannelWriter.COMPRESSION_TRIES),
                     "tx_ring_after" to intVal(channel.stateForTest().txRing),
@@ -5677,24 +5872,58 @@ private fun handleWireCmd7(command: String, p: JsonObject): JsonObject? = when (
     }
 
     "wire_resource_force_collision" -> {
-        // BLOCKED (reticulum-kt#resource-collision-guard): kotlin
-        // initializeForSending builds the hashmap in a SINGLE pass with no
-        // collision_guard_list / random_hash regeneration / rebuild loop (cf.
-        // python Resource.py:436-472). There is no remap path to drive, so this
-        // reports the genuine (no-remap) observation; the test's remapped==True
-        // assertion fails by design until the collision-guard loop is implemented.
+        // Drive the hashmap collision-guard rebuild loop. The interceptor returns part 0's
+        // GENUINE map hash a second time for part 1, which trips the guard; from the
+        // rebuild pass on it passes the real value through. No bytes are fabricated — one
+        // real hash is repeated. Mirrors cmd_wire_resource_force_collision.
         val handle = p.str("handle")
         val linkIdHex = p.str("link_id")
         val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
         val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        var phase1Done = false
+        var calls = 0
+        var collide: ByteArray? = null
+        var rhFirst: ByteArray? = null
+        var rhSecond: ByteArray? = null
+        Resource.mapHashInterceptorForTest = { res, real ->
+            if (!phase1Done) {
+                rhFirst = res.randomHash
+                calls++
+                if (calls == 1) {
+                    collide = real
+                    real
+                } else {
+                    phase1Done = true
+                    collide
+                }
+            } else {
+                rhSecond = res.randomHash
+                real
+            }
+        }
+
+        // Shrink the link MTU for the construction only, so the payload chunks into
+        // several parts — a single-part resource cannot collide. Restored after.
         val savedMtu = link.mtu
-        link.setMtuForTest(200 + network.reticulum.common.RnsConstants.HEADER_MAX_SIZE + network.reticulum.common.RnsConstants.IFAC_MIN_SIZE)
-        val resource = try { Resource.create(randomBytes(4000), link, advertise = false) } finally { link.setMtuForTest(savedMtu) }
+        link.setMtuForTest(
+            200 + network.reticulum.common.RnsConstants.HEADER_MAX_SIZE +
+                network.reticulum.common.RnsConstants.IFAC_MIN_SIZE,
+        )
+        val resource = try {
+            Resource.create(randomBytes(4000), link, advertise = false)
+        } finally {
+            link.setMtuForTest(savedMtu)
+            Resource.mapHashInterceptorForTest = null
+        }
+
+        val before = rhFirst ?: resource.randomHash
+        val after = rhSecond ?: resource.randomHash
         result(
-            "remapped" to boolVal(false),
-            "random_hash_before" to hexVal(resource.randomHash),
-            "random_hash_after" to hexVal(resource.randomHash),
-            "hashmap_changed" to boolVal(false),
+            "remapped" to boolVal(phase1Done && !before.contentEquals(after)),
+            "random_hash_before" to hexVal(before),
+            "random_hash_after" to hexVal(after),
+            "hashmap_changed" to boolVal(!before.contentEquals(after)),
             "num_parts" to intVal(resource.parts.size),
         )
     }
@@ -5984,27 +6213,32 @@ private fun handleWireCmd7(command: String, p: JsonObject): JsonObject? = when (
                 r
             }
             "duplicate" -> {
-                // BLOCKED (reticulum-kt#resource-req-hashlist): kotlin
-                // Link.processResourceReq has no req_hashlist packet-hash de-dup
-                // (cf. Link.py:1109-1115). Drive the genuine behaviour and report
-                // it honestly; first_in_hashlist / req_hashlist_len have no source.
+                // Feed the SAME request packet twice. The second must serve nothing
+                // further, and the resource's served-request hash list must hold exactly
+                // one entry (python req_hashlist, Link.py:1094-1095).
                 val savedMtu = link.mtu; link.setMtuForTest(200 + overhead)
                 val sender = try { Resource.create(randomBytes(1500), link, advertise = false) } finally { link.setMtuForTest(savedMtu) }
                 sender.primeTransferringForTest()
                 link.registerOutgoingResource(sender)
                 val reqData = byteArrayOf(notExhausted) + sender.hash + sender.hashmapRaw
-                feedInboundLinkPacket(link, reqData, network.reticulum.common.PacketContext.RESOURCE_REQ)
+                // ONE packet object delivered twice: its packet hash is what the de-dup
+                // keys on, and re-crafting would produce a fresh ciphertext and hash.
+                val rx = craftInboundLinkPacket(
+                    link, reqData, network.reticulum.common.PacketContext.RESOURCE_REQ,
+                )
+                link.receive(rx)
                 val firstServed = sender.sentPartsForTest()
-                feedInboundLinkPacket(link, reqData, network.reticulum.common.PacketContext.RESOURCE_REQ)
+                val afterFirst = sender.servedRequestCountForTest()
+                link.receive(rx)
                 val secondServed = sender.sentPartsForTest()
                 val r = result(
                     "variant" to strVal(variant),
                     "total_parts" to intVal(sender.parts.size),
                     "first_served" to intVal(firstServed),
                     "second_served" to intVal(secondServed),
-                    "first_in_hashlist" to boolVal(false),
-                    "req_hashlist_len" to intVal(0),
-                    "deduped" to boolVal(false),
+                    "first_in_hashlist" to boolVal(afterFirst >= 1),
+                    "req_hashlist_len" to intVal(sender.servedRequestCountForTest()),
+                    "deduped" to boolVal(secondServed == firstServed),
                 )
                 runCatching { link.cancelOutgoingResource(sender) }
                 runCatching { sender.cancel() }
@@ -6136,9 +6370,18 @@ private fun handleWireCmd7(command: String, p: JsonObject): JsonObject? = when (
         val variant = p.str("variant")
         val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
         val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
-        data class FlagsCase(val requestId: ByteArray?, val isResponse: Boolean, val strategy: Int)
+        data class FlagsCase(
+            val requestId: ByteArray?,
+            val isResponse: Boolean,
+            val strategy: Int,
+            val registerHandler: Boolean = false,
+        )
+        // A request advertisement is accepted only when the destination has request
+        // handlers (Link.py:1036-1040), independently of resource_strategy. The two
+        // request variants differ only in whether one is registered.
         val case = when (variant) {
-            "request_autoaccept" -> FlagsCase(randomBytes(16), false, Link.ACCEPT_NONE)
+            "request_autoaccept" -> FlagsCase(randomBytes(16), false, Link.ACCEPT_NONE, true)
+            "request_no_handler" -> FlagsCase(randomBytes(16), false, Link.ACCEPT_ALL, false)
             "response_no_pending_request" -> FlagsCase(randomBytes(16), true, Link.ACCEPT_NONE)
             "plain_accept_none" -> FlagsCase(null, false, Link.ACCEPT_NONE)
             "plain_accept_all" -> FlagsCase(null, false, Link.ACCEPT_ALL)
@@ -6156,10 +6399,22 @@ private fun handleWireCmd7(command: String, p: JsonObject): JsonObject? = when (
             val savedStrategy = link.getResourceStrategy()
             val before = countForHash()
             link.setResourceStrategy(case.strategy)
+            val handlerPath = "/advflags-probe"
+            val handlerDest = link.destinationForTest()
+            if (case.registerHandler) {
+                handlerDest?.registerRequestHandler(
+                    handlerPath,
+                    responseGenerator = { _, _, _, _, _, _ -> ByteArray(0) },
+                    allow = network.reticulum.destination.RequestPolicy.ALLOW_ALL,
+                )
+            }
             try {
                 feedInboundLinkPacket(link, advPlain, network.reticulum.common.PacketContext.RESOURCE_ADV)
             } finally {
                 link.setResourceStrategy(savedStrategy)
+                if (case.registerHandler) {
+                    runCatching { handlerDest?.deregisterRequestHandler(handlerPath) }
+                }
             }
             val after = countForHash()
             out = result(

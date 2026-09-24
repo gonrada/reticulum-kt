@@ -66,12 +66,17 @@ class ResourceTransferE2ETest : RnsLiveTestBase() {
 
         println("  [Test] Sending ${testData.size} byte resource from Kotlin to Python...")
 
+        val maxSenderProgress = AtomicReference(0f)
+
         val resource = Resource.create(
             data = testData,
             link = link,
             callback = { r ->
                 completedResource.set(r)
                 completedLatch.countDown()
+            },
+            progressCallback = { r ->
+                maxSenderProgress.updateAndGet { prev -> maxOf(prev, r.progress) }
             }
         )
 
@@ -80,6 +85,12 @@ class ResourceTransferE2ETest : RnsLiveTestBase() {
         // Wait for transfer to complete on Kotlin side
         val completed = completedLatch.await(30, TimeUnit.SECONDS)
         assertTrue(completed, "Resource transfer should complete within 30 seconds")
+
+        // Outgoing progress must fire on the sender and reach ~1.0.
+        assertTrue(
+            maxSenderProgress.get() >= 0.99f,
+            "Sender progress callback should fire and reach ~1.0 (was ${maxSenderProgress.get()})",
+        )
 
         // Poll Python for received resource
         val deadline = System.currentTimeMillis() + 15_000

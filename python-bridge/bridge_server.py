@@ -3605,6 +3605,127 @@ def cmd_lxmf_send_opportunistic(params):
     }
 
 
+def cmd_lxmf_set_outbound_propagation_node(params):
+    """Point this client at a propagation node.
+
+    params:
+        node_hash (hex): lxmf.propagation destination hash (16 bytes)
+
+    Returns:
+        set (bool)
+        has_path (bool): Transport knows a path to the node
+        identity_known (bool): the node's identity has been learned from an announce
+        app_data_known (bool): the node's announce app data is cached (needed for
+            the propagation stamp cost)
+    """
+    global _lxmf_router
+    if not _lxmf_router:
+        return {'error': 'LXMF router not started'}
+    RNS = _get_full_rns()
+    node_hash = hex_to_bytes(params['node_hash'])
+    _lxmf_router.set_outbound_propagation_node(node_hash)
+    return {
+        'set': True,
+        'has_path': RNS.Transport.has_path(node_hash),
+        'identity_known': RNS.Identity.recall(node_hash) is not None,
+        'app_data_known': RNS.Identity.recall_app_data(node_hash) is not None,
+    }
+
+
+def cmd_lxmf_send_propagated(params):
+    """Send an LXMF message via PROPAGATED delivery through the configured node.
+
+    params:
+        destination_hash (hex): lxmf.delivery destination (16 bytes); our own
+            destination is allowed and resolves to our own identity
+        content (str), title (str, optional)
+
+    Returns:
+        sent (bool), message_hash (hex), status (str)
+    """
+    global _lxmf_router, _lxmf_identity, _lxmf_destination
+    if not _lxmf_router:
+        return {'sent': False, 'status': 'error', 'error': 'LXMF router not started'}
+    RNS = _get_full_rns()
+    import LXMF
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    content = params['content']
+    title = params.get('title', '')
+    if destination_hash == _lxmf_destination.hash:
+        identity = _lxmf_identity
+    else:
+        identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        return {'sent': False, 'status': 'no_identity', 'error': f'No identity recalled for destination {destination_hash.hex()}'}
+    destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
+    message = LXMF.LXMessage(destination=destination, source=_lxmf_destination, content=content, title=title,
+                             desired_method=LXMF.LXMessage.PROPAGATED)
+    # The propagation stamp is generated in-process: LXStamper's multiprocessing pool
+    # inherits this bridge's stdio (its JSON protocol) and leaves worker processes
+    # behind when the parent exits. Costs in tests are small, so job_simple suffices.
+    import LXMF.LXStamper as _stamper
+    _stamper.job_linux = _stamper.job_simple
+    _stamper.job_linux_managed = _stamper.job_simple
+    try:
+        _lxmf_router.handle_outbound(message)
+    except Exception as e:
+        return {'sent': False, 'status': 'error', 'error': str(e)}
+    return {'sent': True, 'status': 'queued', 'message_hash': bytes_to_hex(message.hash) if message.hash else None}
+
+
+def cmd_lxmf_outbound_state(params):
+    """States of the messages still in the outbound queue.
+
+    Returns:
+        pending (list): [{message_hash, state, method, attempts}]
+    """
+    global _lxmf_router
+    if not _lxmf_router:
+        return {'error': 'LXMF router not started'}
+    pending = []
+    for lxm in list(_lxmf_router.pending_outbound):
+        pending.append({
+            'message_hash': bytes_to_hex(lxm.hash) if lxm.hash else None,
+            'state': lxm.state,
+            'method': lxm.method,
+            'attempts': lxm.delivery_attempts,
+        })
+    return {'pending': pending, 'count': len(pending)}
+
+
+def cmd_lxmf_request_messages(params):
+    """Start a sync from the configured propagation node (request_messages_from_propagation_node).
+
+    params:
+        max_messages (int, optional): cap; 0 = all
+    """
+    global _lxmf_router, _lxmf_identity
+    if not _lxmf_router:
+        return {'error': 'LXMF router not started'}
+    max_messages = int(params.get('max_messages', 0))
+    _lxmf_router.request_messages_from_propagation_node(_lxmf_identity, max_messages)
+    return {'requested': True, 'state': _lxmf_router.propagation_transfer_state}
+
+
+def cmd_lxmf_propagation_state(params):
+    """The client's propagation transfer state (LXMRouter.PR_* codes).
+
+    Returns:
+        state (int), progress (float), last_result (int or None), link_active (bool)
+    """
+    global _lxmf_router
+    if not _lxmf_router:
+        return {'error': 'LXMF router not started'}
+    RNS = _get_full_rns()
+    link = _lxmf_router.outbound_propagation_link
+    return {
+        'state': _lxmf_router.propagation_transfer_state,
+        'progress': _lxmf_router.propagation_transfer_progress,
+        'last_result': _lxmf_router.propagation_transfer_last_result,
+        'link_active': bool(link is not None and link.status == RNS.Link.ACTIVE),
+    }
+
+
 def cmd_propagation_node_start(params):
     """Start propagation node with configurable stamp cost.
 
@@ -5116,6 +5237,12 @@ COMMANDS = {
     'lxmf_announce': cmd_lxmf_announce,
     'lxmf_send_direct': cmd_lxmf_send_direct,
     'lxmf_send_opportunistic': cmd_lxmf_send_opportunistic,
+    # Propagation client operations (python as the client of a Kotlin node)
+    'lxmf_set_outbound_propagation_node': cmd_lxmf_set_outbound_propagation_node,
+    'lxmf_send_propagated': cmd_lxmf_send_propagated,
+    'lxmf_outbound_state': cmd_lxmf_outbound_state,
+    'lxmf_request_messages': cmd_lxmf_request_messages,
+    'lxmf_propagation_state': cmd_lxmf_propagation_state,
     # Propagation node operations
     'propagation_node_start': cmd_propagation_node_start,
     'propagation_node_get_messages': cmd_propagation_node_get_messages,

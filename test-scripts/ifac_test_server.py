@@ -147,12 +147,19 @@ def main():
     try:
         announce_interval = 30
         last_announce = 0
+        # Report tunnel registrations so a Kotlin->python test can assert that the
+        # client's (IFAC-masked) tunnel-synthesis frame actually got through.
+        tunnels_seen = -1
         while True:
             now = time.time()
             if now - last_announce >= announce_interval:
                 dest.announce()
                 RNS.log("Sent announce")
                 last_announce = now
+            tunnels_now = len(RNS.Transport.tunnels)
+            if tunnels_now != tunnels_seen:
+                print(f"TUNNELS: {tunnels_now}", flush=True)
+                tunnels_seen = tunnels_now
             time.sleep(1)
     except KeyboardInterrupt:
         RNS.log("Shutting down...")

@@ -118,7 +118,12 @@ private fun ensureTransportIdentity(p: JsonObject): Identity {
 private fun buildAnnounceAppdata(p: JsonObject): JsonObject {
     val interfaceType = p.str("interface_type")
     val fields = p.get("fields")?.takeIf { it.isJsonObject }?.asJsonObject ?: JsonObject()
-    val stampValue = p.intOpt("stamp_value") ?: 14
+    // An omitted stamp_value means "use the impl's default", which is the library's
+    // DEFAULT_STAMP_VALUE — never a literal here. A hard-coded 14 survived the 1.5.2
+    // bump to 16 and produced stamps that cleared the receiver's default threshold
+    // only by luck (a 14-cost stamp meets 16 one time in four).
+    val stampValue = p.intOpt("stamp_value")
+        ?: network.reticulum.discovery.DiscoveryConstants.DEFAULT_STAMP_VALUE
     val encrypt = p.boolOpt("encrypt") ?: false
 
     Transport.transportEnabled = p.boolOpt("transport_enabled") ?: false
@@ -260,7 +265,7 @@ fun handleDiscoveryCommand(command: String, p: JsonObject): JsonObject {
                 })
             } else {
                 InterfaceAnnounceHandler(
-                    requiredValue = p.intOpt("required_value") ?: 14,
+                    requiredValue = p.intOpt("required_value") ?: network.reticulum.discovery.DiscoveryConstants.DEFAULT_STAMP_VALUE,
                     rawCallback = { info ->
                         callbackInvoked = true
                         if (info == null) infoNone = true else captured = info
@@ -377,7 +382,7 @@ fun handleDiscoveryCommand(command: String, p: JsonObject): JsonObject {
             val newPacked = announcer.packInfoDict(info)
             val infohash = Hashes.fullHash(newPacked)
             val wb = Stamper.generateWorkblock(infohash, DiscoveryConstants.WORKBLOCK_EXPAND_ROUNDS)
-            val r = runBlocking { Stamper.generateStamp(wb, p.intOpt("stamp_value") ?: 14) }
+            val r = runBlocking { Stamper.generateStamp(wb, p.intOpt("stamp_value") ?: network.reticulum.discovery.DiscoveryConstants.DEFAULT_STAMP_VALUE) }
             val stamp = r.stamp
                 ?: return result("aborted" to boolVal(true), "app_data" to JsonNull.INSTANCE)
             result(

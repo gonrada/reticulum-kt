@@ -273,6 +273,9 @@ class HybridSharedInstanceSession:
             f.write("  share_instance = No\n")
             f.write("\n[interfaces]\n")
 
+        # Upstream Transport gates its worker threads on _should_run, which exit_handler
+        # clears and start() never re-arms; re-arm per in-process instance (see pipe_session.py).
+        RNS.Transport._should_run = True
         self.reticulum = RNS.Reticulum(
             configdir=self._config_path, loglevel=RNS.LOG_CRITICAL
         )

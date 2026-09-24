@@ -5,6 +5,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
 import com.google.gson.JsonArray
 import network.reticulum.common.*
+import network.reticulum.config.InterfaceConfig
 import network.reticulum.crypto.*
 import network.reticulum.identity.Identity
 import network.reticulum.destination.Destination
@@ -14,12 +15,15 @@ import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
+import network.reticulum.interfaces.kiss.KissInterface
+import network.reticulum.interfaces.spp.SppInterface
 import network.reticulum.interfaces.pipe.PipeInterface
 import network.reticulum.interfaces.rnode.RNodeInterface
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.udp.UDPInterface
 import network.reticulum.interfaces.auto.AutoInterfaceConstants
+import network.reticulum.interfaces.backbone.BackboneInterface
 import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
 import network.reticulum.resource.ResourceConstants
@@ -87,6 +91,17 @@ fun main() {
         }
         realStdout.flush()
     }
+
+    // stdin EOF is the harness closing us. Shut the stack down explicitly rather than
+    // relying on the JVM's exit path: a peer that gets no LINKCLOSE only learns the link
+    // is gone when its watchdog gives up, and reports TIMEOUT — which it cannot tell apart
+    // from a node that crashed. Then exit, because a stray non-daemon thread would
+    // otherwise hold the process open past the harness's patience and get it killed
+    // before any of this took effect.
+    runCatching { shutdownWireState() }
+    realStdout.flush()
+    System.err.flush()
+    kotlin.system.exitProcess(0)
 }
 
 // --- Hex helpers ---
@@ -1841,17 +1856,48 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "identity_keyless_op" -> {
-            // Python can build Identity(create_keys=False) holding NO key
-            // material, and decrypt/sign/encrypt all raise KeyError at runtime.
-            // reticulum-kt makes that state unrepresentable: Identity's private
-            // constructor requires key material, so the "keyless op" cannot be
-            // constructed at all — a stronger, compile-time form of the same
-            // guarantee. There is no honest way to drive the python runtime
-            // behavior here; failing loudly is the truthful report.
-            throw IllegalStateException(
-                "keyless Identity is unrepresentable in reticulum-kt " +
-                "(private constructor requires key material; the missing-key " +
-                "op python guards with KeyError is prevented at compile time)")
+            // Drive a crypto op on an identity that lacks the private key it would need,
+            // and report whether the library refused rather than fabricating a result.
+            //
+            // key_state = "public_only" is the state both implementations can hold: an
+            // identity recalled from a peer's public key. sign and decrypt must refuse;
+            // encrypt and verify must still work, since that is the entire point of
+            // holding a peer's public key.
+            //
+            // key_state = "none" — python's Identity(create_keys=False) with nothing
+            // loaded — is unrepresentable here: Identity's constructor is private and
+            // every factory requires key material, so the runtime state python guards
+            // with KeyError cannot be built. Reported as such rather than faked.
+            val op = p.str("op")
+            val data = p.hex("data")
+            when (p.strOpt("key_state") ?: "none") {
+                "public_only" -> {
+                    val identity = Identity.fromPublicKey(Identity.create(crypto).getPublicKey(), crypto)
+                    try {
+                        val out = when (op) {
+                            "decrypt" -> identity.decrypt(data)
+                            "sign" -> identity.sign(data)
+                            "encrypt" -> identity.encrypt(data)
+                            else -> throw IllegalArgumentException("unknown op '$op'")
+                        }
+                        result(
+                            "raised" to JsonNull.INSTANCE,
+                            "result" to (out?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                        )
+                    } catch (e: IllegalArgumentException) {
+                        throw e
+                    } catch (e: Exception) {
+                        result(
+                            "raised" to strVal(e::class.java.simpleName),
+                            "message" to strVal(e.message ?: ""),
+                        )
+                    }
+                }
+                else -> throw IllegalStateException(
+                    "a fully keyless Identity is unrepresentable in reticulum-kt " +
+                        "(private constructor requires key material); use " +
+                        "key_state=public_only for the state both implementations hold")
+            }
         }
 
         "identity_random_hash" -> {
@@ -1901,15 +1947,21 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "interface_default_ifac_size" -> {
-            // Per-class DEFAULT_IFAC_SIZE read off the live interface classes.
-            // reticulum-kt implements no Serial/KISS/AX25KISS interfaces, so
-            // those python class names are honestly absent from the map.
+            // Per-class DEFAULT_IFAC_SIZE read off the live interface classes. Keyed
+            // by the PYTHON class name, since that is what names the medium; where
+            // reticulum-kt covers a python class under a different name the mapping is
+            // noted. KissInterface serves both python KISS classes (its `ax25` flag
+            // selects AX.25 framing), and SppInterface is our serial medium — it
+            // advertises itself as "SerialInterface" for discovery.
             val sizes = JsonObject().apply {
                 addProperty("TCPServerInterface", TCPServerInterface.DEFAULT_IFAC_SIZE)
                 addProperty("TCPClientInterface", TCPClientInterface.DEFAULT_IFAC_SIZE)
                 addProperty("UDPInterface", UDPInterface.DEFAULT_IFAC_SIZE)
                 addProperty("PipeInterface", PipeInterface.DEFAULT_IFAC_SIZE)
                 addProperty("RNodeInterface", RNodeInterface.DEFAULT_IFAC_SIZE)
+                addProperty("KISSInterface", KissInterface.DEFAULT_IFAC_SIZE)
+                addProperty("AX25KISSInterface", KissInterface.DEFAULT_IFAC_SIZE)
+                addProperty("SerialInterface", SppInterface.DEFAULT_IFAC_SIZE)
             }
             result(
                 "default_ifac_size" to sizes,
@@ -1921,9 +1973,10 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
             when (val itype = p.str("type")) {
                 "TCPInterface" -> result("hw_mtu" to intVal(TCPClientInterface.HW_MTU))
                 "AutoInterface" -> result("hw_mtu" to intVal(AutoInterfaceConstants.HW_MTU))
+                "BackboneInterface" -> result("hw_mtu" to intVal(BackboneInterface.HW_MTU))
                 else -> result("error" to strVal(
-                    "unsupported interface type '$itype' " +
-                    "(reticulum-kt class-level HW_MTU: TCPInterface, AutoInterface)"))
+                    "unsupported interface type '$itype' (reticulum-kt class-level " +
+                    "HW_MTU: TCPInterface, AutoInterface, BackboneInterface)"))
             }
         }
 
@@ -2194,6 +2247,46 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
             out
         }
 
+        // === Config parsing (LIVE) ===
+
+        "config_parse_interface" -> {
+            // Push raw config text through the library's own INI parser and interface
+            // synthesis, then read the derived attributes back — the same shape the
+            // reference bridge returns from RNS's _synthesize_interface.
+            val name = p.strOpt("interface_name") ?: "probe"
+            val text = p.strOpt("config_text") ?: ""
+            val parsed = InterfaceConfig.parseIni(text)
+            val section = InterfaceConfig.interfaceSection(parsed, name)
+            if (section == null) {
+                result("error" to strVal("config_text has no [[$name]] under [interfaces]"))
+            } else {
+                val syn = InterfaceConfig.synthesize(section)
+                result(
+                    "selected_interface_mode" to intVal(syn.selectedInterfaceMode),
+                    "configured_bitrate" to (syn.configuredBitrate?.let { intVal(it) } ?: JsonNull.INSTANCE),
+                    "mode" to intVal(InterfaceConfig.modeValue(syn.mode)),
+                    "mode_name" to strVal(InterfaceConfig.modeName(syn.mode)),
+                    "bitrate" to intVal(syn.bitrate),
+                    "announce_cap" to doubleVal(syn.announceCap),
+                    "ifac_size" to intVal(syn.ifacSize),
+                    "default_ifac_size" to intVal(syn.defaultIfacSize),
+                    "discoverable" to boolVal(syn.discoverable),
+                    "discovery_announce_interval" to
+                        (syn.discoveryAnnounceInterval?.let { intVal(it) } ?: JsonNull.INSTANCE),
+                    "ifac_netname" to (syn.ifacNetname?.let { strVal(it) } ?: JsonNull.INSTANCE),
+                    "ifac_netkey" to (syn.ifacNetkey?.let { strVal(it) } ?: JsonNull.INSTANCE),
+                    "ifac_active" to boolVal(syn.ifacActive),
+                    "ic_max_held_announces" to intVal(syn.icMaxHeldAnnounces),
+                    "ic_burst_hold" to doubleVal(syn.icBurstHold),
+                    "ic_burst_freq_new" to doubleVal(syn.icBurstFreqNew),
+                    "ic_burst_freq" to doubleVal(syn.icBurstFreq),
+                    "ic_new_time" to doubleVal(syn.icNewTime),
+                    "ic_burst_penalty" to doubleVal(syn.icBurstPenalty),
+                    "ic_held_release_interval" to doubleVal(syn.icHeldReleaseInterval),
+                )
+            }
+        }
+
         // === Conformance surface: packet build/observe (LIVE) ===
 
         "packet_build" -> {
@@ -2246,9 +2339,16 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
             packet.contextRaw = contextInt
             packet.hops = hops
             val raw = packet.pack()
-            // Read the fields back the way any receiver does — a real unpack.
-            val parsed = Packet.unpack(raw)
-                ?: throw IllegalStateException("library could not unpack its own packet")
+            // Read the fields back the way any receiver does — a real unpack — but fall
+            // back to the packet we just built when unpack legitimately refuses.
+            //
+            // A zero-length data field is a protocol violation on RECEIPT: python raises
+            // "Zero-length data field" in Packet.unpack (Packet.py:275) and so do we. It is
+            // not a violation to BUILD one, and the reference bridge reports the fields of
+            // what it built without round-tripping. Requiring the round-trip here made
+            // packet_build fail for `data=""`, which is how
+            // test_header2_maxsize_is_35 and test_mdu_derivation measure header overhead.
+            val parsed = Packet.unpack(raw) ?: packet
             packetFieldsJson(raw, parsed)
         }
 
@@ -2338,11 +2438,17 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "hdlc_deframe_stream" -> {
-            // Drives the library's real streaming Deframer — the same class the
-            // kotlin TCP read path uses — including its runt-frame drop.
+            // Drives the library's real streaming Deframer — the same class the kotlin TCP
+            // read path uses — including both of check_frame_len's bounds: the runt drop at
+            // HEADER_MINSIZE and, when the request supplies hw_mtu, the upper bound at
+            // hw_mtu + ifac_size (TCPInterface.py:337-340). The reference bridge's stand-in
+            // reports ifac_size 0, so there is nothing to add here.
             val stream = p.hex("stream")
+            val hwMtu = p.intOpt("hw_mtu")
             val frames = mutableListOf<ByteArray>()
-            HDLC.createDeframer { frames.add(it) }.process(stream)
+            HDLC.createDeframer(
+                payloadLimit = { hwMtu ?: Int.MAX_VALUE },
+            ) { frames.add(it) }.process(stream)
             result("frames" to JsonArray().apply { frames.forEach { add(it.toHex()) } })
         }
 

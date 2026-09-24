@@ -29,6 +29,7 @@ import network.reticulum.transport.LinkEntry
 import network.reticulum.transport.RichAnnounceHandler
 import network.reticulum.transport.ReverseEntry
 import network.reticulum.transport.Transport
+import network.reticulum.transport.TransportConstants
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedDeque
@@ -53,10 +54,16 @@ class MockInterface(
     // parentInterface.isLocalSharedInstance==true to localClientInterfaces
     // (Transport.kt:899), mirroring reference/behavioral_transport.py:505-531.
     override val isLocalSharedInstance: Boolean = false,
+    override val announceRateTarget: Int? = null,
+    override val announceRateGrace: Int = 0,
+    override val announceRatePenalty: Int = 0,
+    // Both feed the announce egress spacing: wait = (len*8/bitrate) / announce_cap.
+    // A test that wants to observe throttling sets a low bitrate and a small cap.
+    override val bitrate: Int = 10_000_000,
+    override val announceCap: Double = TransportConstants.ANNOUNCE_CAP,
 ) : Interface(name) {
     override val canSend: Boolean = true
     override val canReceive: Boolean = true
-    override val bitrate: Int = 10_000_000
     override val supportsDiscovery: Boolean = false
 
     private val txQueue = ConcurrentLinkedDeque<ByteArray>()
@@ -178,6 +185,7 @@ private fun parseMode(name: String?): InterfaceMode = when (name?.uppercase()) {
     "ROAMING" -> InterfaceMode.ROAMING
     "BOUNDARY" -> InterfaceMode.BOUNDARY
     "GATEWAY" -> InterfaceMode.GATEWAY
+    "INTERNAL" -> InterfaceMode.INTERNAL
     else -> throw IllegalArgumentException("Unknown interface mode: $name")
 }
 
@@ -201,6 +209,22 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
             require(seed.size == 64) { "identity_seed must be 64 bytes" }
             Identity.fromPrivateKey(seed)
         }
+
+        // RNS 1.5.2 routes inbound packets through a traffic-class priority queue drained
+        // by a separate thread, so Transport.inbound returns before the packet has been
+        // acted on. Every behavioral test injects a frame and then reads Transport's
+        // tables on the next line, which that makes a race. The reference behavioral
+        // bridge (reference/behavioral_transport.py:353-364) sets USE_INBOUND_QUEUE =
+        // False for exactly this reason, and this is its counterpart: with the queue off,
+        // preprocessing and processing run inline on the injecting thread.
+        //
+        // This removes a scheduling mechanism, not a protocol rule — nothing downstream
+        // of the queue decides differently because of how the packet got there. The
+        // queue's own behaviour is pinned by rns-core's InboundQueuesTest and
+        // AsyncInboundTest, and the wire suite runs with it ON. The flag is process-wide
+        // and survives Transport.stop()/start(), so once set here it holds for every
+        // behavioral handle this bridge process serves.
+        Transport.useInboundQueue = false
 
         val configDir = java.nio.file.Files.createTempDirectory("rns_behav_").toFile()
         val rns = Reticulum.start(
@@ -283,7 +307,15 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
             }
         }
 
-        val iface = MockInterface(name, mode, mtu, ifacIdentity, ifacKey, ifacSize)
+        val iface = MockInterface(
+            name, mode, mtu, ifacIdentity, ifacKey, ifacSize,
+            announceRateTarget = p.intOpt("announce_rate_target"),
+            announceRateGrace = p.intOpt("announce_rate_grace") ?: 0,
+            announceRatePenalty = p.intOpt("announce_rate_penalty") ?: 0,
+            bitrate = p.intOpt("bitrate") ?: 10_000_000,
+            announceCap = p.get("announce_cap")?.takeIf { !it.isJsonNull }?.asDouble
+                ?: TransportConstants.ANNOUNCE_CAP,
+        )
 
         // local_client=True: register this interface as a local-client interface
         // behind a shared-instance master (parent isLocalSharedInstance=true), so
@@ -414,15 +446,20 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
             "timestamp" to doubleVal(e.timestamp / 1000.0),
             "retransmit_timeout" to doubleVal(e.retransmitTimeout / 1000.0),
             "local_rebroadcasts" to intVal(e.localRebroadcasts),
-            // kotlin AnnounceEntry has no block_rebroadcasts flag; report false.
-            "block_rebroadcasts" to boolVal(false),
-            "received_from" to hexVal(e.destinationHash),
+            "block_rebroadcasts" to boolVal(e.blockRebroadcasts),
+            // A hash, not an interface, as in the reference (its IDX_AT_RCVD_IF slot is
+            // misleadingly named): the announcing transport node's ID when the packet
+            // carried one, else the destination's own hash.
+            "received_from" to hexVal(e.receivedFrom),
             // The announce packet hash — the 4-param announce-handler dispatch
             // delivers this same full hash. AnnounceEntry has no stored hash field,
             // so recompute it from the stored raw announce packet.
             "packet_hash" to (Packet.unpack(e.raw)?.getHash()?.let { hexVal(it) } ?: JsonNull.INSTANCE),
-            "attached_interface" to (inst.ifaceIdOf(
-                Transport.findInterfaceByHashForTest(e.receivingInterfaceHash))
+            // The interface the rebroadcast is PINNED to (null when it goes out on all
+            // eligible interfaces), not the one the announce arrived on.
+            "attached_interface" to (e.attachedInterfaceHash
+                ?.let { Transport.findInterfaceByHashForTest(it) }
+                ?.let { inst.ifaceIdOf(it) }
                 ?.let { strVal(it) } ?: JsonNull.INSTANCE),
         )
     }
@@ -471,16 +508,14 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
     "behavioral_read_announce_rate" -> {
         inst(p)
         val dest = p.hex("dest")
-        val ts = Transport.announceRateTimestampsForTest(dest)
+        val e = Transport.announceRateEntry(dest)
             ?: return result("found" to boolVal(false))
-        // kotlin tracks only the timestamp history; last is its max,
-        // rate_violations/blocked_until are 0 (see port-deviations.md).
         result(
             "found" to boolVal(true),
-            "last" to doubleVal((ts.maxOrNull() ?: 0L) / 1000.0),
-            "rate_violations" to intVal(0),
-            "blocked_until" to doubleVal(0.0),
-            "timestamps" to JsonArray().apply { ts.forEach { add(it / 1000.0) } },
+            "last" to doubleVal(e.last / 1000.0),
+            "rate_violations" to intVal(e.rateViolations),
+            "blocked_until" to doubleVal(e.blockedUntil / 1000.0),
+            "timestamps" to JsonArray().apply { e.timestamps.forEach { add(it / 1000.0) } },
         )
     }
 

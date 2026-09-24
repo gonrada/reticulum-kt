@@ -131,16 +131,18 @@ class RatchetRotationE2ETest : RnsLiveTestBase() {
             "Kotlin's new ratchet ID should match Python's rotated ID"
         )
 
-        // Exactly one ratchet is kept per destination: the stored one must be the rotated one
-        val newestRatchet = Identity.getRatchet(pythonDestHash!!)!!
-        val newestRatchetId = network.reticulum.crypto.Hashes.fullHash(newestRatchet)
-            .copyOfRange(0, 10)
+        // Python keeps exactly one known ratchet per destination (Identity.py:419) and so
+        // does Kotlin: the stored ratchet must be the rotated one.
+        val stored = Identity.getRatchet(pythonDestHash!!)
+        assertNotNull(stored, "Kotlin should hold the rotated ratchet")
+        val storedId = network.reticulum.crypto.Hashes.fullHash(stored!!).copyOfRange(0, 10)
         assertEquals(
             newPythonRatchetId,
-            newestRatchetId.toHex(),
-            "Newest stored ratchet should match rotated ratchet"
+            storedId.toHex(),
+            "Stored ratchet should be the rotated ratchet"
         )
+        assertEquals(1, Identity.getRatchets(pythonDestHash!!).size, "one ratchet per destination, as Python")
 
-        println("  [Test] Ratchet rotation verified: the rotated ratchet is the stored one")
+        println("  [Test] Ratchet rotation verified — rotated ratchet replaced the old one!")
     }
 }

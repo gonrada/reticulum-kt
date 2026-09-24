@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Timeout
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertTrue
@@ -36,6 +37,9 @@ class IfacTcpIntegrationTest {
 
     private var pythonProcess: Process? = null
     private var kotlinInterface: TCPClientInterface? = null
+
+    /** Every line the python server printed, so a test can wait on its state reports. */
+    private val pythonLines = CopyOnWriteArrayList<String>()
 
     companion object {
         const val TEST_PORT = 14242
@@ -102,6 +106,16 @@ class IfacTcpIntegrationTest {
             .directory(projectRoot)
             .redirectErrorStream(true)
 
+        // The script falls back to ~/repos/Reticulum; on a checkout where the
+        // reference lives beside this repo, point python at it unless the caller
+        // already did.
+        if (System.getenv("PYTHONPATH").isNullOrEmpty()) {
+            val sibling = File(projectRoot.parentFile, "Reticulum")
+            if (File(sibling, "RNS").isDirectory) {
+                processBuilder.environment()["PYTHONPATH"] = sibling.absolutePath
+            }
+        }
+
         val process = processBuilder.start()
 
         // Read output in background
@@ -110,6 +124,7 @@ class IfacTcpIntegrationTest {
                 var line: String?
                 while (reader.readLine().also { line = it } != null) {
                     println("[Python] $line")
+                    line?.let { pythonLines.add(it) }
                 }
             }
         }.start()
@@ -301,5 +316,54 @@ class IfacTcpIntegrationTest {
         } else {
             println("Connection failed (also acceptable)")
         }
+    }
+
+    /**
+     * Kotlin -> python direction of the IFAC handshake. The client's first frame on
+     * connect is the tunnel-synthesis packet; if it leaves unmasked, an IFAC'd python
+     * TCPServerInterface drops it silently and never registers the tunnel
+     * (Transport.py:1442-1473). The server script reports `TUNNELS: n` whenever
+     * RNS.Transport.tunnels changes size; the tunnel must appear on the python side.
+     */
+    @Test
+    @Timeout(60)
+    @DisplayName("Python IFAC server registers the tunnel the Kotlin client synthesizes")
+    fun `python registers kotlin tunnel through ifac`() {
+        pythonProcess = startPythonServer()
+
+        kotlinInterface = TCPClientInterface(
+            name = "IFAC Tunnel Client",
+            targetHost = "127.0.0.1",
+            targetPort = TEST_PORT,
+            ifacNetname = TEST_NETNAME,
+            ifacNetkey = TEST_PASSPHRASE
+        )
+        assertTrue(kotlinInterface!!.ifacSize == 16, "IFAC should be enabled (size=16)")
+
+        kotlinInterface!!.onPacketReceived = { data, iface ->
+            Transport.inbound(data, iface.toRef())
+        }
+        kotlinInterface!!.start()
+        Transport.registerInterface(kotlinInterface!!.toRef())
+
+        var attempts = 0
+        while (!kotlinInterface!!.online.value && attempts < 30) {
+            Thread.sleep(500)
+            attempts++
+        }
+        assertTrue(kotlinInterface!!.online.value, "Interface should come online")
+
+        // Tunnel synthesis runs from Transport's job loop shortly after the interface
+        // reports online; the python side registers it on receipt.
+        var waited = 0
+        while (pythonLines.none { it.contains("TUNNELS: 1") } && waited < 20_000) {
+            Thread.sleep(250)
+            waited += 250
+        }
+        assertTrue(
+            pythonLines.any { it.contains("TUNNELS: 1") },
+            "python never registered the tunnel: the synthesis frame did not pass IFAC. " +
+                "Last python lines: ${pythonLines.takeLast(8)}"
+        )
     }
 }

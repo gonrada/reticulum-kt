@@ -100,7 +100,7 @@ class PipeSession:
         import RNS
         self.RNS = RNS
 
-        RNS.loglevel = RNS.LOG_CRITICAL
+        RNS.loglevel = int(os.environ.get("RNS_CONF_LOGLEVEL", RNS.LOG_CRITICAL))
 
         self._config_path = tempfile.mkdtemp(prefix="rns_conformance_py_")
         config_file = os.path.join(self._config_path, "config")
@@ -111,7 +111,11 @@ class PipeSession:
             f.write("  share_instance = No\n")
             f.write("\n[interfaces]\n")
 
-        self.reticulum = RNS.Reticulum(configdir=self._config_path, loglevel=RNS.LOG_CRITICAL)
+        # Upstream Transport gates its worker threads on _should_run, which exit_handler
+        # clears and start() never re-arms; a second in-process instance would never
+        # drain its inbound queue (Transport.py inbound_job/jobloop).
+        RNS.Transport._should_run = True
+        self.reticulum = RNS.Reticulum(configdir=self._config_path, loglevel=RNS.loglevel)
 
     def _create_pipe_interface(self):
         """Create StdioPipeInterface connected to subprocess stdin/stdout."""
