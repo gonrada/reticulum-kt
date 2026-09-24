@@ -46,5 +46,16 @@ subprojects {
 
     tasks.withType<Test> {
         useJUnitPlatform()
+        // Forward the opt-in flag for the hot-path perf harness (HotPathBench) to the
+        // forked test worker. No effect on normal runs; the harness self-skips unless set.
+        System.getProperty("bench")?.let { systemProperty("bench", it) }
+        // Allocation profiling: when -Dbench.jfr=<path> is set, arm JFR allocation
+        // sampling on the test worker (AnnounceAllocProfile self-skips otherwise). JFR is
+        // built into the JDK; the `profile` preset samples allocations at ~1-2% overhead.
+        System.getProperty("bench.jfr")?.let { jfrPath ->
+            systemProperty("bench.jfr", jfrPath)
+            jvmArgs("-XX:StartFlightRecording=filename=$jfrPath,settings=profile,dumponexit=true")
+            jvmArgs("-XX:FlightRecorderOptions=stackdepth=64")
+        }
     }
 }

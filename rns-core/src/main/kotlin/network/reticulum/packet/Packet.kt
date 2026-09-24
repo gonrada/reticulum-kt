@@ -133,25 +133,32 @@ class Packet private constructor(
     var raw: ByteArray? = null
         internal set
 
-    /**
-     * The full hash of the packet's hashable portion.
-     */
-    val packetHash: ByteArray by lazy {
-        val hashable = getHashablePart()
-        Hashes.fullHash(hashable)
-    }
+    // Memoised hash, INVALIDATED BY pack(). python computes full_hash(get_hashable_part())
+    // on every get_hash() call (Packet.py:356-358), so a resend — which re-packs to obtain
+    // fresh ciphertext for encrypted destinations (Packet.py:316-325) — yields a NEW hash.
+    // Caching these with `by lazy` made the hash permanent, so a re-encrypted resend kept
+    // its old identity: different bytes on the wire, same packet hash for dedup, receipts
+    // and proof matching. Memoisation is kept for the per-packet hot path; correctness
+    // comes from clearing it whenever the packed bytes change.
+    @Volatile
+    private var packetHashCache: ByteArray? = null
 
-    /**
-     * The truncated hash of the packet.
-     */
-    val truncatedHash: ByteArray by lazy {
-        Hashes.truncatedHash(getHashablePart())
-    }
+    /** The full hash of the packet's hashable portion. */
+    val packetHash: ByteArray
+        get() = packetHashCache ?: Hashes.fullHash(getHashablePart()).also { packetHashCache = it }
 
-    /**
-     * The hex-encoded packet hash.
-     */
-    val hexHash: String by lazy { packetHash.toHexString() }
+    /** The truncated hash of the packet. */
+    val truncatedHash: ByteArray
+        get() = packetHash.copyOf(network.reticulum.common.RnsConstants.TRUNCATED_HASH_BYTES)
+
+    /** The hex-encoded packet hash. */
+    val hexHash: String
+        get() = packetHash.toHexString()
+
+    /** Drop the memoised hash; called from pack() when the packed bytes are rebuilt. */
+    private fun invalidateHashCache() {
+        packetHashCache = null
+    }
 
     /**
      * Get the packed flags byte.
@@ -182,6 +189,9 @@ class Packet private constructor(
      * bytes rather than re-packing.
      */
     fun pack(): ByteArray {
+        // The packed bytes are about to be rebuilt — for an encrypted destination this
+        // produces fresh ciphertext, so any memoised hash now describes the previous
+        // packing (python recomputes per get_hash() call and has no such staleness).
         var header = byteArrayOf(getPackedFlags().toByte(), hops.toByte())
         var ciphertext: ByteArray? = null
 
@@ -231,6 +241,10 @@ class Packet private constructor(
         val packed = header + body
         raw = packed
 
+        // Dropped AFTER the new bytes are in place: a concurrent reader then sees either
+        // the old bytes with the old hash or the new bytes with no hash, never the old
+        // hash cached against the new bytes.
+        invalidateHashCache()
         // python: IOError("Packet size of X exceeds MTU of Y bytes")
         if (packed.size > mtu) {
             throw IllegalStateException(
@@ -251,7 +265,7 @@ class Packet private constructor(
      * The packet hash: full SHA-256 of the hashable part, exactly python
      * Packet.get_hash (Packet.py:356-358) — stable across hops/transport_id.
      */
-    fun getHash(): ByteArray = Hashes.fullHash(getHashablePart())
+    fun getHash(): ByteArray = packetHash // memoised, cleared by pack() — see packetHashCache
 
     fun getHashablePart(): ByteArray {
         val packed = raw ?: pack()
@@ -259,18 +273,25 @@ class Packet private constructor(
         // Mask the flags byte to only keep lower 4 bits
         val maskedFlags = (packed[0].toInt() and 0b00001111).toByte()
 
+        // Single pre-sized array + copyInto, rather than `byteArrayOf(x) + copyOfRange(...)`
+        // which allocated three arrays (the 1-byte flag array, the range copy, and the
+        // concatenation). Output is byte-identical. getHashablePart backs packetHash /
+        // truncatedHash and runs on every packet.
         return when (headerType) {
             HeaderType.HEADER_1 -> {
                 // [masked_flags] + [hops onwards]
-                byteArrayOf(maskedFlags) + packed.copyOfRange(2, packed.size)
+                val result = ByteArray(packed.size - 1)
+                result[0] = maskedFlags
+                packed.copyInto(result, destinationOffset = 1, startIndex = 2, endIndex = packed.size)
+                result
             }
             HeaderType.HEADER_2 -> {
-                // Skip transport_id (16 bytes after hops)
-                // [masked_flags] + [after transport_id]
-                byteArrayOf(maskedFlags) + packed.copyOfRange(
-                    2 + RnsConstants.TRUNCATED_HASH_BYTES,
-                    packed.size
-                )
+                // Skip transport_id (16 bytes after hops): [masked_flags] + [after transport_id]
+                val start = 2 + RnsConstants.TRUNCATED_HASH_BYTES
+                val result = ByteArray(1 + (packed.size - start))
+                result[0] = maskedFlags
+                packed.copyInto(result, destinationOffset = 1, startIndex = start, endIndex = packed.size)
+                result
             }
         }
     }
@@ -410,8 +431,7 @@ class Packet private constructor(
                 // python keeps context as a raw int — an unknown code point
                 // parses fine and matches no dispatch branch. UNKNOWN +
                 // contextRaw preserve that (forward compatibility).
-                context = PacketContext.entries.find { it.value == contextByte }
-                    ?: PacketContext.UNKNOWN
+                context = PacketContext.fromByte(contextByte)
 
                 Packet(
                     packetType = packetType,

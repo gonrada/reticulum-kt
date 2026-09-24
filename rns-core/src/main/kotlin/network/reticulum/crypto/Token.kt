@@ -3,7 +3,6 @@ package network.reticulum.crypto
 import network.reticulum.common.AesMode
 import network.reticulum.common.CryptoException
 import network.reticulum.common.RnsConstants
-import network.reticulum.common.constantTimeEquals
 
 /**
  * Modified Fernet token implementation for Reticulum.
@@ -24,6 +23,10 @@ class Token(
     private val mode: AesMode
     private val signingKey: ByteArray
     private val encryptionKey: ByteArray
+
+    // The offset/length forms are internal to BouncyCastleProvider, not on the
+    // CryptoProvider interface; any other provider gets the sliced-copy path.
+    private val bcCrypto: BouncyCastleProvider? = crypto as? BouncyCastleProvider
 
     init {
         when (key.size) {
@@ -70,13 +73,38 @@ class Token(
         // encrypt; split out so decrypt can use python's LAX unpad.
         val ciphertext = crypto.aesEncryptNoPadding(PKCS7.pad(plaintext), encryptionKey, iv, mode)
 
-        // signed_parts = IV + ciphertext
-        val signedParts = iv + ciphertext
+        // token = IV || ciphertext || HMAC(IV || ciphertext), assembled in
+        // place: the signed parts are the token's first 16 + ciphertext bytes.
+        val signedLength = 16 + ciphertext.size
+        val token = ByteArray(signedLength + 32)
+        iv.copyInto(token, 0)
+        ciphertext.copyInto(token, 16)
+        hmacOver(token, 0, signedLength).copyInto(token, signedLength)
+        return token
+    }
 
-        // HMAC over IV + ciphertext
-        val hmac = crypto.hmacSha256(signingKey, signedParts)
+    /** HMAC-SHA256(signingKey) over data[offset, offset + length). */
+    private fun hmacOver(data: ByteArray, offset: Int, length: Int): ByteArray =
+        bcCrypto?.hmacSha256(signingKey, data, offset, length)
+            ?: crypto.hmacSha256(signingKey, data.copyOfRange(offset, offset + length))
 
-        return signedParts + hmac
+    /** Bare AES-CBC decrypt of data[offset, offset + length) under encryptionKey. */
+    private fun aesDecryptOver(data: ByteArray, offset: Int, length: Int, iv: ByteArray): ByteArray =
+        bcCrypto?.aesDecryptNoPadding(data, offset, length, encryptionKey, iv, mode)
+            ?: crypto.aesDecryptNoPadding(data.copyOfRange(offset, offset + length), encryptionKey, iv, mode)
+
+    /**
+     * Constant-time comparison of data[offset, offset + expected.size) with
+     * expected: the same XOR-accumulate loop as ByteArray.constantTimeEquals,
+     * without copying the range out first.
+     */
+    private fun constantTimeEqualsAt(data: ByteArray, offset: Int, expected: ByteArray): Boolean {
+        if (data.size - offset != expected.size) return false
+        var result = 0
+        for (i in expected.indices) {
+            result = result or (data[offset + i].toInt() xor expected[i].toInt())
+        }
+        return result == 0
     }
 
     /**
@@ -95,11 +123,11 @@ class Token(
             throw CryptoException("Cannot verify HMAC on token of only ${token.size} bytes")
         }
 
-        val receivedHmac = token.copyOfRange(token.size - 32, token.size)
-        val dataToVerify = token.copyOfRange(0, token.size - 32)
-        val expectedHmac = crypto.hmacSha256(signingKey, dataToVerify)
+        // HMAC over token[0, size-32); the received tag is the trailing 32 bytes.
+        val signedLength = token.size - 32
+        val expectedHmac = hmacOver(token, 0, signedLength)
 
-        return receivedHmac.constantTimeEquals(expectedHmac)
+        return constantTimeEqualsAt(token, signedLength, expectedHmac)
     }
 
     /**
@@ -118,10 +146,14 @@ class Token(
         }
 
         val iv = token.copyOfRange(0, 16)
-        val ciphertext = token.copyOfRange(16, token.size - 32)
+        // ciphertext = token[16, size-32), decrypted in place. An authenticated
+        // token shorter than 48 bytes has no such range; reject it before the
+        // try, as the former copyOfRange(16, size - 32) did.
+        val ciphertextLength = token.size - 48
+        require(ciphertextLength >= 0) { "Token of ${token.size} bytes carries no ciphertext" }
 
         return try {
-            PKCS7.unpad(crypto.aesDecryptNoPadding(ciphertext, encryptionKey, iv, mode))
+            PKCS7.unpad(aesDecryptOver(token, 16, ciphertextLength, iv))
         } catch (e: Exception) {
             throw CryptoException("Could not decrypt token: ${e.message}", e)
         }

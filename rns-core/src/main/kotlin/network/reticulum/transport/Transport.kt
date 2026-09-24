@@ -224,11 +224,15 @@ object Transport {
 
     /**
      * A packet that has been through [preprocessInbound] and is waiting to be drained. Carries
-     * the wire bytes the second stage needs for byte accounting and broadcast forwarding.
+     * what the second stage needs and would otherwise have to recompute: the wire bytes (for
+     * byte accounting and broadcast forwarding), the announce validation result (one Ed25519
+     * verify per announce, not two), and the packet-hash key (one allocation, not two).
      */
     private class InboundItem(
         val packet: Packet,
         val interfaceRef: InterfaceRef,
+        val preValidatedAnnounce: AnnounceData?,
+        val pktKey: ByteArrayKey,
     ) {
         /** The wire bytes as unpacked; `Packet.unpack` keeps its own copy, so the item holds no second one. */
         val raw: ByteArray get() = packet.raw ?: ByteArray(0)
@@ -443,6 +447,14 @@ object Transport {
 
     /** Registered destinations. */
     private val destinations = CopyOnWriteArrayList<Destination>()
+
+    /**
+     * Hash -> Destination index over [destinations], maintained in
+     * register/deregisterDestination. Turns "is this one of ours?" — asked on every inbound
+     * announce and at the local-destination skip — from an O(n) linear scan with contentEquals
+     * into an O(1) lookup. [destinations] stays the source of truth (order, iteration).
+     */
+    private val destinationIndex = ConcurrentHashMap<ByteArrayKey, Destination>()
 
     /** Registered announce handlers with their aspect filters. */
     private val announceHandlers = CopyOnWriteArrayList<RegisteredHandler>()
@@ -1244,10 +1256,11 @@ object Transport {
 
         // Prevent duplicate registration (matches Python Transport.py:2223-2225)
         val key = destination.hash.toKey()
-        if (destinations.any { it.hash.toKey() == key }) {
+        if (destinationIndex.containsKey(key)) {
             return
         }
         destinations.add(destination)
+        destinationIndex[key] = destination
         log("Registered destination: ${destination.hexHash}")
     }
 
@@ -1256,6 +1269,8 @@ object Transport {
      */
     fun deregisterDestination(destination: Destination) {
         destinations.remove(destination)
+        // Remove from the index only if it still maps to this exact destination.
+        destinationIndex.remove(destination.hash.toKey(), destination)
         log("Deregistered destination: ${destination.hexHash}")
     }
 
@@ -1269,8 +1284,7 @@ object Transport {
      * Find a registered destination by hash.
      */
     fun findDestination(hash: ByteArray): Destination? {
-        val key = hash.toKey()
-        return destinations.find { it.hash.toKey() == key }
+        return destinationIndex[hash.toKey()]
     }
 
     // ===== Receipt Tracking =====
@@ -3468,7 +3482,9 @@ object Transport {
         // Transport.py:1705 runs packet_filter before `packet.hops += 1`). The
         // PLAIN/GROUP filter checks `hops <= 1`, which must see the on-wire hops,
         // or a legitimately relayed 1-hop PLAIN/GROUP packet is wrongly dropped.
-        if (!packetFilter(packet, interfaceRef)) {
+        // Build the packet-hash key once; packetFilter's dedup and addPacketHash both reuse it.
+        val pktKey = packet.packetHash.toKey()
+        if (!packetFilter(packet, interfaceRef, pktKey)) {
             logDebug { "FILTERED: ${packet.packetType} dest=${packet.destinationHash.toHexString()} from ${interfaceRef.name}" }
             return null
         }
@@ -3494,8 +3510,14 @@ object Transport {
         var trafficClass = tc
 
         // Drop an announce with an invalid signature/binding BEFORE it
-        // consumes a hashlist slot (python validates in preprocess_inbound and
-        // returns before add_packet_hash, Transport.py:1806-1810).
+        // consumes a hashlist slot (python validates in inbound and returns
+        // before add_packet_hash). validateAnnounce is side-effect-free, so its
+        // result is kept and handed to processAnnounce below instead of
+        // re-validating there — that second call was a full Ed25519 verify on
+        // every announce, doubling the hottest path's crypto for no gain.
+        // Nothing between here and the dispatch mutates packet.data or the
+        // identity/ratchet state the validation reads.
+        var preValidatedAnnounce: AnnounceData? = null
         if (packet.packetType == PacketType.ANNOUNCE) {
             // python Transport.py:1804 — an announce frame larger than
             // Reticulum.MTU is a protocol violation, dropped BEFORE signature
@@ -3507,7 +3529,8 @@ object Transport {
                 return null
             }
             if (trafficClass < TransportConstants.TC_ANNOUNCE) trafficClass = TransportConstants.TC_ANNOUNCE
-            if (validateAnnounce(packet) == null) {
+            preValidatedAnnounce = validateAnnounce(packet)
+            if (preValidatedAnnounce == null) {
                 log("Dropping invalid announce from ${interfaceRef.name}")
                 return null
             }
@@ -3582,7 +3605,7 @@ object Transport {
         }
 
         packet.trafficClass = trafficClass
-        return InboundItem(packet, interfaceRef)
+        return InboundItem(packet, interfaceRef, preValidatedAnnounce, pktKey)
     }
 
     /**
@@ -3595,22 +3618,28 @@ object Transport {
         val packet = item.packet
         val raw = item.raw
         val interfaceRef = item.interfaceRef
+        val preValidatedAnnounce = item.preValidatedAnnounce
+        val pktKey = item.pktKey
 
         // python Transport.py:1915-1916 — an interface that went offline while the packet
         // sat in the queue does not get its packet processed.
         if (!interfaceRef.online) return
 
+        // One ByteArrayKey for the destination hash, reused by every table lookup below
+        // (was re-allocated at each of four sites per packet).
+        val destKey = packet.destinationHash.toKey()
+
         // Add to hashlist (with some exceptions)
         val rememberHash =
             when {
-                linkTable.containsKey(packet.destinationHash.toKey()) -> false
+                linkTable.containsKey(destKey) -> false
                 packet.packetType == PacketType.PROOF &&
                     packet.context == PacketContext.LRPROOF -> false
                 else -> true
             }
 
         if (rememberHash) {
-            addPacketHash(packet.packetHash)
+            addPacketHash(pktKey)
         }
 
         trafficRxBytes += raw.size
@@ -3621,14 +3650,16 @@ object Transport {
         // Only applies to PLAIN+BROADCAST packets (path requests, control packets).
         // Announces (SINGLE+BROADCAST) are NOT forwarded here — they are handled
         // by processAnnounce() which re-packages them with HEADER_2 transport headers.
+        // Whether this packet arrived from one of our local (shared-instance) clients.
+        // Computed once here; reused by the broadcast branch below and by the
+        // for-local-client detection after it (was computed twice per packet).
+        val fromLocalClient = localClientInterfaces.any { it.hash.contentEquals(interfaceRef.hash) }
+
         if (packet.destinationType == DestinationType.PLAIN &&
             packet.transportType == TransportType.BROADCAST &&
-            !controlHashes.contains(packet.destinationHash.toKey())
+            !controlHashes.contains(destKey)
         ) {
             logDebug { "BROADCAST ROUTING: packet from ${interfaceRef.name}, localClients=${localClientInterfaces.size}" }
-
-            // Check if packet is from a local client interface
-            val fromLocalClient = localClientInterfaces.any { it.hash.contentEquals(interfaceRef.hash) }
             logDebug { "BROADCAST ROUTING: fromLocalClient=$fromLocalClient" }
 
             if (fromLocalClient) {
@@ -3665,13 +3696,12 @@ object Transport {
         }
 
         // Detect packets for local clients (Python Transport.py:1378-1382)
-        val fromLocalClient = localClientInterfaces.any { it.hash.contentEquals(interfaceRef.hash) }
         val forLocalClient =
             packet.packetType != PacketType.ANNOUNCE &&
-                pathTable[packet.destinationHash.toKey()]?.let { it.hops == 0 } == true
+                pathTable[destKey]?.let { it.hops == 0 } == true
         val forLocalClientLink =
             packet.packetType != PacketType.ANNOUNCE &&
-                linkTable[packet.destinationHash.toKey()]?.let { entry ->
+                linkTable[destKey]?.let { entry ->
                     localClientInterfaces.any { it.hash.contentEquals(entry.receivingInterfaceHash) } ||
                         localClientInterfaces.any { it.hash.contentEquals(entry.nextHopInterfaceHash) }
                 } == true
@@ -3886,7 +3916,7 @@ object Transport {
         // Route based on packet type (Python:1559+, 1937+, 1968+)
         // This runs AFTER transport forwarding — a packet may be both forwarded and delivered locally.
         when (packet.packetType) {
-            PacketType.ANNOUNCE -> processAnnounce(packet, interfaceRef)
+            PacketType.ANNOUNCE -> processAnnounce(packet, interfaceRef, preValidatedAnnounce)
             PacketType.LINKREQUEST -> processLinkRequest(packet, interfaceRef)
             PacketType.PROOF -> processProof(packet, interfaceRef)
             PacketType.DATA -> processData(packet, interfaceRef)
@@ -4002,7 +4032,11 @@ object Transport {
             log("Dropping outbound packet at hop ceiling (${packet.hops} >= ${TransportConstants.PATHFINDER_M})")
             return false
         }
-        val packedData = packet.pack()
+        // Use the bytes send() already packed; pack here only if the packet arrived unpacked
+        // (direct Transport.outbound callers). The unconditional re-pack repeated the full
+        // ephemeral X25519 + HKDF + AES for every SINGLE-dest packet and threw the first
+        // result away. Python's Transport._outbound only ever reads packet.raw.
+        val packedData = packet.raw ?: packet.pack()
         var sent = false
         val destHex = packet.destinationHash.toHexString()
 
@@ -4174,7 +4208,7 @@ object Transport {
                     }
 
                     if (packet.packetType == PacketType.ANNOUNCE) {
-                        val isLocal = destinations.any { it.hash.contentEquals(packet.destinationHash) }
+                        val isLocal = destinationIndex.containsKey(packet.destinationHash.toKey())
                         // An announce for a destination that is neither ours nor one we
                         // hold a route to is not broadcast at all (python Transport.py:
                         // 1452-1456, "next hop interface doesn't exist"). There is nothing
@@ -4403,9 +4437,12 @@ object Transport {
     private fun processAnnounce(
         packet: Packet,
         interfaceRef: InterfaceRef,
+        // Result of the side-effect-free pre-drop validation in processInbound, so the
+        // Ed25519 verify runs once per announce. Falls back to validating here if absent.
+        preValidated: AnnounceData? = null,
     ) {
-        // Validate and extract announce data
-        val announceData = validateAnnounce(packet)
+        // Validate and extract announce data (reusing the inbound pre-validation when supplied)
+        val announceData = preValidated ?: validateAnnounce(packet)
         if (announceData == null) {
             logDebug { "Announce validation failed for ${packet.destinationHash.toHexString()}" }
             return
@@ -4437,12 +4474,13 @@ object Transport {
         // Announce counting and ingress-limit holding happen in preprocessInbound now, before
         // the packet is queued and before the identity above is remembered (python
         // Transport.py:1811-1825). An announce that reaches this point was not held.
+        val destKey = destHash.toKey()
 
         // Skip announces for our own local destinations (Python Transport.py:2175-2176).
         // When connected to a shared instance, our own announces bounce back from the
         // transport node. Processing them would create erroneous 0-hop pathTable entries
         // that cause forwarding loops (e.g., LRPROOF loop via spurious link_table entries).
-        val isLocalDestination = destinations.any { it.hash.contentEquals(destHash) }
+        val isLocalDestination = destinationIndex.containsKey(destKey)
         if (isLocalDestination) {
             logDebug { "Skipping announce for local destination ${destHash.toHexString()}" }
             return
@@ -5061,7 +5099,7 @@ object Transport {
         // interface only, matching Python's `attached_interface` semantics in
         // Transport.py:2781 where path-response announces carry the requesting
         // interface as their attached_interface.
-        val isLocal = destinations.any { it.hash.contentEquals(destinationHash) }
+        val isLocal = destinationIndex.containsKey(destinationHash.toKey())
         val sourceInterface = nextHopInterface(destinationHash)
         val sourceMode = sourceInterface?.mode
         val targetInterface = attached ?: packet.attachedInterface
@@ -5999,6 +6037,9 @@ object Transport {
     private fun packetFilter(
         packet: Packet,
         receivingInterface: InterfaceRef,
+        // The packet-hash key, supplied by the inbound path so addPacketHash can reuse it
+        // instead of re-keying (one ByteArrayKey per packet instead of two).
+        key: ByteArrayKey = packet.packetHash.toKey(),
     ): Boolean {
         // Python RNS: Bypass local filtering if connected to shared instance
         // (Python Transport.py:1187-1190)
@@ -6045,8 +6086,7 @@ object Transport {
             }
         }
 
-        // Hashlist dedup (Python:1227-1238)
-        val key = packet.packetHash.toKey()
+        // Hashlist dedup (Python:1227-1238) — `key` is the caller-supplied packet-hash key.
         if (!packetHashlist.contains(key) && !packetHashlistPrev.contains(key)) {
             return true
         } else if (packet.packetType == PacketType.ANNOUNCE &&
@@ -6058,8 +6098,10 @@ object Transport {
         return false
     }
 
-    private fun addPacketHash(hash: ByteArray) {
-        val key = hash.toKey()
+    private fun addPacketHash(hash: ByteArray) = addPacketHash(hash.toKey())
+
+    /** Key-taking variant so the inbound path reuses the key packetFilter already built. */
+    private fun addPacketHash(key: ByteArrayKey) {
         packetHashlist.add(key)
 
         // Rotate hashlist if too large. Rotate at HASHLIST_MAXSIZE/2 so the two
@@ -7712,11 +7754,11 @@ object Transport {
 
     // ===== Helpers =====
 
-    private fun findInterfaceByHash(hash: ByteArray): InterfaceRef? {
-        val key = hash.toKey()
-        return interfaces.find { it.hash.toKey() == key }
-            ?: localClientInterfaces.find { it.hash.toKey() == key }
-    }
+    private fun findInterfaceByHash(hash: ByteArray): InterfaceRef? =
+        // contentEquals: the previous form allocated a ByteArrayKey per interface per lookup
+        // (path-routed outbound, forward, proof, cull). Still O(#interfaces), zero allocations.
+        interfaces.find { it.hash.contentEquals(hash) }
+            ?: localClientInterfaces.find { it.hash.contentEquals(hash) }
 
     private fun log(message: String) {
         RnsLog.log(RnsLog.INFO, "Transport", message)

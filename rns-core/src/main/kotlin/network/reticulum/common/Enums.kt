@@ -125,6 +125,16 @@ enum class PacketContext(val value: Int) {
     LRPROOF(0xFF);
 
     companion object {
+        // 256-slot table for the wire context byte: Packet.unpack ran a 22-entry linear
+        // scan of `entries` per packet. UNKNOWN(-1) is excluded so it cannot shadow a real
+        // code point; unmapped bytes resolve to UNKNOWN (raw byte kept in Packet.contextRaw).
+        private val BY_VALUE: Array<PacketContext?> = arrayOfNulls<PacketContext>(256).also { table ->
+            for (e in entries) if (e.value in 0..255) table[e.value] = e
+        }
+
+        /** Context for a wire byte (0..255); UNKNOWN for a code point with no named entry. */
+        fun fromByte(value: Int): PacketContext = BY_VALUE[value and 0xFF] ?: UNKNOWN
+
         fun fromValue(value: Int): PacketContext =
             entries.find { it.value == value }
                 ?: throw IllegalArgumentException("Unknown packet context: $value")

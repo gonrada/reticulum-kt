@@ -228,4 +228,10 @@ interface CryptoProvider {
  * Default crypto provider instance.
  * Uses BouncyCastle on JVM.
  */
-fun defaultCryptoProvider(): CryptoProvider = BouncyCastleProvider()
+// Single shared provider. BouncyCastleProvider is stateless except a thread-safe SecureRandom
+// (and per-call-local digest/cipher/signer objects), so one instance is safe to share across
+// threads. defaultCryptoProvider() was a `= BouncyCastleProvider()` factory called all over the
+// crypto hot path, constructing a new provider — and a freshly seeded SecureRandom — every call.
+private val DEFAULT_CRYPTO_PROVIDER: CryptoProvider by lazy { BouncyCastleProvider() }
+
+fun defaultCryptoProvider(): CryptoProvider = DEFAULT_CRYPTO_PROVIDER

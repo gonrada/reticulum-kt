@@ -308,6 +308,16 @@ class Resource private constructor(
             )
             println("[$timestamp] [Resource] $message")
         }
+
+        /**
+         * Lazy variant for hot paths: the message lambda (and its hex-string
+         * allocations) only runs when DEBUG is on. `log(...)` is already gated,
+         * but call sites that interpolate `toHexString()` pay for the string
+         * before the gate is reached; this moves the gate in front of it.
+         */
+        private inline fun logDebug(message: () -> String) {
+            if (DEBUG) log(message())
+        }
     }
 
     // Resource identification
@@ -946,15 +956,15 @@ class Resource private constructor(
             val partData = data
             val partHash = getMapHash(partData)
 
-            log("receivePart: received ${partData.size} bytes, partHash=${partHash.toHexString()}")
-            log("receivePart: randomHash=${randomHash.toHexString()}, hashmap size=${hashmap.size}")
+            logDebug { "receivePart: received ${partData.size} bytes, partHash=${partHash.toHexString()}" }
+            logDebug { "receivePart: randomHash=${randomHash.toHexString()}, hashmap size=${hashmap.size}" }
             if (hashmap.isNotEmpty() && hashmap[0] != null) {
-                log("receivePart: expected hashmap[0]=${hashmap[0]!!.toHexString()}")
+                logDebug { "receivePart: expected hashmap[0]=${hashmap[0]!!.toHexString()}" }
             }
 
             // Search for matching hash in current window
             val searchStart = if (consecutiveCompletedHeight >= 0) consecutiveCompletedHeight else 0
-            log("receivePart: searchStart=$searchStart, window=$window, parts.size=${parts.size}")
+            logDebug { "receivePart: searchStart=$searchStart, window=$window, parts.size=${parts.size}" }
             for (i in searchStart until minOf(searchStart + window, parts.size)) {
                 val mapHash = hashmap[i]
                 if (mapHash != null && mapHash.contentEquals(partHash)) {

@@ -43,9 +43,10 @@ class Identity private constructor(
     val hash: ByteArray = Hashes.truncatedHash(getPublicKey())
 
     /**
-     * The hex-encoded hash.
+     * The hex-encoded hash. Lazy: most identities (every recall(), the
+     * throw-away one in validateAnnounce) never have it read.
      */
-    val hexHash: String = hash.toHexString()
+    val hexHash: String by lazy { hash.toHexString() }
 
     /**
      * Whether this identity holds a private key (can sign/decrypt).
@@ -132,8 +133,8 @@ class Identity private constructor(
          * ratchet per destination (`known_ratchets[destination_hash] = ratchet`,
          * Identity.py:419) and a new ratchet replaces the old one; accumulating
          * them here let any announcer grow this map by one entry per announce for
-         * RATCHET_EXPIRY. The list type is kept so the existing callers and
-         * locking are unchanged.
+         * RATCHET_EXPIRY. The list is kept only as the per-destination lock
+         * object (see [withRatchetEntries]).
          */
         private val destinationRatchets = ConcurrentHashMap<ByteArrayKey, MutableList<RatchetEntry>>()
 
@@ -402,17 +403,33 @@ class Identity private constructor(
                     "Can't remember destination, public key size of ${publicKey.size} is not valid"
                 )
             }
+            remember(packetHash, destHash, publicKey, appData, destHash.toKey(), Hashes.truncatedHash(publicKey))
+        }
+
+        /**
+         * [remember] for a caller that already holds the destination key and the
+         * identity hash of [publicKey] (validateAnnounce has both), so neither is
+         * recomputed. [publicKey] must be [RnsConstants.FULL_KEY_SIZE] bytes and
+         * [identityHash] must equal `Hashes.truncatedHash(publicKey)`.
+         */
+        internal fun remember(
+            packetHash: ByteArray,
+            destHash: ByteArray,
+            publicKey: ByteArray,
+            appData: ByteArray?,
+            destKey: ByteArrayKey,
+            identityHash: ByteArray
+        ) {
             val data = IdentityData(
                 timestamp = System.currentTimeMillis(),
                 packetHash = packetHash.copyOf(),
                 publicKey = publicKey.copyOf(),
                 appData = appData?.copyOf()
             )
-            knownDestinations[destHash.toKey()] = data
+            knownDestinations[destKey] = data
             identityStore?.upsertKnownDestination(destHash, data)
 
             // Index by identity hash for reverse lookups
-            val identityHash = Hashes.truncatedHash(publicKey)
             identityHashIndex[identityHash.toKey()] = destHash.copyOf()
         }
 
@@ -727,7 +744,8 @@ class Identity private constructor(
                 }
 
                 // Check if we already know this destination and verify the public key hasn't changed
-                val existingData = knownDestinations[destinationHash.toKey()]
+                val destinationKey = destinationHash.toKey()
+                val existingData = knownDestinations[destinationKey]
                 if (existingData != null) {
                     if (!publicKey.contentEquals(existingData.publicKey)) {
                         // Hash collision or attack - reject
@@ -735,12 +753,15 @@ class Identity private constructor(
                     }
                 }
 
-                // Store the announced identity
+                // Store the announced identity. announcedIdentity.hash IS
+                // truncatedHash(publicKey); the key was built for the lookup above.
                 remember(
                     packetHash = packet.packetHash,
                     destHash = destinationHash,
                     publicKey = publicKey,
-                    appData = appData
+                    appData = appData,
+                    destKey = destinationKey,
+                    identityHash = announcedIdentity.hash
                 )
 
                 // Store ratchet if present
@@ -964,6 +985,29 @@ class Identity private constructor(
         }
 
         /**
+         * Run [block] on the ratchet list for [key], holding that list's monitor.
+         *
+         * Ratchet ops used to take one global `synchronized(destinationRatchets)`
+         * over the ConcurrentHashMap; contention is per destination, so lock the
+         * per-destination list instead. The map itself is thread-safe. The only
+         * hazard is [cleanRatchets] detaching an emptied list between our
+         * getOrPut and our lock, which would strand a subsequent add on an
+         * orphaned list — so after locking, confirm the list is still the one
+         * in the map and retry otherwise (cleanRatchets detaches only while
+         * holding the list's monitor, so the check is race-free).
+         */
+        private inline fun <T> withRatchetEntries(key: ByteArrayKey, block: (MutableList<RatchetEntry>) -> T): T {
+            while (true) {
+                val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
+                synchronized(entries) {
+                    if (destinationRatchets[key] === entries) {
+                        return block(entries)
+                    }
+                }
+            }
+        }
+
+        /**
          * Remember a ratchet for a destination.
          * Stores the ratchet with the current timestamp, replacing any previous
          * ratchet for that destination — exactly one ratchet is kept per
@@ -983,9 +1027,7 @@ class Identity private constructor(
             val entry = RatchetEntry(ratchet.copyOf(), now)
             var shouldPersist = false
 
-            synchronized(destinationRatchets) {
-                val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
-
+            withRatchetEntries(key) { entries ->
                 // Already the current ratchet: nothing to do (python compares only
                 // against the one stored ratchet, Identity.py:412).
                 if (entries.any { it.ratchet.contentEquals(ratchet) }) {
@@ -1079,9 +1121,9 @@ class Identity private constructor(
             val now = System.currentTimeMillis()
 
             // Check in-memory cache first
-            synchronized(destinationRatchets) {
-                val entries = destinationRatchets[key]
-                if (entries != null) {
+            val entries = destinationRatchets[key]
+            if (entries != null) {
+                synchronized(entries) {
                     // Clean expired entries
                     entries.removeIf { now - it.timestamp > RATCHET_EXPIRY }
                     val ratchet = entries.firstOrNull()?.ratchet?.copyOf()
@@ -1100,10 +1142,9 @@ class Identity private constructor(
                 // appeared meanwhile came from rememberRatchet and is at least
                 // as fresh as the store (write-through follows the in-memory
                 // update), and the slot holds at most one entry.
-                synchronized(destinationRatchets) {
-                    val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
-                    if (entries.isEmpty()) {
-                        entries.add(RatchetEntry(ratchet.copyOf(), timestamp))
+                withRatchetEntries(key) { cached ->
+                    if (cached.isEmpty()) {
+                        cached.add(RatchetEntry(ratchet.copyOf(), timestamp))
                     }
                 }
                 return ratchet
@@ -1180,9 +1221,7 @@ class Identity private constructor(
                 }
 
                 // Add to in-memory cache (single slot; see getRatchet)
-                val key = destHash.toKey()
-                synchronized(destinationRatchets) {
-                    val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
+                withRatchetEntries(destHash.toKey()) { entries ->
                     if (entries.isEmpty()) {
                         entries.add(RatchetEntry(ratchet.copyOf(), receivedMs))
                     }
@@ -1208,9 +1247,8 @@ class Identity private constructor(
             val key = destHash.toKey()
             val now = System.currentTimeMillis()
 
-            synchronized(destinationRatchets) {
-                val entries = destinationRatchets[key] ?: return emptyList()
-
+            val entries = destinationRatchets[key] ?: return emptyList()
+            synchronized(entries) {
                 // Clean expired entries
                 entries.removeIf { now - it.timestamp > RATCHET_EXPIRY }
 
@@ -1230,9 +1268,7 @@ class Identity private constructor(
          */
         @network.reticulum.RnsTestSeam
         fun dropRatchetCacheForTest(destHash: ByteArray) {
-            synchronized(destinationRatchets) {
-                destinationRatchets.remove(destHash.toKey())
-            }
+            destinationRatchets.remove(destHash.toKey())
         }
 
         /**
@@ -1262,13 +1298,14 @@ class Identity private constructor(
             println("Cleaning ratchets...")
             val now = System.currentTimeMillis()
 
-            // Clean in-memory cache
-            synchronized(destinationRatchets) {
-                val iterator = destinationRatchets.entries.iterator()
-                while (iterator.hasNext()) {
-                    val entry = iterator.next()
-                    val ratchets = entry.value
+            // Clean in-memory cache. Each list is trimmed and, if emptied, detached
+            // from the map while its monitor is held — see withRatchetEntries.
+            val iterator = destinationRatchets.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                val ratchets = entry.value
 
+                synchronized(ratchets) {
                     // Remove expired ratchets
                     ratchets.removeIf { now - it.timestamp > RATCHET_EXPIRY }
 
@@ -1451,13 +1488,15 @@ class Identity private constructor(
         if (ratchets != null) {
             for (ratchet in ratchets) {
                 try {
-                    // python computes the candidate's id before the exchange
-                    // (Identity._get_ratchet_id(ratchet_prv.public_key()...))
-                    val ratchetId = ratchetIdFor(crypto.x25519PublicFromPrivate(ratchet))
                     val sharedKey = crypto.x25519Exchange(ratchet, peerPublicBytes)
                     plaintext = decryptWithSharedKey(sharedKey, tokenData)
                     if (plaintext != null) {
-                        ratchetIdReceiver?.latestRatchetId = ratchetId
+                        // python computes the candidate's id before the exchange
+                        // (Identity.py:872-873), but the id is a pure function of
+                        // the ratchet and only observable on success, so defer the
+                        // scalar mult + SHA-256 until a candidate actually wins.
+                        ratchetIdReceiver?.latestRatchetId =
+                            ratchetIdFor(crypto.x25519PublicFromPrivate(ratchet))
                         break
                     }
                 } catch (e: Exception) {

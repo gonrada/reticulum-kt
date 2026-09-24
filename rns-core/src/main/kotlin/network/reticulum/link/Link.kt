@@ -605,7 +605,7 @@ class Link private constructor(
     var attachedDestination: Destination? = null
 
     /**
-     * The destination whose request handlers and proof strategy serve this link.
+     * The destination whose request handlers serve requests arriving on this link.
      *
      * python keeps one `self.destination` for both directions: the OUT destination the
      * initiator opened to, and, for an inbound link, the owning IN destination assigned at
@@ -2746,6 +2746,29 @@ class Link private constructor(
     }
 
     /**
+     * Find the resource whose full hash starts with [truncatedHash]
+     * (the first [RnsConstants.TRUNCATED_HASH_BYTES] bytes), without
+     * allocating a per-candidate prefix copy. Callers hold the list's lock.
+     */
+    private fun findResourceByTruncatedHash(
+        resources: List<network.reticulum.resource.Resource>,
+        truncatedHash: ByteArray,
+    ): network.reticulum.resource.Resource? {
+        val n = RnsConstants.TRUNCATED_HASH_BYTES
+        if (truncatedHash.size != n) return null
+        return resources.find { resource ->
+            val full = resource.hash
+            if (full.size < n) return@find false
+            var i = 0
+            while (i < n) {
+                if (full[i] != truncatedHash[i]) return@find false
+                i++
+            }
+            true
+        }
+    }
+
+    /**
      * Process resource request packets.
      */
     private fun processResourceReq(packet: Packet) {
@@ -2781,9 +2804,7 @@ class Link private constructor(
             // Find matching outgoing resource - compare truncated hash (first 16 bytes)
             val resource =
                 synchronized(outgoingResources) {
-                    outgoingResources.find {
-                        it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
-                    }
+                    findResourceByTruncatedHash(outgoingResources, resourceHash)
                 }
 
             if (resource == null) {
@@ -2795,7 +2816,7 @@ class Link private constructor(
             // parts by index, and serving the same request again re-sends parts the
             // receiver has already taken, desynchronising the window it uses to decide
             // what to ask for next — python calls the result a sequencing error and
-            // guards it by packet hash (Link.py:1113-1114).
+            // guards it by packet hash (Link.py:1094-1095).
             if (!resource.admitRequestPacket(packet.getHash())) {
                 log("Ignoring duplicate request for resource ${resourceHash.toHexString()}")
                 return
@@ -2827,9 +2848,7 @@ class Link private constructor(
             // Find matching incoming resource - compare truncated hash (first 16 bytes)
             val resource =
                 synchronized(incomingResources) {
-                    incomingResources.find {
-                        it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
-                    }
+                    findResourceByTruncatedHash(incomingResources, resourceHash)
                 }
 
             if (resource == null) {
@@ -2864,9 +2883,7 @@ class Link private constructor(
             // Compare truncated hash (first 16 bytes)
             val resource =
                 synchronized(incomingResources) {
-                    incomingResources.find {
-                        it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
-                    }
+                    findResourceByTruncatedHash(incomingResources, resourceHash)
                 }
 
             if (resource == null) {
@@ -2900,9 +2917,7 @@ class Link private constructor(
             // Compare truncated hash (first 16 bytes)
             val resource =
                 synchronized(outgoingResources) {
-                    outgoingResources.find {
-                        it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
-                    }
+                    findResourceByTruncatedHash(outgoingResources, resourceHash)
                 }
 
             if (resource == null) {
@@ -3051,9 +3066,7 @@ class Link private constructor(
             // Find matching outgoing resource - compare truncated hash (first 16 bytes)
             val resource =
                 synchronized(outgoingResources) {
-                    outgoingResources.find {
-                        it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
-                    }
+                    findResourceByTruncatedHash(outgoingResources, resourceHash)
                 }
 
             if (resource == null) {

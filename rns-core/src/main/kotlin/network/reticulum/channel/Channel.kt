@@ -2,8 +2,6 @@ package network.reticulum.channel
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.LinkedBlockingDeque
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.pow
@@ -84,13 +82,18 @@ class Channel(
     // Message handlers
     private val messageHandlers = CopyOnWriteArrayList<MessageCallback>()
 
-    // Sequence tracking
-    private val nextSequence = AtomicInteger(0)
-    private val nextRxSequence = AtomicInteger(0)
+    // Sequence tracking. Every access is under [lock] (python: plain ints under
+    // _lock, Channel.py:355-390), so plain @Volatile ints like [window] suffice.
+    @Volatile
+    private var nextSequence = 0
+    @Volatile
+    private var nextRxSequence = 0
 
-    // Send/receive rings (deques for ordered delivery)
-    private val txRing = LinkedBlockingDeque<Envelope>()
-    private val rxRing = LinkedBlockingDeque<Envelope>()
+    // Send/receive rings, kept in sequence order. Every access is under [lock]
+    // (python: collections.deque under _lock), so a plain ArrayList suffices and
+    // emplaceEnvelope can insert in place instead of copy/clear/addAll.
+    private val txRing = ArrayList<Envelope>()
+    private val rxRing = ArrayList<Envelope>()
 
     // Window management
     @Volatile
@@ -272,7 +275,7 @@ class Channel(
                 }
 
                 // Reserve (but do NOT yet advance) the next sequence number.
-                reservedSequence = nextSequence.get()
+                reservedSequence = nextSequence
                 envelope = Envelope(outlet, message, sequence = reservedSequence)
 
                 // Pack the message FIRST, then size-check BEFORE advancing the
@@ -289,7 +292,7 @@ class Channel(
                 }
 
                 // Only now advance the transmit sequence (Channel.py:617).
-                nextSequence.set((reservedSequence + 1) % SEQ_MODULUS)
+                nextSequence = (reservedSequence + 1) % SEQ_MODULUS
             }
 
             // Transmit via the outlet OUTSIDE the inner lock (Channel.py:619).
@@ -307,7 +310,7 @@ class Channel(
             // reserved sequence and raise ME_LINK_NOT_READY so the next send
             // reuses the freed sequence with no gap (python Channel.py:621-626).
             if (packet == null || !packetHasReceipt(packet)) {
-                lock.withLock { nextSequence.set(reservedSequence) }
+                lock.withLock { nextSequence = reservedSequence }
                 throw ChannelException(
                     ChannelExceptionType.ME_LINK_NOT_READY,
                     "Outlet did not transmit packet"
@@ -367,7 +370,7 @@ class Channel(
                 val message = envelope.unpack(messageFactories)
 
                 // Validate sequence number
-                val currentRx = nextRxSequence.get()
+                val currentRx = nextRxSequence
                 if (envelope.sequence < currentRx) {
                     // Check if it's within the window overflow range
                     val windowOverflow = (currentRx + WINDOW_MAX) % SEQ_MODULUS
@@ -430,17 +433,17 @@ class Channel(
             // run. Skipping (not breaking) matches python and still stops
             // appending naturally once the contiguous run ends.
             for (envelope in rxRing) {
-                if (envelope.sequence == nextRxSequence.get()) {
+                if (envelope.sequence == nextRxSequence) {
                     contiguous.add(envelope)
-                    nextRxSequence.set((nextRxSequence.get() + 1) % SEQ_MODULUS)
+                    nextRxSequence = (nextRxSequence + 1) % SEQ_MODULUS
 
                     // Handle sequence wrap-around
-                    if (nextRxSequence.get() == 0) {
+                    if (nextRxSequence == 0) {
                         // Continue processing after wrap
                         for (e in rxRing) {
-                            if (e.sequence == nextRxSequence.get()) {
+                            if (e.sequence == nextRxSequence) {
                                 contiguous.add(e)
-                                nextRxSequence.set((nextRxSequence.get() + 1) % SEQ_MODULUS)
+                                nextRxSequence = (nextRxSequence + 1) % SEQ_MODULUS
                             }
                         }
                     }
@@ -469,7 +472,7 @@ class Channel(
      * Add envelope to a ring in sequence order.
      * Returns true if the envelope was added, false if it was a duplicate.
      */
-    private fun emplaceEnvelope(envelope: Envelope, ring: LinkedBlockingDeque<Envelope>): Boolean {
+    private fun emplaceEnvelope(envelope: Envelope, ring: MutableList<Envelope>): Boolean {
         lock.withLock {
             var insertIndex = 0
 
@@ -482,13 +485,12 @@ class Channel(
 
                 // Find insertion point - sequences are ordered, accounting for wrap-around
                 if (envelope.sequence < existing.sequence &&
-                    !((nextRxSequence.get() - envelope.sequence) > (SEQ_MAX / 2))
+                    !((nextRxSequence - envelope.sequence) > (SEQ_MAX / 2))
                 ) {
-                    // Insert here
-                    val list = ring.toMutableList()
-                    list.add(insertIndex, envelope)
-                    ring.clear()
-                    ring.addAll(list)
+                    // Insert here (python: ring.insert(i, envelope), Channel.py:333).
+                    // Returning immediately ends the for-each before the list
+                    // sees the structural change, so no ConcurrentModificationException.
+                    ring.add(insertIndex, envelope)
                     envelope.tracked = true
                     return true
                 }
@@ -507,10 +509,9 @@ class Channel(
      * Run message callbacks.
      */
     private fun runCallbacks(message: MessageBase) {
-        // Make a copy to avoid concurrent modification
-        val callbacks = messageHandlers.toList()
-
-        for (callback in callbacks) {
+        // CopyOnWriteArrayList iteration is already a snapshot (python:
+        // _message_callbacks.copy(), Channel.py:343); no extra copy needed.
+        for (callback in messageHandlers) {
             try {
                 if (callback(message)) {
                     break
@@ -738,7 +739,7 @@ class Channel(
         val tx = txRing.toList()
         ChannelStateForTest(
             window, windowMin, windowMax, windowFlexibility,
-            nextSequence.get(), nextRxSequence.get(),
+            nextSequence, nextRxSequence,
             rxRing.size, tx.size,
             tx.maxOfOrNull { it.tries } ?: 0,
             tx.map { it.sequence to it.tries },

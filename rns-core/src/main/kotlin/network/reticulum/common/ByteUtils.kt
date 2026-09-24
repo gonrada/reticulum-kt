@@ -7,19 +7,47 @@ package network.reticulum.common
  * These are critical for wire format compatibility.
  */
 
+private val HEX_DIGITS = "0123456789abcdef".toCharArray()
+
 /**
- * Convert a ByteArray to a hex string.
+ * Convert a ByteArray to a lowercase hex string.
+ *
+ * Direct nibble lookup rather than `"%02x".format(it)` per byte — the former allocated a
+ * java.util.Formatter (and, parsing the "%02x" spec, a regex Matcher) plus buffers on every
+ * byte. Hex conversion is on hot paths (every log line, hexHash, dedup keys), and JFR put the
+ * old form at the top of the announce-path allocation profile. Output is byte-identical.
  */
-fun ByteArray.toHexString(): String = joinToString("") { "%02x".format(it) }
+fun ByteArray.toHexString(): String {
+    val out = CharArray(size * 2)
+    var i = 0
+    for (b in this) {
+        val v = b.toInt() and 0xFF
+        out[i++] = HEX_DIGITS[v ushr 4]
+        out[i++] = HEX_DIGITS[v and 0x0F]
+    }
+    return String(out)
+}
 
 /**
  * Convert a hex string to ByteArray.
+ *
+ * Index loop with [Character.digit] rather than `chunked(2).map { .. }.toByteArray()`,
+ * which built a List<String> of 2-char substrings and a boxed List<Byte> per call.
+ *
+ * @throws IllegalArgumentException on odd length or a non-hex character.
  */
 fun String.hexToByteArray(): ByteArray {
-    check(length % 2 == 0) { "Hex string must have even length" }
-    return chunked(2)
-        .map { it.toInt(16).toByte() }
-        .toByteArray()
+    require(length % 2 == 0) { "Hex string must have even length" }
+    val out = ByteArray(length / 2)
+    var i = 0
+    while (i < length) {
+        val hi = Character.digit(this[i], 16)
+        val lo = Character.digit(this[i + 1], 16)
+        require(hi >= 0 && lo >= 0) { "Invalid hex digit at index $i" }
+        out[i shr 1] = ((hi shl 4) or lo).toByte()
+        i += 2
+    }
+    return out
 }
 
 /**
@@ -157,13 +185,21 @@ fun java.math.BigInteger.toLittleEndianBytes(length: Int): ByteArray {
  * Wrapper for ByteArray to use as Map key with proper equality.
  */
 class ByteArrayKey(val bytes: ByteArray) {
+    // Computed once at construction. These keys live in many ConcurrentHashMaps / key-sets
+    // (path/link/reverse/announce tables, dedup hashlists, receipts, tunnels, the destination
+    // index...), so hashCode() is called on every put/get/contains; recomputing
+    // contentHashCode() each time was pure waste. Safe because a map key's backing array must
+    // not be mutated after use (contentEquals would break too) — the same immutability this
+    // class already assumes.
+    private val hash: Int = bytes.contentHashCode()
+
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is ByteArrayKey) return false
         return bytes.contentEquals(other.bytes)
     }
 
-    override fun hashCode(): Int = bytes.contentHashCode()
+    override fun hashCode(): Int = hash
 
     override fun toString(): String = bytes.toHexString()
 }

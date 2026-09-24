@@ -25,6 +25,15 @@ import java.security.SecureRandom
 class BouncyCastleProvider : CryptoProvider {
     private val secureRandom = SecureRandom()
 
+    // Reused per thread rather than allocated per call — sha256/sha512 are extremely hot
+    // (packet/identity/truncated hashes) and JFR flagged SHA256Digest construction on the
+    // announce path. SHA256Digest is not thread-safe, so a ThreadLocal gives each thread its
+    // own; reset() before use makes reuse byte-identical to a fresh instance. Sound because
+    // this provider is a shared singleton (see defaultCryptoProvider) and hashing is never
+    // re-entrant on one thread.
+    private val sha256Digest = ThreadLocal.withInitial { SHA256Digest() }
+    private val sha512Digest = ThreadLocal.withInitial { SHA512Digest() }
+
     override fun generateX25519KeyPair(): X25519KeyPair {
         val seed = ByteArray(32)
         secureRandom.nextBytes(seed)
@@ -166,7 +175,8 @@ class BouncyCastleProvider : CryptoProvider {
     }
 
     override fun sha256(data: ByteArray): ByteArray {
-        val digest = SHA256Digest()
+        val digest = sha256Digest.get()
+        digest.reset()
         val hash = ByteArray(32)
         digest.update(data, 0, data.size)
         digest.doFinal(hash, 0)
@@ -174,21 +184,27 @@ class BouncyCastleProvider : CryptoProvider {
     }
 
     override fun sha512(data: ByteArray): ByteArray {
-        val digest = SHA512Digest()
+        val digest = sha512Digest.get()
+        digest.reset()
         val hash = ByteArray(64)
         digest.update(data, 0, data.size)
         digest.doFinal(hash, 0)
         return hash
     }
 
-    override fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
+    override fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray =
+        hmacSha256(key, data, 0, data.size)
+
+    /**
+     * HMAC-SHA256 over data[offset, offset + length) without slicing it out
+     * first. Not part of [CryptoProvider]; Token uses it to authenticate a
+     * token in place. BC's HMac.init hashes a key longer than the 64-byte
+     * block itself (RFC 2104), so no pre-hashing is done here.
+     */
+    internal fun hmacSha256(key: ByteArray, data: ByteArray, offset: Int, length: Int): ByteArray {
         val hmac = HMac(SHA256Digest())
-
-        // If key is longer than block size (64), hash it first
-        val actualKey = if (key.size > 64) sha256(key) else key
-
-        hmac.init(KeyParameter(actualKey))
-        hmac.update(data, 0, data.size)
+        hmac.init(KeyParameter(key))
+        hmac.update(data, offset, length)
 
         val result = ByteArray(32)
         hmac.doFinal(result, 0)
@@ -309,19 +325,34 @@ class BouncyCastleProvider : CryptoProvider {
         }
     }
 
-    override fun aesDecryptNoPadding(ciphertext: ByteArray, key: ByteArray, iv: ByteArray, mode: AesMode): ByteArray {
+    override fun aesDecryptNoPadding(ciphertext: ByteArray, key: ByteArray, iv: ByteArray, mode: AesMode): ByteArray =
+        aesDecryptNoPadding(ciphertext, 0, ciphertext.size, key, iv, mode)
+
+    /**
+     * Bare AES-CBC decrypt of ciphertext[offset, offset + length) without
+     * slicing it out first. Not part of [CryptoProvider]; Token uses it to
+     * decrypt the body of a token in place.
+     */
+    internal fun aesDecryptNoPadding(
+        ciphertext: ByteArray,
+        offset: Int,
+        length: Int,
+        key: ByteArray,
+        iv: ByteArray,
+        mode: AesMode
+    ): ByteArray {
         require(key.size == mode.keySize) { "Key must be ${mode.keySize} bytes for $mode" }
         require(iv.size == 16) { "IV must be 16 bytes" }
-        require(ciphertext.size % 16 == 0) { "Ciphertext must be a multiple of the 16-byte AES block size" }
+        require(length % 16 == 0) { "Ciphertext must be a multiple of the 16-byte AES block size" }
 
         try {
             val cipher = CBCBlockCipher.newInstance(AESEngine.newInstance())
             cipher.init(false, ParametersWithIV(KeyParameter(key), iv))
-            val output = ByteArray(ciphertext.size)
-            var offset = 0
-            while (offset < ciphertext.size) {
-                cipher.processBlock(ciphertext, offset, output, offset)
-                offset += cipher.blockSize
+            val output = ByteArray(length)
+            var done = 0
+            while (done < length) {
+                cipher.processBlock(ciphertext, offset + done, output, done)
+                done += cipher.blockSize
             }
             return output
         } catch (e: Exception) {

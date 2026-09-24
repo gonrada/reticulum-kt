@@ -9,7 +9,6 @@ import java.io.Closeable
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
@@ -134,8 +133,20 @@ class RawChannelReader(
     private val channel: Channel
 ) : InputStream(), Closeable {
 
+    private companion object {
+        const val INITIAL_BUFFER_CAPACITY = 4096
+    }
+
     private val lock = ReentrantLock()
-    private val buffer = LinkedBlockingQueue<Byte>()
+
+    // Receive buffer: a growable byte array guarded by [lock], mirroring python's
+    // plain bytearray under an RLock (Buffer.py:131,146,171-175). Unread bytes
+    // live in buffer[bufHead until bufTail]; readers wait on [dataReady].
+    // Previously a LinkedBlockingQueue<Byte> — one node and one lock op per byte.
+    private var buffer = ByteArray(INITIAL_BUFFER_CAPACITY)
+    private var bufHead = 0
+    private var bufTail = 0
+    private val dataReady = lock.newCondition()
     private val eofReceived = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
     private val listeners = mutableListOf<(Int) -> Unit>()
@@ -180,16 +191,16 @@ class RawChannelReader(
         if (message is StreamDataMessage && message.streamId == streamId) {
             lock.withLock {
                 if (message.data.isNotEmpty()) {
-                    for (b in message.data) {
-                        buffer.offer(b)
-                    }
+                    appendLocked(message.data)
                 }
                 if (message.eof) {
                     eofReceived.set(true)
                 }
+                // Wake any reader parked in read(); it re-checks data/eof itself.
+                dataReady.signalAll()
 
                 // Notify callbacks in separate threads
-                val bufferSize = buffer.size
+                val bufferSize = bufTail - bufHead
                 listeners.forEach { listener ->
                     try {
                         thread(name = "Message Callback", isDaemon = true) {
@@ -209,37 +220,86 @@ class RawChannelReader(
         return false
     }
 
-    override fun read(): Int {
-        if (closed.get()) return -1
-        if (eofReceived.get() && buffer.isEmpty()) return -1
+    /** Append [data] to the receive buffer. Caller must hold [lock]. */
+    private fun appendLocked(data: ByteArray) {
+        val unread = bufTail - bufHead
+        if (bufTail + data.size > buffer.size) {
+            if (unread + data.size <= buffer.size) {
+                // Enough total room: slide the unread bytes to the front.
+                System.arraycopy(buffer, bufHead, buffer, 0, unread)
+            } else {
+                var capacity = buffer.size
+                while (capacity < unread + data.size) capacity = capacity shl 1
+                val grown = ByteArray(capacity)
+                System.arraycopy(buffer, bufHead, grown, 0, unread)
+                buffer = grown
+            }
+            bufHead = 0
+            bufTail = unread
+        }
+        System.arraycopy(data, 0, buffer, bufTail, data.size)
+        bufTail += data.size
+    }
 
-        return try {
-            val byte = buffer.poll(100, TimeUnit.MILLISECONDS)
-            byte?.toInt()?.and(0xFF) ?: if (eofReceived.get()) -1 else read()
-        } catch (e: InterruptedException) {
-            -1
+    /** Consume [count] bytes from the front of the buffer. Caller must hold [lock]. */
+    private fun consumeLocked(count: Int) {
+        bufHead += count
+        if (bufHead == bufTail) {
+            // Drained: reset so the next append starts at offset 0 with no compaction.
+            bufHead = 0
+            bufTail = 0
+        }
+    }
+
+    override fun read(): Int {
+        // Loop rather than recurse: the old form re-entered read() on every 100 ms poll
+        // timeout, growing the stack by a frame per tick on an idle reader.
+        while (true) {
+            if (closed.get()) return -1
+            lock.withLock {
+                if (eofReceived.get() && bufTail == bufHead) return -1
+                if (bufTail == bufHead) {
+                    // Same 100 ms poll as the old blocking-queue form; await releases
+                    // the lock so handleMessage can append while we wait.
+                    try {
+                        dataReady.await(100, TimeUnit.MILLISECONDS)
+                    } catch (e: InterruptedException) {
+                        return -1
+                    }
+                }
+                if (bufTail > bufHead) {
+                    val byte = buffer[bufHead].toInt() and 0xFF
+                    consumeLocked(1)
+                    return byte
+                }
+                if (eofReceived.get()) return -1
+            }
         }
     }
 
     override fun read(b: ByteArray, off: Int, len: Int): Int {
         if (closed.get()) return -1
-        if (eofReceived.get() && buffer.isEmpty()) return -1
+        lock.withLock {
+            if (eofReceived.get() && bufTail == bufHead) return -1
 
-        var count = 0
-        while (count < len) {
-            val byte = buffer.poll(if (count == 0) 100 else 0, TimeUnit.MILLISECONDS)
-            if (byte != null) {
-                b[off + count] = byte
-                count++
-            } else {
-                break
+            // First poll waits up to 100 ms for data; the copy below then takes whatever
+            // is available without further blocking (the old per-byte loop polled with
+            // 0 ms after the first byte). InterruptedException propagates as before.
+            if (bufTail == bufHead && len > 0) {
+                dataReady.await(100, TimeUnit.MILLISECONDS)
             }
-        }
 
-        return if (count > 0) count else if (eofReceived.get()) -1 else 0
+            val count = minOf(len, bufTail - bufHead)
+            if (count > 0) {
+                System.arraycopy(buffer, bufHead, b, off, count)
+                consumeLocked(count)
+            }
+
+            return if (count > 0) count else if (eofReceived.get()) -1 else 0
+        }
     }
 
-    override fun available(): Int = buffer.size
+    override fun available(): Int = lock.withLock { bufTail - bufHead }
 
     /** Conformance test seam: whether the EOF marker was received (private
      *  `eofReceived`). Drives wire_buffer_received's eof field. */
