@@ -2,14 +2,14 @@ package network.reticulum.interfaces.udp
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.common.RnsLog
 import network.reticulum.interfaces.Interface
+import network.reticulum.interfaces.util.createInterfaceScope
+import network.reticulum.interfaces.util.onCancellationOnce
 import java.io.IOException
 import java.net.*
 import java.nio.ByteBuffer
@@ -89,39 +89,13 @@ class UDPInterface(
     private var multicastSocket: MulticastSocket? = null
     private val running = AtomicBoolean(false)
 
-    // Coroutine scope for I/O operations (battery-efficient on Android)
-    private val ioScope: CoroutineScope = createScope(parentScope).also { _ ->
-        // Listen for parent cancellation AFTER scope is created
-        // When parent scope completes (cancelled or otherwise), trigger graceful shutdown
-        parentScope?.coroutineContext?.get(Job)?.invokeOnCompletion { _ ->
-            // Parent completed - trigger graceful shutdown
-            // Note: This fires after parent starts cancelling AND its children complete,
-            // so also monitor the child scope's cancellation state
-            detach()
-        }
-        // Additionally, launch a coroutine that watches for scope cancellation
-        // This provides faster response to parent cancellation
-        parentScope?.launch {
-            try {
-                // This coroutine will be cancelled when parent is cancelled
-                kotlinx.coroutines.awaitCancellation()
-            } finally {
-                // Parent scope was cancelled - trigger shutdown
-                detach()
-            }
-        }
+    // Coroutine scope for I/O operations (battery-efficient on Android). When a parent
+    // lifecycle scope is supplied, its cancellation detaches this interface; the watcher
+    // is registered AFTER the scope is created so it never observes a half-built scope.
+    private val ioScope: CoroutineScope = createInterfaceScope(parentScope).also {
+        parentScope?.onCancellationOnce { detach() }
     }
     private var readJob: Job? = null
-
-    private fun createScope(parent: CoroutineScope?): CoroutineScope {
-        return if (parent != null) {
-            // Child scope: cancels when parent cancels, but can cancel independently
-            CoroutineScope(parent.coroutineContext + SupervisorJob(parent.coroutineContext[Job]) + Dispatchers.IO)
-        } else {
-            // Standalone scope: lives until explicitly cancelled
-            CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        }
-    }
 
     override fun start() {
         if (running.getAndSet(true)) {

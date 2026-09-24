@@ -2,9 +2,7 @@ package network.reticulum.interfaces.tcp
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -17,6 +15,8 @@ import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.streamDeframer
 import network.reticulum.interfaces.framing.streamFramer
 import network.reticulum.interfaces.util.TcpKeepalive
+import network.reticulum.interfaces.util.createInterfaceScope
+import network.reticulum.interfaces.util.onCancellationOnce
 import java.io.IOException
 import java.io.InputStream
 import java.net.InetSocketAddress
@@ -59,6 +59,14 @@ class TCPClientInterface(
     private val fixedMtuBytes: Int? = null,
     // Configured IFAC size in BITS (python Reticulum.py:719-723 bits->bytes floor).
     private val ifacSizeBits: Int? = null,
+    /**
+     * SOCKS5 proxy for the outbound connection (e.g. Tor/Orbot at 127.0.0.1:9050).
+     * When set, the target host is resolved REMOTELY by the proxy (SOCKS5 ATYP=domain
+     * via an unresolved address), so .onion targets work. Python RNS core has no SOCKS;
+     * this is a JVM-only addition for proxied transports such as Tor.
+     */
+    private val socksProxyHost: String? = null,
+    private val socksProxyPort: Int = 9050,
 ) : Interface(name) {
 
     companion object {
@@ -130,27 +138,11 @@ class TCPClientInterface(
     private val framesSent = AtomicLong(0)
     private val framesReceived = AtomicLong(0)
 
-    // Coroutine scope for I/O operations (battery-efficient on Android)
-    private val ioScope: CoroutineScope = createScope(parentScope).also {
-        // Listen for parent cancellation AFTER scope is created (avoids race condition)
-        // When parent scope completes (cancelled or otherwise), trigger graceful shutdown
-        parentScope?.coroutineContext?.get(Job)?.invokeOnCompletion { _ ->
-            // Parent completed - trigger graceful shutdown
-            // Note: This fires after parent starts cancelling AND its children complete,
-            // so also monitor the child scope's cancellation state
-            detach()
-        }
-        // Additionally, launch a coroutine that watches for scope cancellation
-        // This provides faster response to parent cancellation
-        parentScope?.launch {
-            try {
-                // This coroutine will be cancelled when parent is cancelled
-                kotlinx.coroutines.awaitCancellation()
-            } finally {
-                // Parent scope was cancelled - trigger shutdown
-                detach()
-            }
-        }
+    // Coroutine scope for I/O operations (battery-efficient on Android). When a parent
+    // lifecycle scope is supplied, its cancellation detaches this interface; the watcher
+    // is registered AFTER the scope is created so it never observes a half-built scope.
+    private val ioScope: CoroutineScope = createInterfaceScope(parentScope).also {
+        parentScope?.onCancellationOnce { detach() }
     }
     private var readJob: Job? = null
     private var connectJob: Job? = null
@@ -161,22 +153,6 @@ class TCPClientInterface(
         val socket: Socket,
         val inputStream: InputStream,
     )
-
-    /**
-     * Create the appropriate coroutine scope based on parent.
-     * - With parent: child scope that cancels when parent cancels (Android service lifecycle)
-     * - Without parent: standalone scope for JVM/test usage
-     */
-    private fun createScope(parent: CoroutineScope?): CoroutineScope {
-        return if (parent != null) {
-            // Child scope: cancels when parent cancels, but can cancel independently
-            // SupervisorJob(parentJob) creates a child that doesn't propagate failures upward
-            CoroutineScope(parent.coroutineContext + SupervisorJob(parent.coroutineContext[Job]) + Dispatchers.IO)
-        } else {
-            // Standalone scope: lives until explicitly cancelled
-            CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        }
-    }
 
     // Framer and deframer are selected once from useKissFraming; the deframer bounds
     // (KISS decode cap at HW_MTU, HDLC escaped-buffer cap 2*HW_MTU+16) derive from hwMtu.
@@ -205,13 +181,31 @@ class TCPClientInterface(
     }
 
     private fun connect(initial: Boolean = false): EstablishedConnection? {
+        // Track the socket so a failure anywhere below closes it, instead of
+        // leaking a file descriptor per reconnect attempt (parity with Python
+        // TCPInterface, which closes/nulls self.socket on connect error).
+        var sockRef: Socket? = null
         return try {
             if (initial) {
-                log("Establishing TCP connection to $targetHost:$targetPort...")
+                val via = if (socksProxyHost != null) " via SOCKS5 $socksProxyHost:$socksProxyPort" else ""
+                log("Establishing TCP connection to $targetHost:$targetPort$via...")
             }
 
-            val sock = Socket()
-            sock.connect(InetSocketAddress(targetHost, targetPort), connectTimeoutMs)
+            // Route through a SOCKS5 proxy when configured. Connect to an
+            // UNRESOLVED address so the proxy performs DNS (SOCKS5 ATYP=domain),
+            // which is required for .onion targets over Tor/Orbot.
+            val sock = if (socksProxyHost != null) {
+                Socket(java.net.Proxy(java.net.Proxy.Type.SOCKS, InetSocketAddress(socksProxyHost, socksProxyPort)))
+            } else {
+                Socket()
+            }
+            sockRef = sock
+            val remote = if (socksProxyHost != null) {
+                InetSocketAddress.createUnresolved(targetHost, targetPort)
+            } else {
+                InetSocketAddress(targetHost, targetPort)
+            }
+            sock.connect(remote, connectTimeoutMs)
             sock.tcpNoDelay = true
             sock.keepAlive = keepAlive
             // Python's probe timing (TCPInterface.py:183-197: TCP_KEEPIDLE=5,
@@ -267,6 +261,8 @@ class TCPClientInterface(
 
             EstablishedConnection(sock, inputStream)
         } catch (e: Exception) {
+            // Close the half-open socket on any failure so the fd is not leaked.
+            try { sockRef?.close() } catch (_: Exception) {}
             if (initial) {
                 log("Initial connection failed: ${e.message}")
                 log("Will retry connection in ${RECONNECT_WAIT_MS / 1000} seconds")

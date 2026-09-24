@@ -2,15 +2,14 @@ package network.reticulum.interfaces.rnode
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.KISS
+import network.reticulum.interfaces.util.createInterfaceScope
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
@@ -64,6 +63,13 @@ class RNodeInterface(
         private const val READ_TIMEOUT_MS = 1_250L
         private const val CONFIG_DELAY_MS = 150L
         private const val FB_BYTES_PER_LINE = 8
+
+        // Frame-duration ceiling: a frame left open longer than this is
+        // discarded and the reader resyncs, even while bytes keep arriving (the
+        // inter-byte READ_TIMEOUT_MS can't catch a peer that trickles forever).
+
+        /** Max time a single frame may stay open, derived from the bitrate ([KISS.maxFrameDurationMs]). */
+        fun deriveMaxFrameDurationMs(hwMtu: Int, bitrate: Int): Long = KISS.maxFrameDurationMs(hwMtu, bitrate)
 
         // Signal quality computation constants (matching Python RNodeInterface)
         private const val Q_SNR_MIN_BASE = -9f
@@ -157,11 +163,7 @@ class RNodeInterface(
     private val txLock = Any()
 
     // Coroutine management
-    private val ioScope: CoroutineScope = if (parentScope != null) {
-        CoroutineScope(parentScope.coroutineContext + SupervisorJob(parentScope.coroutineContext[Job]) + Dispatchers.IO)
-    } else {
-        CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    }
+    private val ioScope: CoroutineScope = createInterfaceScope(parentScope)
     private var readJob: Job? = null
 
     override fun start() {
@@ -412,6 +414,8 @@ class RNodeInterface(
      * - CMD_STAT_BAT: 2 bytes (state + percent)
      * - etc.
      */
+    private fun maxFrameDurationMs(): Long = deriveMaxFrameDurationMs(hwMtu, bitrate)
+
     private suspend fun readLoop() {
         var inFrame = false
         var escape = false
@@ -419,6 +423,7 @@ class RNodeInterface(
         val dataBuffer = ByteArrayOutputStream(512)
         val commandBuffer = ByteArrayOutputStream(16)
         var lastReadMs = System.currentTimeMillis()
+        var frameStartedMs = -1L
 
         val buf = ByteArray(1)
 
@@ -436,6 +441,7 @@ class RNodeInterface(
                             inFrame = false
                             command = KISS.CMD_UNKNOWN
                             escape = false
+                            frameStartedMs = -1L
                         }
                         handleIdleMaintenance()
                         continue
@@ -451,6 +457,7 @@ class RNodeInterface(
                         inFrame = false
                         command = KISS.CMD_UNKNOWN
                         escape = false
+                        frameStartedMs = -1L
                     }
                     if (bytesRead == -1) {
                         log("Read loop reached EOF - remote closed connection")
@@ -464,9 +471,21 @@ class RNodeInterface(
                 lastReadMs = System.currentTimeMillis()
                 var byte = buf[0].toInt() and 0xFF
 
+                // Frame-duration ceiling: discard a frame open too long, even
+                // while bytes keep arriving; then fall through so a FEND in this
+                // byte can still start a fresh frame (resync).
+                if (inFrame && frameStartedMs >= 0 &&
+                    System.currentTimeMillis() - frameStartedMs > maxFrameDurationMs()
+                ) {
+                    log("Discarding a frame open too long without completing")
+                    dataBuffer.reset(); commandBuffer.reset(); inFrame = false
+                    command = KISS.CMD_UNKNOWN; escape = false; frameStartedMs = -1L
+                }
+
                 if (inFrame && byte == (KISS.FEND.toInt() and 0xFF) && command == KISS.CMD_DATA) {
                     // End of data frame
                     inFrame = false
+                    frameStartedMs = -1L
                     val data = dataBuffer.toByteArray()
                     dataBuffer.reset()
                     commandBuffer.reset()
@@ -478,6 +497,7 @@ class RNodeInterface(
                 } else if (byte == (KISS.FEND.toInt() and 0xFF)) {
                     // Start of new frame
                     inFrame = true
+                    frameStartedMs = System.currentTimeMillis()
                     command = KISS.CMD_UNKNOWN
                     dataBuffer.reset()
                     commandBuffer.reset()

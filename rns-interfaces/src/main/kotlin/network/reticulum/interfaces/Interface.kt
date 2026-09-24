@@ -303,6 +303,14 @@ abstract class Interface(
     @Volatile var rStatSnr: Float? = null
     @Volatile var rStatQ: Float? = null
 
+    // Per-instance InterfaceRef adapter, backing toRef() / InterfaceAdapter.getOrCreate.
+    // Held on the interface rather than in a process-global map so the adapter's lifetime
+    // tracks this interface: a detached, dereferenced interface and its adapter are
+    // garbage-collected together instead of leaking for the process lifetime. Identity
+    // is still stable for a live interface, which register/deregister rely on (they match
+    // by adapter identity).
+    @Volatile internal var cachedAdapter: InterfaceAdapter? = null
+
     /** Callback for received packets. */
     var onPacketReceived: ((data: ByteArray, fromInterface: Interface) -> Unit)? = null
 

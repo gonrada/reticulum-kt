@@ -4,7 +4,6 @@ import network.reticulum.common.InterfaceMode
 import network.reticulum.common.RnsConstants
 import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Adapter to bridge Interface to InterfaceRef for Transport integration.
@@ -153,10 +152,21 @@ class InterfaceAdapter private constructor(
     }
 
     companion object {
-        // Cache adapters to avoid creating duplicates
-        private val adapterCache = ConcurrentHashMap<Interface, InterfaceAdapter>()
-
-        fun getOrCreate(iface: Interface): InterfaceAdapter = adapterCache.computeIfAbsent(iface) { InterfaceAdapter(iface) }
+        /**
+         * Return the interface's adapter, creating it once and caching it ON the
+         * interface itself ([Interface.cachedAdapter]). Backing the cache with a
+         * per-instance field — instead of the process-global map that never evicted —
+         * lets a detached, dereferenced interface and its adapter be garbage-collected
+         * together, while still returning a stable adapter identity for a live interface
+         * (Transport register/deregister match by adapter identity, so this must be
+         * stable). Double-checked locking on the interface guards concurrent creation.
+         */
+        fun getOrCreate(iface: Interface): InterfaceAdapter {
+            iface.cachedAdapter?.let { return it }
+            return synchronized(iface) {
+                iface.cachedAdapter ?: InterfaceAdapter(iface).also { iface.cachedAdapter = it }
+            }
+        }
     }
 }
 

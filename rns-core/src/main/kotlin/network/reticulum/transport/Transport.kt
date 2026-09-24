@@ -459,6 +459,38 @@ object Transport {
     /** Registered announce handlers with their aspect filters. */
     private val announceHandlers = CopyOnWriteArrayList<RegisteredHandler>()
 
+    /**
+     * Invoked when an announce arrives for one of our OWN (local) destinations that we
+     * did NOT emit — i.e. another node is announcing our identity. The usual cause is one
+     * identity imported into several installs, which silently splits inbound messages
+     * across instances. Our own announces echoing off a shared instance are filtered out
+     * (matched by packetHash against our self-emitted announces; packetHash excludes the
+     * hops byte, so an echo with a bumped hop count still matches), so this fires only for
+     * the genuine collision. The announce is still skipped for path/identity processing
+     * regardless — this is a pure observation hook.
+     */
+    @Volatile
+    var onForeignLocalAnnounce: ((destinationHash: ByteArray, packetHash: ByteArray, hops: Int) -> Unit)? = null
+
+    /** Max self-emitted announce hashes retained for echo discrimination. */
+    private const val SELF_ANNOUNCE_HASH_MAX = 512
+
+    /**
+     * Bounded FIFO set of packetHashes of announces we originated for our own
+     * destinations. Lets onForeignLocalAnnounce distinguish our own shared-instance echo
+     * (silent) from a foreign announce of our identity (surfaced).
+     */
+    private val selfAnnounceHashes: MutableSet<ByteArrayKey> =
+        java.util.Collections.synchronizedSet(
+            java.util.Collections.newSetFromMap(
+                object : LinkedHashMap<ByteArrayKey, Boolean>(64, 0.75f, false) {
+                    override fun removeEldestEntry(
+                        eldest: MutableMap.MutableEntry<ByteArrayKey, Boolean>?,
+                    ): Boolean = size > SELF_ANNOUNCE_HASH_MAX
+                },
+            ),
+        )
+
     /** Known aspects for resolving destination hashes in null-filter handlers. */
     private val knownAspects = ConcurrentHashMap.newKeySet<String>()
 
@@ -831,6 +863,7 @@ object Transport {
         pendingProofCallbacks.clear()
         announceHandlers.clear()
         knownAspects.clear()
+        selfAnnounceHashes.clear()
         tearDownLinksForShutdown()
         pendingLinks.clear()
         activeLinks.clear()
@@ -4012,6 +4045,16 @@ object Transport {
         if (!started.get()) return false
         if (paused.get()) return false
 
+        // Record announces we originate for our own destinations (hops == 0, local dest),
+        // so the local-destination skip can tell our own shared-instance echo from a
+        // foreign announce of our identity. packetHash excludes hops, so the echo matches
+        // even with an incremented hop count. Forwarded announces (hops >= 1) are excluded.
+        if (packet.packetType == PacketType.ANNOUNCE && packet.hops == 0 &&
+            destinationIndex.containsKey(packet.destinationHash.toKey())
+        ) {
+            selfAnnounceHashes.add(packet.packetHash.toKey())
+        }
+
         outboundTapForTest?.let { tap -> runCatching { tap(packet) } }
 
         return jobsLock.withLock {
@@ -4482,6 +4525,19 @@ object Transport {
         // that cause forwarding loops (e.g., LRPROOF loop via spurious link_table entries).
         val isLocalDestination = destinationIndex.containsKey(destKey)
         if (isLocalDestination) {
+            // Surface announces for our own destination that we did NOT emit (a foreign
+            // node announcing our identity — typically one identity in several installs).
+            // Our own shared-instance echo is filtered by packetHash. The skip itself is
+            // unchanged: we never process a local-destination announce into the path table.
+            if (!selfAnnounceHashes.contains(packet.packetHash.toKey())) {
+                onForeignLocalAnnounce?.let { handler ->
+                    try {
+                        handler(destHash.copyOf(), packet.packetHash.copyOf(), packet.hops)
+                    } catch (e: Exception) {
+                        log("Error in onForeignLocalAnnounce handler: ${e.message}")
+                    }
+                }
+            }
             logDebug { "Skipping announce for local destination ${destHash.toHexString()}" }
             return
         }

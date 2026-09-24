@@ -83,6 +83,18 @@ private class FakeSerialPort : KissSerialPort {
     }
 }
 
+/** Little-endian u32 (MeshCore GET_RADIO freq/bw). */
+private fun le32(v: Long): ByteArray = byteArrayOf(
+    (v and 0xFF).toByte(),
+    ((v shr 8) and 0xFF).toByte(),
+    ((v shr 16) and 0xFF).toByte(),
+    ((v shr 24) and 0xFF).toByte(),
+)
+
+/** Big-endian u16 (MeshCore 0x25 CHTM percent*100 fields). */
+private fun be16(v: Int): ByteArray =
+    byteArrayOf(((v shr 8) and 0xFF).toByte(), (v and 0xFF).toByte())
+
 class KissInterfaceTest {
 
     private val live = mutableListOf<KissInterface>()
@@ -484,15 +496,119 @@ class KissInterfaceTest {
     }
 
     @Test
-    fun `a non-DATA frame is dropped and does not disrupt following DATA`() = runBlocking {
+    fun `sendCommandFrame writes a FEND-wrapped, escaped command frame`() = runBlocking {
+        val port = FakeSerialPort()
+        val iface = newInterface(port)
+        iface.start()
+        waitUntil("online") { iface.online.value }
+
+        // MeshCore SetHardware (0x06): sub_cmd 0x09 + a payload byte (0xC0) that must be escaped.
+        assertTrue(iface.sendCommandFrame(0x06, byteArrayOf(0x09, 0xC0.toByte(), 0x01)))
+        waitUntil("command frame written") { port.written.any { it.size >= 2 && it[1] == 0x06.toByte() } }
+
+        val frame = port.written.first { it.size >= 2 && it[1] == 0x06.toByte() }
+        assertArrayEquals(
+            byteArrayOf(KISS.FEND, 0x06, 0x09, KISS.FESC, KISS.TFEND, 0x01, KISS.FEND),
+            frame,
+        )
+    }
+
+    @Test
+    fun `onCommandFrame surfaces a top-level telemetry frame with the raw command byte`() = runBlocking {
+        val port = FakeSerialPort()
+        val cmds = CopyOnWriteArrayList<Pair<Byte, ByteArray>>()
+        val iface = newInterface(port)
+        iface.onCommandFrame = { c, p -> cmds.add(c to p) }
+        iface.start()
+        waitUntil("online") { iface.online.value }
+
+        // MeshCore telemetry is a TOP-LEVEL KISS command byte (not wrapped). 0x23 (RSSI) has a
+        // non-zero port nibble; the deframer must surface it as 0x23, NOT strip the nibble to
+        // 0x03 (which would collide with the SLOTTIME config command). RSSI is a single byte
+        // (dBm+157); use an escapable value (0xC0) to also exercise unescape.
+        val payload = byteArrayOf(0xC0.toByte())
+        port.feed(KISS.frame(payload, 0x23.toByte()))
+        waitUntil("telemetry surfaced") { cmds.isNotEmpty() }
+
+        assertEquals(0x23.toByte(), cmds[0].first)
+        assertArrayEquals(payload, cmds[0].second)
+    }
+
+    @Test
+    fun `onCommandFrame delivers a wrapped MeshCore hardware response (0x06 + sub-command)`() = runBlocking {
+        val port = FakeSerialPort()
+        val cmds = CopyOnWriteArrayList<Pair<Byte, ByteArray>>()
+        val iface = newInterface(port)
+        iface.onCommandFrame = { c, p -> cmds.add(c to p) }
+        iface.start()
+        waitUntil("online") { iface.online.value }
+
+        // MeshCore wraps hardware responses under SetHardware: a GET_RADIO reply on the wire is
+        // FEND 0x06 0x8B <10 bytes> FEND. onCommandFrame must deliver cmd=0x06 with the
+        // sub-command as payload[0] (NOT cmd=0x8B — 0x8B never arrives top-level). The 10-byte
+        // body is freq u32 LE, bw u32 LE, sf u8, cr u8 (the freq's 0xC0 byte also exercises escape).
+        val body = le32(915_000_000) + le32(62_500) + byteArrayOf(8, 5)
+        val hwResp = byteArrayOf(0x8B.toByte()) + body
+        port.feed(KISS.frame(hwResp, 0x06.toByte()))
+        waitUntil("hw response surfaced") { cmds.isNotEmpty() }
+
+        assertEquals(0x06.toByte(), cmds[0].first)
+        assertEquals(0x8B.toByte(), cmds[0].second[0])
+        assertArrayEquals(hwResp, cmds[0].second)
+    }
+
+    @Test
+    fun `onCommandFrame delivers a top-level 0x25 CHTM telemetry frame intact`() = runBlocking {
+        val port = FakeSerialPort()
+        val cmds = CopyOnWriteArrayList<Pair<Byte, ByteArray>>()
+        val iface = newInterface(port)
+        iface.onCommandFrame = { c, p -> cmds.add(c to p) }
+        iface.start()
+        waitUntil("online") { iface.online.value }
+
+        // MeshCore CHTM (0x25) is top-level, 11 bytes, BIG-ENDIAN: four u16 BE percent*100
+        // (airtime short/long, channel-util short/long), then RSSI/noise (u8 dBm+157) and an
+        // interference byte (0xFF = none). The interface delivers raw bytes; decoding is the
+        // consumer's job. This pins the on-wire size/shape the parser must expect.
+        val chtm = be16(1234) + be16(0) + be16(5000) + be16(10000) +
+            byteArrayOf(57, 40, 0xFF.toByte())
+        port.feed(KISS.frame(chtm, 0x25.toByte()))
+        waitUntil("chtm surfaced") { cmds.isNotEmpty() }
+
+        assertEquals(0x25.toByte(), cmds[0].first)
+        assertEquals(11, cmds[0].second.size)
+        assertArrayEquals(chtm, cmds[0].second)
+    }
+
+    @Test
+    fun `DATA frames go to the packet path, not to onCommandFrame`() = runBlocking {
         val port = FakeSerialPort()
         val received = CopyOnWriteArrayList<ByteArray>()
+        val cmds = CopyOnWriteArrayList<Byte>()
         val iface = newInterface(port)
+        iface.onPacketReceived = { d, _ -> received.add(d) }
+        iface.onCommandFrame = { c, _ -> cmds.add(c) }
+        iface.start()
+        waitUntil("online") { iface.online.value }
+
+        port.feed(KISS.frame("data".toByteArray(), KISS.CMD_DATA))
+        waitUntil("data received") { received.isNotEmpty() }
+        delay(50) // give any stray command callback a chance to (wrongly) fire
+
+        assertEquals(1, received.size)
+        assertTrue(cmds.isEmpty(), "a DATA frame must not surface via onCommandFrame")
+    }
+
+    @Test
+    fun `a non-DATA frame is dropped without a handler and does not disrupt following DATA`() = runBlocking {
+        val port = FakeSerialPort()
+        val received = CopyOnWriteArrayList<ByteArray>()
+        val iface = newInterface(port) // no onCommandFrame handler
         iface.onPacketReceived = { d, _ -> received.add(d) }
         iface.start()
         waitUntil("online") { iface.online.value }
 
-        // A SetHardware frame (0x06, 0xF0) — non-DATA, so dropped (KISSInterface.py:305-330).
+        // A wrapped SET_RADIO ack (0x06, 0xF0) — non-DATA, so dropped with no handler.
         port.feed(KISS.frame(byteArrayOf(0xF0.toByte()), 0x06.toByte()))
         port.feed(KISS.frame("ok".toByteArray(), KISS.CMD_DATA))
         waitUntil("data received") { received.isNotEmpty() }

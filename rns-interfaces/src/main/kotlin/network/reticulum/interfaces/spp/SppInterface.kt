@@ -4,7 +4,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -16,6 +15,8 @@ import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.backoff.ExponentialBackoff
 import network.reticulum.interfaces.framing.HDLC
+import network.reticulum.interfaces.util.createInterfaceScope
+import network.reticulum.interfaces.util.onCancellationOnce
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -140,27 +141,14 @@ class SppInterface(
         maxAttempts = maxReconnectAttempts ?: 10,
     )
 
-    // Coroutine scope for I/O operations
-    private val ioScope: CoroutineScope = createScope(parentScope).also {
-        parentScope?.launch {
-            try {
-                kotlinx.coroutines.awaitCancellation()
-            } finally {
-                detach()
-            }
-        }
+    // Coroutine scope for I/O operations. When a parent lifecycle scope is supplied,
+    // its cancellation detaches this interface (watcher registered after the scope exists).
+    private val ioScope: CoroutineScope = createInterfaceScope(parentScope).also {
+        parentScope?.onCancellationOnce { detach() }
     }
     private var readJob: Job? = null
     private var connectJob: Job? = null
     private var writeJob: Job? = null
-
-    private fun createScope(parent: CoroutineScope?): CoroutineScope {
-        return if (parent != null) {
-            CoroutineScope(parent.coroutineContext + SupervisorJob(parent.coroutineContext[Job]) + Dispatchers.IO)
-        } else {
-            CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        }
-    }
 
     // Decoupled outbound: processOutgoing only enqueues; a writer coroutine does
     // the (potentially slow) stream write, so a stalled peer never blocks the

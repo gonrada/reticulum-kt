@@ -171,6 +171,15 @@ class KissInterface(
     private var sessionJob: Job? = null
     private val inbound = Channel<ByteArray>(INBOUND_QUEUE_CAPACITY)
 
+    /**
+     * Optional handler for inbound non-DATA KISS frames: (raw command byte, unescaped payload).
+     * Default null — non-DATA frames are dropped, matching Python RNS's KISSInterface. Set this
+     * to read command responses (e.g. MeshCore HW_RESP 0x8B for a SetHardware/GET_RADIO) and
+     * unsolicited stats (0x23 RSSI / 0x24 SNR / 0x25 channel stats). Invoked on the read-loop
+     * thread; keep the handler quick and non-blocking.
+     */
+    var onCommandFrame: ((command: Byte, payload: ByteArray) -> Unit)? = null
+
     // Flow-control state, guarded by txLock (touched by the Transport caller in
     // processOutgoing and by the read coroutine in processQueue).
     private val txLock = Any()
@@ -245,6 +254,7 @@ class KissInterface(
         var inFrame = false
         var escape = false
         var command = KISS.CMD_UNKNOWN
+        var commandRaw = KISS.CMD_UNKNOWN
         val dataBuffer = ByteArrayOutputStream()
         var lastReadMs = System.currentTimeMillis()
         var frameStartedMs = -1L
@@ -264,21 +274,29 @@ class KissInterface(
                 System.currentTimeMillis() - frameStartedMs > maxFrameDurationMs
             ) {
                 log("discarding a frame open >${maxFrameDurationMs}ms before reading new bytes")
-                dataBuffer.reset(); inFrame = false; command = KISS.CMD_UNKNOWN; escape = false; frameStartedMs = -1L
+                dataBuffer.reset(); inFrame = false; command = KISS.CMD_UNKNOWN
+                commandRaw = KISS.CMD_UNKNOWN; escape = false; frameStartedMs = -1L
             }
 
             for (b in bytes) {
                 lastReadMs = System.currentTimeMillis()
                 when {
                     inFrame && b == KISS.FEND -> {
-                        // Closing FEND: deliver DATA to the packet path. Any other command's
-                        // frame is dropped, as in python (KISSInterface.py:305-307 only
-                        // delivers CMD_DATA).
-                        if (command == KISS.CMD_DATA) deliverInbound(dataBuffer.toByteArray())
+                        // Closing FEND: deliver DATA to the packet path, or surface a non-DATA
+                        // command frame (raw command byte + unescaped payload) to the optional
+                        // handler. Dropping non-DATA frames stays the default (handler null,
+                        // matching Python RNS). READY carries no payload and only drives flow
+                        // control, so it is never surfaced.
+                        when {
+                            command == KISS.CMD_DATA -> deliverInbound(dataBuffer.toByteArray())
+                            commandRaw != KISS.CMD_UNKNOWN && command != KISS.CMD_READY ->
+                                onCommandFrame?.invoke(commandRaw, dataBuffer.toByteArray())
+                        }
                         inFrame = false
                         escape = false
                         frameStartedMs = -1L
                         command = KISS.CMD_UNKNOWN
+                        commandRaw = KISS.CMD_UNKNOWN
                         dataBuffer.reset()
                     }
                     b == KISS.FEND -> {
@@ -286,18 +304,22 @@ class KissInterface(
                         escape = false // don't let a dangling FESC leak across frames
                         frameStartedMs = lastReadMs
                         command = KISS.CMD_UNKNOWN
+                        commandRaw = KISS.CMD_UNKNOWN
                         dataBuffer.reset()
                     }
                     inFrame && dataBuffer.size() < rxBound -> {
                         when {
                             dataBuffer.size() == 0 && command == KISS.CMD_UNKNOWN -> {
-                                // First byte after FEND is the command; strip the port nibble
-                                // (single HDLC port supported, KISSInterface.py:313-317).
+                                // First byte after FEND is the command. Keep the raw byte for the
+                                // non-DATA handler (RNode/MeshCore commands like 0x8B are not
+                                // port|command); strip the port nibble for DATA/READY dispatch
+                                // (single HDLC port supported).
+                                commandRaw = b
                                 command = (b.toInt() and 0x0F).toByte()
                             }
                             command == KISS.CMD_READY -> processQueue()
-                            command == KISS.CMD_DATA -> {
-                                // DATA payload — unescape + buffer (KISSInterface.py:318-328).
+                            else -> {
+                                // DATA payload, or any other command's payload — unescape + buffer.
                                 if (b == KISS.FESC) {
                                     escape = true
                                 } else {
@@ -447,6 +469,23 @@ class KissInterface(
             port.write(frame) == frame.size
         } catch (e: Exception) {
             log("config command write error: ${e.message}"); false
+        }
+    }
+
+    /**
+     * Send a raw KISS command frame: [command] byte + KISS-escaped [payload], FEND-wrapped.
+     * Unlike the fixed single-value config commands, this carries an arbitrary multi-byte
+     * payload — e.g. MeshCore SetHardware (0x06) with a SET_RADIO payload (sub_cmd + freq/bw/
+     * sf/cr). Returns false on a short or failed write. Read responses via [onCommandFrame].
+     */
+    fun sendCommandFrame(command: Byte, payload: ByteArray): Boolean {
+        val frame = KISS.frame(payload, command)
+        return synchronized(txLock) {
+            try {
+                port.write(frame) == frame.size
+            } catch (e: Exception) {
+                log("command frame write error: ${e.message}"); false
+            }
         }
     }
 
