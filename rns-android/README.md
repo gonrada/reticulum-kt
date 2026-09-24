@@ -9,6 +9,9 @@ Battery-optimized Android integration for Reticulum mesh networking.
 - **Doze Mode Support**: Proper handling of Android's power-saving states
 - **Network Monitoring**: Automatic adaptation to WiFi/cellular/metered connections
 - **Memory Efficiency**: ByteArray pooling and adaptive memory management
+- **KISS TNC backends**: Bluetooth Classic (RFCOMM), USB serial and BLE Nordic UART
+  transports for `KissInterface` and `BleKissInterface`, wired to the Transport by
+  `AndroidKissInterfaces`
 
 ## Requirements
 
@@ -93,6 +96,25 @@ class MyActivity : AppCompatActivity() {
         }
     }
 }
+```
+
+### KISS backends
+
+`AndroidKissInterfaces` builds a KISS or AX.25-over-KISS interface on one of three
+Android transports and registers it with the Transport:
+
+- `SppKissSerialPort` — Bluetooth Classic RFCOMM, behind the `KissSerialPort` seam.
+- `UsbKissSerialPort` — USB serial through `usb-serial-for-android`, with per-chip
+  drivers (FTDI, CP210x, CH34x, CDC, and a CH34x-as-CDC override for the TNC4).
+- `AndroidNusLink` — a GATT Nordic UART client behind the `NusLink` seam, for
+  `BleKissInterface`; the BLE KISS TNC Service profile is detected automatically.
+
+```kotlin
+// One call per transport; each builds the port, wraps it in the interface,
+// registers it with Transport and starts it. detach() tears it down.
+AndroidKissInterfaces.startBtClassicKiss(/* context, device, name, ax25 ... */)
+AndroidKissInterfaces.startUsbKiss(/* context, usb device, name, ax25 ... */)
+AndroidKissInterfaces.startBleKiss(/* context, address, name ... */)
 ```
 
 ### NetworkMonitor

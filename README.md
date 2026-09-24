@@ -14,18 +14,22 @@ Thanks for reading. The rest of this page is written by the LLM and is probably 
 
 A Kotlin/JVM implementation of the [Reticulum Network Stack](https://reticulum.network/) for building resilient, delay-tolerant mesh networks on Android and JVM.
 
-The KISS and radio support, the security hardening and the reference-parity work
-are described under [Additions](#additions). The stack is driven in production
-from an Android foreground service.
+The KISS and radio support, the security hardening, the hot-path work and the
+reference-parity work are described under [Additions](#additions). The stack is
+driven in production from an Android foreground service talking to KISS TNCs over
+BLE, Bluetooth Classic and USB serial.
 
 ## Additions
 
-The four themes:
+The five themes:
 
-**KISS / TNC radio stack** — `KissInterface` carrying KISS over any byte stream,
-with the reference's frame-duration ceiling, flow control and beacon, AX.25
-framing (`kiss/Ax25.kt`), the shared stream-framing layer the serial-class
-interfaces sit on, and IFAC on all of them.
+**KISS / TNC radio stack** — `KissInterface` over any byte stream, AX.25 framing
+(`kiss/Ax25.kt`), `BleKissInterface` over Nordic UART with automatic detection of
+the BLE KISS TNC Service profile, beacon transmit and TNC configuration commands,
+and Android backends for GATT (`AndroidNusLink`), Bluetooth Classic RFCOMM and
+USB serial with per-chip drivers (FTDI, CP210x, CH34x, CDC, plus a CH34x-as-CDC
+override for the TNC4). Verified end to end on an Android emulator with virtual
+Bluetooth against an emulated MeshCore TNC.
 
 **Reference parity (RNS 1.5.2)** — asynchronous inbound processing with
 per-traffic-class queues and a single drainer, announce and path-request
@@ -36,19 +40,17 @@ discovery path requests answered on announce arrival, management and probe
 destinations that answer remote `/path` and `/status` queries and announce every
 two hours, known-destination use tracking with batched persistence, multi-segment
 resources joined on the receive side, link requests and responses carrying any
-msgpack value, receipt-free link sends, and a `SerialInterface`. Every reference
-config key is parsed and applied, including `loglevel`, which drives the leveled
-`RnsLog`. Every timer in Packet, Link, Resource, Channel and Transport was
-inventoried against the reference with the state it checks when it fires; the
-seven divergences that inventory found (initiator establishment, the Resource
-watchdog's four branches, tunnel and link-table lifetimes, the proof timeout's
-interface term, the request budget's start, pending requests at link close) are
-fixed. The `conformance-bridge` module runs the language-agnostic
+msgpack value, receipt-free link sends, and a `SerialInterface`. Every timer in
+Packet, Link, Resource, Channel and Transport was inventoried against the reference
+with the state it checks when it fires; the seven divergences that inventory found
+(initiator establishment, the Resource watchdog's
+four branches, tunnel and link-table lifetimes, the proof timeout's interface term,
+the request budget's start, pending requests at link close) are fixed. A slow-link
+interop rig (`rns-test`, RTT and bitrate shaped) and a conformance case for a
+response that outlives its request budget guard the timing class of defect. The
+`conformance-bridge` module runs the language-agnostic
 [reticulum-conformance](https://github.com/torlando-tech/reticulum-conformance)
-suite against this port; the full suite passes against RNS 1.5.2, 1308 passed and
-none failed. That run was made with the bridge commands the suite needs, which
-arrive on the radio branch: the suite cannot be run from this branch as it stands,
-so the result is reported here rather than reproducible here.
+suite against this port; the full suite passes against RNS 1.5.2.
 
 **Security hardening** — three source-level reviews of `rns-core`,
 `rns-interfaces` and `rns-cli` with Python RNS as the oracle. The first
@@ -68,8 +70,14 @@ every stream read loop.
 
 **Correctness fixes** — announces replayed to late-joining local clients,
 shared-instance startup race, sender-side `Resource` recovery and in-flight
-failure on link teardown, IN-only destination registration, and an SPP socket
-leak on a failed connect or accept.
+failure on link teardown, `InterfaceAdapter` cache leak, IN-only destination
+registration, SOCKS5 support on `TCPClientInterface`, and an SPP socket leak on
+a failed connect or accept.
+
+**Performance** — a leveled `RnsLog` with hot-path log gating, announce-path
+allocation down about 66%, an O(1) local-destination index, one decrypt call per
+packet, a byte-ring `Channel`/`Buffer`, and `Packet.getHashablePart` in a single
+allocation.
 
 Every intentional departure from Python RNS is recorded in
 [`port-deviations.md`](port-deviations.md) (the authoritative list) and summarised
@@ -102,13 +110,14 @@ Interoperability is validated by automated tests against the Python reference.
 
 | Interface | Status | Notes |
 |-----------|--------|-------|
-| TCP Server/Client | Complete | HDLC framing, fixed five-second reconnect matching Python, keepalive on server children |
+| TCP Server/Client | Complete | HDLC framing, fixed five-second reconnect matching Python, keepalive on server children, optional SOCKS5 proxy |
 | Backbone | Complete | NIO selector listener, IFAC with configurable tag size on the parent and spawned clients, 1024-client cap, bounded HDLC deframer, coalescing transmit buffer |
 | UDP | Complete | Unicast, broadcast, multicast |
 | Local (Shared Instance) | Complete | Server/client IPC for sharing Reticulum across apps, bounded child deframer, accept loop survives transient errors |
 | RNode (LoRa) | Complete | Full KISS protocol, firmware checking, BLE + serial transport, bitrate-derived frame-duration ceiling |
-| KISS | Complete | Fork addition — KISS TNC over any byte stream, frame-duration ceiling, flow control, beacon, IFAC |
+| KISS | Complete | Fork addition — KISS TNC over any byte stream, frame-duration ceiling, flow control, beacon, TNC configuration commands, IFAC |
 | AX.25 over KISS | Complete | Fork addition — callsign/SSID validation, 16-byte header, prepend on transmit and strip on receive |
+| BLE KISS | Complete | Fork addition — Nordic UART Service and BLE KISS TNC Service profiles by auto-detection, bounded fragment reassembly |
 | BLE Mesh | Complete | Dual-role GATT, identity handshake, fragmentation, Android driver — Kotlin-only |
 | Bluetooth SPP | Complete | Bluetooth Classic RFCOMM with HDLC framing, client + server, decoupled transmit, 8-byte serial IFAC tag |
 | Pipe | Complete | HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) — Python-parity |
@@ -126,6 +135,10 @@ Interoperability is validated by automated tests against the Python reference.
 |-----------|--------|-------|
 | Foreground Service | Complete | Persistent connection with Doze/battery awareness |
 | BLE Driver | Complete | GATT server/client, advertising, scanning (API 26+) |
+| NUS Client | Complete | `AndroidNusLink` — GATT Nordic UART client behind the `NusLink` seam, emulator-verified |
+| Bluetooth Classic KISS | Complete | `SppKissSerialPort` — RFCOMM behind the `KissSerialPort` seam, unit-tested over pipes |
+| USB Serial KISS | Complete | `UsbKissSerialPort` over `usb-serial-for-android`, per-chip drivers |
+| KISS Wiring | Complete | `AndroidKissInterfaces` — construct backend and interface, hook receive into Transport, register |
 | Power Management | Complete | Doze handler, battery monitor, WorkManager integration |
 | Sample App | Moved | See [carina](https://github.com/torlando-tech/carina) for the Compose UI sample app |
 | LXMF | Moved | See [LXMF-kt](https://github.com/torlando-tech/LXMF-kt) for the LXMF messaging protocol |
@@ -164,8 +177,8 @@ Interoperability is validated by automated tests against the Python reference.
 
 ```
 rns-core/            # Core protocol (Identity, Destination, Transport, Link, Channel, Resource, discovery, storage)
-rns-interfaces/      # Network interfaces (TCP, Backbone, UDP, Local, RNode, KISS, BLE, SPP, Auto, I2P, Pipe) + framing
-rns-android/         # Android code (BLE driver, foreground service, power management)
+rns-interfaces/      # Network interfaces (TCP, Backbone, UDP, Local, RNode, KISS, BLE KISS, BLE, SPP, Auto, I2P, Pipe) + framing
+rns-android/         # Android code (BLE and NUS drivers, KISS backends, foreground service, power management)
 rns-cli/             # CLI utilities (rnsd-kt daemon, config parser, interface factory, serial port)
 rns-test/            # Integration and interop tests
 python-bridge/       # Python bridge server for interop testing (150+ commands)

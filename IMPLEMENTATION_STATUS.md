@@ -10,8 +10,9 @@ interoperable with the Python reference: the full reticulum-conformance suite pa
 against RNS 1.5.2 with the Kotlin bridge in every arm. Every interface type Python ships
 is implemented except `WeaveInterface` and `RNodeMultiInterface` (hardware drivers with
 no device to verify against), plus four mobile/JVM-specific additions (BLE Mesh, Nearby
-Connections, Bluetooth SPP, Pipe). The Android module (`rns-android/`) provides the
-foreground service, BLE driver, storage and power management.
+Connections, Bluetooth SPP, Pipe) and three Android backends for KISS TNCs. The Android
+module (`rns-android/`) provides the foreground service, BLE driver, KISS transports and
+power management.
 
 LXMF lives in a separate repository: [LXMF-kt](https://github.com/torlando-tech/LXMF-kt).
 
@@ -65,7 +66,7 @@ LXMF lives in a separate repository: [LXMF-kt](https://github.com/torlando-tech/
 
 #### Interfaces
 - **TCP**: client and server, HDLC framing, fixed five-second reconnect, keepalive on
-  server children, IFAC
+  server children, optional SOCKS5 proxy, IFAC
 - **Backbone**: NIO selector listener, IFAC with configurable tag size, 1024-client cap,
   bounded HDLC deframer, coalescing transmit buffer
 - **UDP**: unicast, broadcast, multicast
@@ -74,8 +75,10 @@ LXMF lives in a separate repository: [LXMF-kt](https://github.com/torlando-tech/
 - **RNode (LoRa)**: KISS protocol, firmware checking, BLE and serial transport,
   bitrate-derived frame-duration ceiling
 - **KISS** and **AX.25 over KISS**: KISS TNC over any byte stream, frame-duration ceiling,
-  flow control, beacon, IFAC; AX.25 callsign/SSID header
+  flow control, beacon and TNC configuration commands, IFAC; AX.25 callsign/SSID header
 - **Serial**: HDLC over a serial stream (`SerialInterface`), any `KissSerialPort`
+- **BLE KISS**: Nordic UART Service and BLE KISS TNC Service profiles by auto-detection,
+  bounded fragment reassembly
 - **BLE Mesh**: dual-role GATT, identity handshake, fragmentation, Android driver
 - **Bluetooth SPP**: Bluetooth Classic RFCOMM with HDLC framing, client and server
 - **Auto**: IPv6 multicast peer discovery, per-peer UDP connections, adaptive announce
@@ -92,6 +95,8 @@ LXMF lives in a separate repository: [LXMF-kt](https://github.com/torlando-tech/
 #### Android (`rns-android/`)
 - **Foreground Service**: `ReticulumService` with lifecycle management and notification
 - **BLE Driver**: GATT server/client, advertising, scanning (API 26+)
+- **KISS backends**: `SppKissSerialPort` (RFCOMM), `UsbKissSerialPort` (usb-serial-for-android,
+  per-chip drivers), `AndroidNusLink` (GATT Nordic UART), wired by `AndroidKissInterfaces`
 - **Storage**: Room-backed identity, path, announce, tunnel and discovery stores with
   transient-lock retry on every write-through path
 - **Power Management**: Doze handler, battery monitor/stats/exemption, network monitor
@@ -108,7 +113,8 @@ LXMF lives in a separate repository: [LXMF-kt](https://github.com/torlando-tech/
 #### Testing
 - **Unit suites**: rns-core, rns-interfaces, rns-cli, rns-android
 - **Interop**: `rns-test` against the Python bridge (`python-bridge/bridge_server.py`,
-  150+ commands)
+  150+ commands), including a slow-link rig that shapes RTT and bitrate so timing
+  defects surface on loopback
 - **Conformance**: `conformance-bridge` runs the
   [reticulum-conformance](https://github.com/torlando-tech/reticulum-conformance)
   suite; full run 1308 passed, 0 failed, 12 skipped, 1 expected failure against
@@ -152,6 +158,9 @@ retaining all messaging, link, resource and channel capabilities.
 
 ### Optimizations in place
 - Leveled `RnsLog` with lazy message construction on hot paths
+- Announce-path allocations reduced by about two thirds; an O(1) local-destination index
+- One decrypt per packet; `Packet.getHashablePart` in a single allocation
+- Byte-ring `Channel`/`Buffer`
 - Adaptive AutoInterface announce interval with Doze awareness
 
 ### Remaining opportunities
@@ -178,7 +187,7 @@ retaining all messaging, link, resource and channel capabilities.
 | Blackhole | ✅ | ✅ | expiry, trusted sources, persistence |
 | Remote management | ✅ | ✅ | `/path` and `/status`, announced |
 | RPC server | ✅ | ✅ | msgpack, full 1.5.2 request set |
-| TCP Interface | ✅ | ✅ | client and server |
+| TCP Interface | ✅ | ✅ | client and server, SOCKS5 |
 | Backbone Interface | ✅ | ✅ | IFAC, bounded deframer |
 | UDP Interface | ✅ | ✅ | unicast, broadcast, multicast |
 | Local Interface | ✅ | ✅ | shared instance IPC |
@@ -190,6 +199,7 @@ retaining all messaging, link, resource and channel capabilities.
 | I2P Interface | ✅ | ✅ | SAM API tunnels |
 | Pipe Interface | ✅ | ✅ | HDLC over byte streams |
 | BLE Mesh | ❌ | ✅ | Kotlin-only, dual-role GATT |
+| BLE KISS | ❌ | ✅ | Kotlin-only, NUS and BLE KISS TNC Service |
 | Bluetooth SPP | ❌ | ✅ | Kotlin-only, RFCOMM with HDLC |
 | Nearby Connections | ❌ | ✅ | Kotlin-only, scheduled for removal |
 | Weave Interface | ✅ | ❌ | hardware driver, not started |
@@ -216,7 +226,7 @@ retaining all messaging, link, resource and channel capabilities.
 - `rns-interfaces/src/main/kotlin/network/reticulum/interfaces/` — all interface types
 
 ### Android
-- `rns-android/src/main/kotlin/network/reticulum/android/` — service, BLE driver, storage, power management
+- `rns-android/src/main/kotlin/network/reticulum/android/` — service, BLE driver, KISS backends, storage, power management
 
 ### CLI
 - `rns-cli/src/main/kotlin/network/reticulum/cli/` — rnsd-kt daemon, config, interface factory, serial port
