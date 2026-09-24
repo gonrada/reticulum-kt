@@ -11,6 +11,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // usb-serial-for-android (USB KISS TNC chip drivers) is published on JitPack.
+        maven { url = uri("https://jitpack.io") }
     }
 }
 

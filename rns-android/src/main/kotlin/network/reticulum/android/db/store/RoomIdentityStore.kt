@@ -26,7 +26,7 @@ class RoomIdentityStore(
             publicKey = data.publicKey.copyOf(),
             appData = data.appData?.copyOf()
         )
-        writeExecutor.execute { knownDestDao.upsert(entity) }
+        writeExecutor.submitWriteThroughDurable("upsertKnownDestination") { knownDestDao.upsert(entity) }
     }
 
     override fun getKnownDestination(destHash: ByteArray): IdentityData? {
@@ -65,7 +65,7 @@ class RoomIdentityStore(
             ratchet = ratchet.copyOf(),
             timestamp = timestampMs
         )
-        writeExecutor.execute { ratchetDao.upsert(entity) }
+        writeExecutor.submitWriteThroughDurable("upsertRatchet") { ratchetDao.upsert(entity) }
     }
 
     override fun getRatchet(destHash: ByteArray): Pair<ByteArray, Long>? {
@@ -75,6 +75,6 @@ class RoomIdentityStore(
 
     override fun removeExpiredRatchets(maxAgeMs: Long) {
         val threshold = System.currentTimeMillis() - maxAgeMs
-        writeExecutor.execute { ratchetDao.deleteExpiredBefore(threshold) }
+        writeExecutor.submitWriteThroughDurable("removeExpiredRatchets") { ratchetDao.deleteExpiredBefore(threshold) }
     }
 }

@@ -61,17 +61,29 @@ class AndroidSppDriver(
                 device.createInsecureRfcommSocketToServiceRecord(SppInterface.SPP_UUID)
             }
 
-            // connect() is blocking — can take 1-12 seconds
-            socket.connect()
-            Log.d(TAG, "SPP connection established with ${device.name ?: address} ($mode)")
+            try {
+                // connect() is blocking — can take 1-12 seconds
+                socket.connect()
+                Log.d(TAG, "SPP connection established with ${device.name ?: address} ($mode)")
 
-            SppConnection(
-                inputStream = socket.inputStream,
-                outputStream = socket.outputStream,
-                remoteAddress = address,
-                remoteName = device.name,
-                close = { closeSocket(socket) },
-            )
+                SppConnection(
+                    inputStream = socket.inputStream,
+                    outputStream = socket.outputStream,
+                    remoteAddress = address,
+                    remoteName = device.name,
+                    close = { closeSocket(socket) },
+                )
+            } catch (e: Exception) {
+                // connect() throws on every failed attempt: device powered off, out of
+                // range, or not bonded. The socket owns a file descriptor even when the
+                // connection never came up, and only the success path installs a closer,
+                // so without this an interface that retries on a timer leaks one socket
+                // per attempt. Each leak surfaces later as "Uncaught exception thrown by
+                // finalizer / IOException: socket not created" from BluetoothSocket's
+                // finalizer. Also covers cancellation, which lands here as an exception.
+                closeSocket(socket)
+                throw e
+            }
         }
     }
 
@@ -92,15 +104,24 @@ class AndroidSppDriver(
             try {
                 // accept() blocks until a client connects or the server socket is closed
                 val socket = server.accept()
-                Log.d(TAG, "Accepted SPP connection from ${socket.remoteDevice.name ?: socket.remoteDevice.address}")
+                try {
+                    Log.d(TAG, "Accepted SPP connection from ${socket.remoteDevice.name ?: socket.remoteDevice.address}")
 
-                SppConnection(
-                    inputStream = socket.inputStream,
-                    outputStream = socket.outputStream,
-                    remoteAddress = socket.remoteDevice.address,
-                    remoteName = socket.remoteDevice.name,
-                    close = { closeSocket(socket) },
-                )
+                    SppConnection(
+                        inputStream = socket.inputStream,
+                        outputStream = socket.outputStream,
+                        remoteAddress = socket.remoteDevice.address,
+                        remoteName = socket.remoteDevice.name,
+                        close = { closeSocket(socket) },
+                    )
+                } catch (e: Exception) {
+                    // The accepted socket is ours the moment accept() returns, but
+                    // getInputStream/getOutputStream and the remoteDevice lookups can all
+                    // throw. Same leak as the connect() path if they do; the finally below
+                    // only closes the *server* socket.
+                    closeSocket(socket)
+                    throw e
+                }
             } finally {
                 // Close the server socket — we only accept one connection at a time.
                 // SppInterface will call accept() again in the read loop's reconnect

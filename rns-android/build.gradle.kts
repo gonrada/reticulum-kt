@@ -75,6 +75,9 @@ dependencies {
     // Google Nearby Connections (WiFi Direct + BLE mesh)
     implementation("com.google.android.gms:play-services-nearby:19.3.0")
 
+    // USB serial (FTDI / CP210x / CH34x / CDC-ACM chip drivers) for USB KISS TNCs
+    implementation("com.github.mik3y:usb-serial-for-android:3.8.1")
+
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutinesVersion")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:$coroutinesVersion")
